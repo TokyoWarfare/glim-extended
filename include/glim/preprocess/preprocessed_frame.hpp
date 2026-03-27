@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <vector>
+#include <unordered_map>
+#include <string>
 #include <Eigen/Core>
 #include <glim/util/raw_points.hpp>
 
@@ -32,6 +34,8 @@ public:
 
   int k_neighbors;             // Number of neighbors of each point
   std::vector<int> neighbors;  // k-nearest neighbors of each point
+
+  std::unordered_map<std::string, std::vector<float>> aux_attributes;  // Per-point scalar attributes (float)
 
   RawPoints::ConstPtr raw_points;
 };

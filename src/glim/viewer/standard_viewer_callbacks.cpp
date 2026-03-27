@@ -81,21 +81,40 @@ void StandardViewer::set_callbacks() {
       auto viewer = guik::LightViewer::instance();
       auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(new_frame->frame->points, new_frame->frame->size());
 
-      std::vector<float> intensities;
-      if (new_frame->raw_frame && new_frame->raw_frame->points.size() == new_frame->frame->size()) {
-        intensities.resize(new_frame->raw_frame->intensities.size());
-        std::copy(new_frame->raw_frame->intensities.begin(), new_frame->raw_frame->intensities.end(), intensities.begin());
-      } else if (new_frame->frame->has_intensities()) {
-        intensities.resize(new_frame->frame->size());
-        std::copy(new_frame->frame->intensities, new_frame->frame->intensities + new_frame->frame->size(), intensities.begin());
+      // Populate aux_attribute_names once from the first frame
+      if (aux_attribute_names.empty()) {
+        for (const auto& attrib : new_frame->frame->aux_attributes) {
+          const size_t elem_size = attrib.second.first;
+          if (elem_size == sizeof(float) || elem_size == sizeof(double)) {
+            aux_attribute_names.push_back(attrib.first);
+          }
+        }
       }
 
-      if (!intensities.empty()) {
-        for (const auto intensity : intensities) {
-          intensity_dist.add(intensity);
+      // Upload colormap for the selected aux attribute (odom mode 2+) and seed intensity_dist
+      if (odom_color_mode >= 2) {
+        const int aux_idx = odom_color_mode - 2;
+        if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
+          const auto& attr_name = aux_attribute_names[aux_idx];
+          const auto it = new_frame->frame->aux_attributes.find(attr_name);
+          if (it != new_frame->frame->aux_attributes.end()) {
+            const size_t elem_size = it->second.first;
+            const void* data = it->second.second;
+            const int n = new_frame->frame->size();
+            std::vector<float> colormap_vals(n);
+            if (elem_size == sizeof(float)) {
+              std::copy(static_cast<const float*>(data), static_cast<const float*>(data) + n, colormap_vals.begin());
+            } else {
+              const double* dptr = static_cast<const double*>(data);
+              for (int i = 0; i < n; i++) colormap_vals[i] = static_cast<float>(dptr[i]);
+            }
+            // Feed actual data range into intensity_dist so cmap_range auto-adjusts to the data
+            for (float v : colormap_vals) {
+              intensity_dist.add(v);
+            }
+            cloud_buffer->add_colormap(colormap_vals);
+          }
         }
-
-        cloud_buffer->add_colormap(intensities);
       }
 
       last_id = new_frame->id;
@@ -127,11 +146,7 @@ void StandardViewer::set_callbacks() {
       switch (odom_color_mode) {
         case 0:  // FLAT
           break;
-        case 1:  // INTENSITY
-          shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
-          shader_setting_rainbow.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
-          break;
-        case 2:  // NORMAL
+        case 1:  // NORMAL
           if (new_frame->frame->normals) {
             std::vector<Eigen::Vector4d> normals(new_frame->frame->normals, new_frame->frame->normals + new_frame->frame->size());
             for (auto& normal : normals) {
@@ -141,6 +156,10 @@ void StandardViewer::set_callbacks() {
             cloud_buffer->add_color(normals);
           }
 
+          shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLOR);
+          shader_setting_rainbow.set_color_mode(guik::ColorMode::VERTEX_COLOR);
+          break;
+        default:  // aux attribute
           shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
           shader_setting_rainbow.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
           break;
@@ -185,19 +204,42 @@ void StandardViewer::set_callbacks() {
         auto drawable = viewer->find_drawable(name);
         if (drawable.first == nullptr) {
           auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(keyframe->frame->points, keyframe->frame->size());
-          if (keyframe->frame->has_intensities()) {
-            std::vector<float> intensities(keyframe->frame->intensities, keyframe->frame->intensities + keyframe->frame->size());
-            cloud_buffer->add_colormap(intensities);
+          if (odom_color_mode >= 2) {
+            const int aux_idx = odom_color_mode - 2;
+            if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
+              const auto& attr_name = aux_attribute_names[aux_idx];
+              const auto it = keyframe->frame->aux_attributes.find(attr_name);
+              if (it != keyframe->frame->aux_attributes.end()) {
+                const size_t elem_size = it->second.first;
+                const void* data = it->second.second;
+                const int n = keyframe->frame->size();
+                std::vector<float> colormap_vals(n);
+                if (elem_size == sizeof(float)) {
+                  std::copy(static_cast<const float*>(data), static_cast<const float*>(data) + n, colormap_vals.begin());
+                } else {
+                  const double* dptr = static_cast<const double*>(data);
+                  for (int i = 0; i < n; i++) colormap_vals[i] = static_cast<float>(dptr[i]);
+                }
+                cloud_buffer->add_colormap(colormap_vals);
+              }
+            }
           }
 
           guik::Rainbow shader_setting(pose);
           switch (odom_color_mode) {
             case 0:  // FLAT
               break;
-            case 1:  // INTENSITY
-              shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+            case 1: {  // NORMAL
+              if (keyframe->frame->normals) {
+                std::vector<Eigen::Vector4d> normals(keyframe->frame->normals, keyframe->frame->normals + keyframe->frame->size());
+                for (auto& n : normals) { n = n.array().abs(); n[3] = 1.0; }
+                cloud_buffer->add_color(normals);
+                shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLOR);
+              }
               break;
-            case 2:  // NORMAL
+            }
+            default:  // aux attribute
+              shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
               break;
           }
 
@@ -208,10 +250,10 @@ void StandardViewer::set_callbacks() {
               drawable.first->set_color_mode(guik::ColorMode::RAINBOW);
               break;
             case 1:
-              drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+              drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLOR);
               break;
-            case 2:
-              drawable.first->set_color_mode(guik::ColorMode::RAINBOW);
+            default:
+              drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
               break;
           }
 
@@ -485,21 +527,67 @@ void StandardViewer::set_callbacks() {
 
       auto viewer = guik::LightViewer::instance();
       auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(submap->frame->points, submap->frame->size());
-      if (submap->frame->has_intensities()) {
-        std::vector<float> intensities(submap->frame->intensities, submap->frame->intensities + submap->frame->size());
-        cloud_buffer->add_colormap(intensities);
+
+      // Always upload normal colors into the color VBO so NORMAL mode works after mode-switch
+      if (submap->frame->normals) {
+        const int n = submap->frame->size();
+        std::vector<Eigen::Vector4f> normal_colors(n);
+        for (int ni = 0; ni < n; ni++) {
+          normal_colors[ni] = ((submap->frame->normals[ni].head<3>().cast<float>().cwiseAbs()).homogeneous()).eval();
+          normal_colors[ni][3] = 1.0f;
+        }
+        cloud_buffer->add_color(normal_colors);
       }
 
-      auto shader_setting = guik::Rainbow(T_world_origin->matrix().cast<float>());
+      // Always upload all float aux attributes as named GL buffers so that mode
+      // switching on existing drawables (via set_colormap_buffer) works without re-upload.
+      std::string active_attr_name;
+      for (const auto& attr_name : aux_attribute_names) {
+        const auto it = submap->frame->aux_attributes.find(attr_name);
+        if (it == submap->frame->aux_attributes.end() || it->second.first != sizeof(float)) {
+          continue;
+        }
+        const int n = submap->frame->size();
+        const float* data = static_cast<const float*>(it->second.second);
+        std::vector<float> vals(data, data + n);
+        cloud_buffer->add_buffer(attr_name, vals);
+        if (active_attr_name.empty()) {
+          active_attr_name = attr_name;  // first available becomes default
+        }
+      }
+
+      // Select and activate the colormap buffer for the current mode (3+ = aux attributes)
+      if (submap_color_mode >= 3) {
+        const int aux_idx = submap_color_mode - 3;
+        if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
+          const auto& attr_name = aux_attribute_names[aux_idx];
+          const auto it = submap->frame->aux_attributes.find(attr_name);
+          if (it != submap->frame->aux_attributes.end() && it->second.first == sizeof(float)) {
+            const int n = submap->frame->size();
+            const float* data = static_cast<const float*>(it->second.second);
+            for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
+            cloud_buffer->set_colormap_buffer(attr_name);
+          }
+        }
+      } else if (!active_attr_name.empty()) {
+        // Pre-arm the colormap buffer with the first attribute so switching later works
+        cloud_buffer->set_colormap_buffer(active_attr_name);
+      }
+
+      const Eigen::Vector4f submap_color = glk::colormap_categoricalf(glk::COLORMAP::TURBO, submap->id, 6);
+      auto shader_setting = guik::Rainbow(T_world_origin->matrix().cast<float>()).set_color(submap_color);
       switch (submap_color_mode) {
         case 0:  // RAINBOW
           shader_setting.set_color_mode(guik::ColorMode::RAINBOW);
           break;
-        case 1:  // INTENSITY
-          shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+        case 1:  // COLOR (per-submap flat color)
+          shader_setting.set_color_mode(guik::ColorMode::FLAT_COLOR);
           break;
-        case 2:  // COLOR
+        case 2:  // NORMAL (per-point normal-encoded color in VBO)
           shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLOR);
+          break;
+        default:  // aux attribute colormap
+          shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
           break;
       }
 

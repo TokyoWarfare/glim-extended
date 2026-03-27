@@ -9,6 +9,7 @@
 
 #include <gtsam_points/config.hpp>
 #include <gtsam_points/types/point_cloud_cpu.hpp>
+#include <gtsam_points/features/normal_estimation.hpp>
 #include <gtsam_points/types/point_cloud_gpu.hpp>
 #include <gtsam_points/types/gaussian_voxelmap_cpu.hpp>
 #include <gtsam_points/types/gaussian_voxelmap_gpu.hpp>
@@ -371,6 +372,11 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
     frame->add_covs(covariance_estimation->estimate(frame->points_storage, odom_frame->raw_frame->neighbors));
     if (!odom_frame->raw_frame->intensities.empty()) {
       frame->add_intensities(odom_frame->raw_frame->intensities);
+      std::vector<float> intens_f(odom_frame->raw_frame->intensities.begin(), odom_frame->raw_frame->intensities.end());
+      frame->add_aux_attribute<float>("intensity", intens_f);
+    }
+    for (const auto& attrib : odom_frame->raw_frame->aux_attributes) {
+      frame->add_aux_attribute<float>(attrib.first, attrib.second);
     }
     deskewed_frame = frame;
   }
@@ -487,9 +493,18 @@ SubMap::Ptr SubMapping::create_submap(bool force_create) const {
 #endif
 
   if (submap->frame == nullptr) {
-    submap->frame = gtsam_points::merge_frames_auto(poses_to_merge, keyframes_to_merge, params.submap_downsample_resolution);
+    const std::unordered_map<std::string, gtsam_points::AttributeBlendMode> blend_modes = {
+      {"intensity", gtsam_points::AttributeBlendMode::MAX},   // brightest return per voxel
+      {"range", gtsam_points::AttributeBlendMode::MIN},       // closest return per voxel
+    };
+    submap->frame = gtsam_points::merge_frames_auto(poses_to_merge, keyframes_to_merge, params.submap_downsample_resolution, blend_modes);
   }
   logger->debug("|merged_submap|={}", submap->frame->size());
+
+  // Compute normals from the covariances already present in the merged frame
+  if (auto frame_cpu = std::dynamic_pointer_cast<gtsam_points::PointCloudCPU>(submap->frame)) {
+    frame_cpu->add_normals(gtsam_points::estimate_normals(frame_cpu->points, frame_cpu->covs, frame_cpu->size()));
+  }
 
   if (params.submap_target_num_points > 0 && submap->frame->size() > params.submap_target_num_points) {
     std::mt19937 mt(submap_count * 643145 + submap->frame->size() * 4312);  // Just a random-like seed

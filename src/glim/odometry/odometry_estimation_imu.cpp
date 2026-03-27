@@ -184,6 +184,11 @@ EstimationFrame::ConstPtr OdometryEstimationIMU::insert_frame(const Preprocessed
     auto frame = std::make_shared<gtsam_points::PointCloudCPU>(points_imu);
     if (raw_frame->intensities.size()) {
       frame->add_intensities(raw_frame->intensities);
+      std::vector<float> intensities_f(raw_frame->intensities.begin(), raw_frame->intensities.end());
+      frame->add_aux_attribute<float>("intensity", intensities_f);
+    }
+    for (const auto& attrib : raw_frame->aux_attributes) {
+      frame->add_aux_attribute<float>(attrib.first, attrib.second);
     }
     frame->add_covs(covs);
     frame->add_normals(normals);
@@ -314,6 +319,11 @@ EstimationFrame::ConstPtr OdometryEstimationIMU::insert_frame(const Preprocessed
   auto frame = std::make_shared<gtsam_points::PointCloudCPU>(deskewed);
   if (raw_frame->intensities.size()) {
     frame->add_intensities(raw_frame->intensities);
+    std::vector<float> intensities_f(raw_frame->intensities.begin(), raw_frame->intensities.end());
+    frame->add_aux_attribute<float>("intensity", intensities_f);
+  }
+  for (const auto& attrib : raw_frame->aux_attributes) {
+    frame->add_aux_attribute<float>(attrib.first, attrib.second);
   }
   frame->add_covs(deskewed_covs);
   frame->add_normals(deskewed_normals);

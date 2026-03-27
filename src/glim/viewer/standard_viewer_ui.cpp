@@ -131,17 +131,37 @@ void StandardViewer::drawable_selection() {
 
   ImGui::Separator();
 
-  std::vector<const char*> odom_color_modes = {"FLAT", "INTENSITY", "NORMAL"};
+  // Odom color modes: 0=FLAT, 1=NORMAL, 2+=aux_attributes
+  std::vector<const char*> odom_color_mode_items = {"FLAT", "NORMAL"};
+  for (const auto& name : aux_attribute_names) {
+    odom_color_mode_items.push_back(name.c_str());
+  }
   ImGui::SetNextItemWidth(92);
-  ImGui::Combo("odom_color_mode", &odom_color_mode, odom_color_modes.data(), odom_color_modes.size());
+  ImGui::Combo("odom_color_mode", &odom_color_mode, odom_color_mode_items.data(), odom_color_mode_items.size());
 
-  std::vector<const char*> submap_color_modes = {"RAINBOW", "INTENSITY", "COLOR"};
+  // Submap color modes: 0=RAINBOW, 1=COLOR, 2=NORMAL, 3+=aux_attributes
+  std::vector<const char*> submap_color_mode_items = {"RAINBOW", "COLOR", "NORMAL"};
+  for (const auto& name : aux_attribute_names) {
+    submap_color_mode_items.push_back(name.c_str());
+  }
   ImGui::SetNextItemWidth(92);
-  if (ImGui::Combo("submap_color_mode", &submap_color_mode, submap_color_modes.data(), submap_color_modes.size())) {
+  if (ImGui::Combo("submap_color_mode", &submap_color_mode, submap_color_mode_items.data(), submap_color_mode_items.size())) {
+    const int aux_idx = (submap_color_mode >= 3) ? submap_color_mode - 3 : -1;
+    const std::string aux_attr = (aux_idx >= 0 && aux_idx < static_cast<int>(aux_attribute_names.size())) ? aux_attribute_names[aux_idx] : "";
+
     for (int i = 0;; i++) {
       const auto found = viewer->find_drawable("submap_" + std::to_string(i));
       if (!found.first) {
         break;
+      }
+
+      // Switch the named colormap buffer on the existing cloud buffer when in aux mode
+      if (!aux_attr.empty()) {
+        auto cb = std::dynamic_pointer_cast<const glk::PointCloudBuffer>(found.second);
+        auto cloud_buffer = std::const_pointer_cast<glk::PointCloudBuffer>(cb);
+        if (cloud_buffer) {
+          cloud_buffer->set_colormap_buffer(aux_attr);
+        }
       }
 
       switch (submap_color_mode) {
@@ -149,10 +169,13 @@ void StandardViewer::drawable_selection() {
           found.first->set_color_mode(guik::ColorMode::RAINBOW);
           break;
         case 1:
-          found.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+          found.first->set_color_mode(guik::ColorMode::FLAT_COLOR);
           break;
-        case 2:
+        case 2:  // NORMAL
           found.first->set_color_mode(guik::ColorMode::VERTEX_COLOR);
+          break;
+        default:  // aux attributes
+          found.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
           break;
       }
     }
@@ -176,11 +199,11 @@ void StandardViewer::drawable_selection() {
     }
   }
 
-  if (odom_color_mode == 1 || submap_color_mode == 1) {
+  if (odom_color_mode >= 2 || submap_color_mode >= 3) {
     ImGui::Checkbox("auto_intensity_range", &auto_intensity_range);
-    if (auto_intensity_range) {
-      intensity_range[0] = intensity_dist.min();
-      intensity_range[1] = intensity_dist.max();
+    if (auto_intensity_range && intensity_dist.size() > 0) {
+      intensity_range[0] = static_cast<float>(intensity_dist.min());
+      intensity_range[1] = static_cast<float>(intensity_dist.max());
     }
 
     ImGui::SetNextItemWidth(150);

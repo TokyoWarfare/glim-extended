@@ -83,6 +83,8 @@ protected:
 
   // Visualization params
   int color_mode;
+  std::vector<std::string> aux_attribute_names;
+  Eigen::Vector2f aux_cmap_range;  // auto-computed min/max across all submaps for the active aux attribute
 
   float coord_scale;
   float sphere_scale;

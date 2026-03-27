@@ -168,6 +168,13 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
 
   PreprocessCallbacks::on_filtering_finished(frame);
 
+  // Compute per-point range (distance to sensor) on the final filtered point set
+  std::vector<float> ranges(frame->size());
+  for (int i = 0; i < frame->size(); i++) {
+    ranges[i] = static_cast<float>(frame->points[i].head<3>().norm());
+  }
+  frame->add_aux_attribute<float>("range", ranges);
+
   // Create a preprocessed frame
   PreprocessedFrame::Ptr preprocessed(new PreprocessedFrame);
   preprocessed->stamp = raw_points->stamp;
@@ -177,6 +184,14 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
   preprocessed->points.assign(frame->points, frame->points + frame->size());
   if (frame->intensities) {
     preprocessed->intensities.assign(frame->intensities, frame->intensities + frame->size());
+  }
+
+  // Propagate float aux_attributes (e.g., range) to the preprocessed frame
+  for (const auto& attrib : frame->aux_attributes) {
+    if (attrib.second.first == sizeof(float)) {
+      const float* data = static_cast<const float*>(attrib.second.second);
+      preprocessed->aux_attributes[attrib.first].assign(data, data + frame->size());
+    }
   }
 
   preprocessed->k_neighbors = params.k_correspondences;
