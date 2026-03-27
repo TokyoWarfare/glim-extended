@@ -115,6 +115,8 @@ private:
   Eigen::Vector2f intensity_range;
   gtsam_points::RunningStatistics<double> intensity_dist;
 
+  std::vector<std::string> aux_attribute_names;  // populated from first odom frame, used to build dynamic dropdowns
+
   std::unique_ptr<TrajectoryManager> trajectory;
   std::vector<Eigen::Isometry3f> submap_keyframes;
 

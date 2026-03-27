@@ -1,6 +1,7 @@
 #include <glim/viewer/interactive_viewer.hpp>
 
 #include <atomic>
+#include <limits>
 #include <thread>
 #include <spdlog/spdlog.h>
 #include <glim/mapping/sub_map.hpp>
@@ -50,6 +51,7 @@ InteractiveViewer::InteractiveViewer() : logger(create_module_logger("viewer")) 
 #endif
 
   color_mode = 0;
+  aux_cmap_range = Eigen::Vector2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest());
   coord_scale = 1.0f;
   sphere_scale = 0.5f;
 
@@ -206,11 +208,16 @@ void InteractiveViewer::drawable_selection() {
     return false;
   };
 
-  std::vector<const char*> color_modes = {"RAINBOW", "INTENSITY", "SESSION"};
+  // 0=RAINBOW, 1=SESSION, 2=NORMAL, 3+=aux_attributes
+  std::vector<const char*> color_modes = {"RAINBOW", "SESSION", "NORMAL"};
+  for (const auto& name : aux_attribute_names) {
+    color_modes.push_back(name.c_str());
+  }
   if (ImGui::Combo("ColorMode", &color_mode, color_modes.data(), color_modes.size())) {
+    aux_cmap_range = Eigen::Vector2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest());  // force recompute for new attribute
     update_viewer();
   }
-  show_note("Color mode for rendering submaps.\n- RAINBOW=Altitute encoding color\n- INTENSITY=Point intensity\n- SESSION=Session ID");
+  show_note("Color mode for rendering submaps.\n- RAINBOW=Altitude encoding color\n- SESSION=Session ID\n- NORMAL=Surface normal direction\n- others=Per-point attribute colormap");
 
   ImGui::Checkbox("Trajectory", &draw_traj);
   ImGui::SameLine();
@@ -438,15 +445,31 @@ void InteractiveViewer::update_viewer() {
     if (drawable.first) {
       drawable.first->add("model_matrix", submap_pose.matrix());
 
+      // For aux colormap modes, switch the named buffer without re-uploading
+      if (color_mode >= 3) {
+        const int aux_idx = color_mode - 3;
+        if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
+          auto cb = std::dynamic_pointer_cast<const glk::PointCloudBuffer>(drawable.second);
+          auto cloud_buffer = std::const_pointer_cast<glk::PointCloudBuffer>(cb);
+          if (cloud_buffer) {
+            cloud_buffer->set_colormap_buffer(aux_attribute_names[aux_idx]);
+          }
+        }
+      }
+
+      // 0=RAINBOW, 1=SESSION(FLAT), 2=NORMAL, 3+=aux
       switch (color_mode) {
         case 0:
           drawable.first->set_color_mode(guik::ColorMode::RAINBOW);
           break;
         case 1:
-          drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLOR);
+          drawable.first->set_color_mode(guik::ColorMode::FLAT_COLOR);
           break;
         case 2:
-          drawable.first->set_color_mode(guik::ColorMode::FLAT_COLOR);
+          drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLOR);
+          break;
+        default:
+          drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
           break;
       }
     } else {
@@ -455,15 +478,50 @@ void InteractiveViewer::update_viewer() {
       const Eigen::Vector4i info(static_cast<int>(PickType::POINTS), 0, 0, submap->id);
       auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(submap->frame->points, submap->frame->size());
 
-      if (submap->frame->has_intensities()) {
-        cloud_buffer->add_intensity(
-          glk::COLORMAP::TURBO,
-          submap->frame->intensities,
-          submap->frame->size(),
-          1.0 / *std::max_element(submap->frame->intensities, submap->frame->intensities + submap->frame->size()));
+      // Always upload normal colors into the color VBO so NORMAL mode works after mode-switch
+      if (submap->frame->normals) {
+        const int n = submap->frame->size();
+        std::vector<Eigen::Vector4f> normal_colors(n);
+        for (int ni = 0; ni < n; ni++) {
+          normal_colors[ni] = ((submap->frame->normals[ni].head<3>().cast<float>() + Eigen::Vector3f::Ones()) * 0.5f).homogeneous();
+        }
+        cloud_buffer->add_color(normal_colors);
+      }
+
+      // Always upload ALL float aux attributes as named GL buffers so mode-switching works
+      std::string first_aux_name;
+      for (const auto& attr_name : aux_attribute_names) {
+        const auto it = submap->frame->aux_attributes.find(attr_name);
+        if (it == submap->frame->aux_attributes.end() || it->second.first != sizeof(float)) {
+          continue;
+        }
+        const int n = submap->frame->size();
+        const float* data = static_cast<const float*>(it->second.second);
+        std::vector<float> vals(data, data + n);
+        cloud_buffer->add_buffer(attr_name, vals);
+        if (first_aux_name.empty()) {
+          first_aux_name = attr_name;
+        }
+      }
+
+      // Arm the colormap buffer for the current (or default) aux attribute
+      if (color_mode >= 3) {
+        const int aux_idx = color_mode - 3;
+        if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
+          cloud_buffer->set_colormap_buffer(aux_attribute_names[aux_idx]);
+        }
+      } else if (!first_aux_name.empty()) {
+        cloud_buffer->set_colormap_buffer(first_aux_name);
       }
 
       auto shader_setting = guik::Rainbow(submap_pose).add("info_values", info).set_color(color).set_alpha(points_alpha);
+
+      switch (color_mode) {
+        case 0: break;  // RAINBOW
+        case 1: shader_setting.set_color_mode(guik::ColorMode::FLAT_COLOR); break;
+        case 2: shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLOR); break;
+        default: shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP); break;
+      }
 
       if (enable_partial_rendering) {
         cloud_buffer->enable_partial_rendering(partial_rendering_budget);
@@ -487,6 +545,30 @@ void InteractiveViewer::update_viewer() {
   }
 
   viewer->shader_setting().add<Eigen::Vector2f>("z_range", z_range + auto_z_range);
+
+  // Set colormap range for aux attribute rendering
+  if (color_mode >= 3) {
+    // If range is unset (min > max sentinel), compute it from all loaded submaps
+    if (aux_cmap_range[0] > aux_cmap_range[1]) {
+      const int aux_idx = color_mode - 3;
+      if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
+        const auto& attr_name = aux_attribute_names[aux_idx];
+        for (const auto& sm : submaps) {
+          const auto it = sm->frame->aux_attributes.find(attr_name);
+          if (it == sm->frame->aux_attributes.end() || it->second.first != sizeof(float)) continue;
+          const float* data = static_cast<const float*>(it->second.second);
+          const int n = sm->frame->size();
+          for (int k = 0; k < n; k++) {
+            aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
+            aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
+          }
+        }
+      }
+    }
+    if (aux_cmap_range[0] <= aux_cmap_range[1]) {
+      viewer->shader_setting().add<Eigen::Vector2f>("cmap_range", aux_cmap_range);
+    }
+  }
 
   std::vector<Eigen::Vector3f> factor_lines;
   std::vector<Eigen::Vector4f> factor_colors;
@@ -575,6 +657,32 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
     }
 
     trajectory->update_anchor(submap->frames[submap->frames.size() / 2]->stamp, submap->T_world_origin);
+
+    // Populate aux_attribute_names from first submap; guaranteed to run for every new submap.
+    if (aux_attribute_names.empty()) {
+      for (const auto& attrib : submap->frame->aux_attributes) {
+        const size_t elem_size = attrib.second.first;
+        if (elem_size == sizeof(float) || elem_size == sizeof(double)) {
+          aux_attribute_names.push_back(attrib.first);
+        }
+      }
+    }
+
+    // Update aux_cmap_range incrementally from this submap's active aux attribute
+    if (color_mode >= 3) {
+      const int aux_idx = color_mode - 3;
+      if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
+        const auto it = submap->frame->aux_attributes.find(aux_attribute_names[aux_idx]);
+        if (it != submap->frame->aux_attributes.end() && it->second.first == sizeof(float)) {
+          const float* data = static_cast<const float*>(it->second.second);
+          const int n = submap->frame->size();
+          for (int k = 0; k < n; k++) {
+            aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
+            aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
+          }
+        }
+      }
+    }
 
     submap_poses.push_back(*pose);
     submaps.push_back(submap);

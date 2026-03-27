@@ -93,6 +93,9 @@ EstimationFrame::ConstPtr OdometryEstimationCT::insert_frame(const PreprocessedF
 
   gtsam_points::PointCloudCPU::Ptr frame_cpu(new gtsam_points::PointCloudCPU(raw_frame->points));
   frame_cpu->add_times(raw_frame->times);
+  for (const auto& attrib : raw_frame->aux_attributes) {
+    frame_cpu->add_aux_attribute<float>(attrib.first, attrib.second);
+  }
 
   covariance_estimation->estimate(raw_frame->points, raw_frame->neighbors, frame_cpu->normals_storage, frame_cpu->covs_storage);
   frame_cpu->normals = frame_cpu->normals_storage.data();
