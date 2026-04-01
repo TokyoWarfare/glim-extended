@@ -35,7 +35,8 @@ public:
   int k_neighbors;             // Number of neighbors of each point
   std::vector<int> neighbors;  // k-nearest neighbors of each point
 
-  std::unordered_map<std::string, std::vector<float>> aux_attributes;  // Per-point scalar attributes (float)
+  std::unordered_map<std::string, std::vector<float>> aux_attributes;         // Per-point scalar attributes (float)
+  std::unordered_map<std::string, std::vector<double>> double_aux_attributes;  // Per-point scalar attributes (double)
 
   RawPoints::ConstPtr raw_points;
 };

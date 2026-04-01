@@ -1,5 +1,6 @@
 #include <glim/viewer/standard_viewer.hpp>
 
+#include <algorithm>
 #include <spdlog/spdlog.h>
 
 #include <gtsam/inference/Symbol.h>
@@ -112,7 +113,8 @@ void StandardViewer::set_callbacks() {
             for (float v : colormap_vals) {
               intensity_dist.add(v);
             }
-            cloud_buffer->add_colormap(colormap_vals);
+            cloud_buffer->add_buffer(attr_name, colormap_vals);
+            cloud_buffer->set_colormap_buffer(attr_name);
           }
         }
       }
@@ -220,7 +222,8 @@ void StandardViewer::set_callbacks() {
                   const double* dptr = static_cast<const double*>(data);
                   for (int i = 0; i < n; i++) colormap_vals[i] = static_cast<float>(dptr[i]);
                 }
-                cloud_buffer->add_colormap(colormap_vals);
+                cloud_buffer->add_buffer(attr_name, colormap_vals);
+                cloud_buffer->set_colormap_buffer(attr_name);
               }
             }
           }
@@ -428,10 +431,6 @@ void StandardViewer::set_callbacks() {
 
       const Eigen::Vector4f color = glk::colormap_categoricalf(glk::COLORMAP::TURBO, id, 16);
       const auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(frame->points, frame->size());
-      if (frame->has_intensities()) {
-        std::vector<float> intensities(frame->intensities, frame->intensities + frame->size());
-        cloud_buffer->add_colormap(intensities);
-      }
 
       guik::FlatColor shader_setting(color);
       if (id == 0) {
@@ -541,19 +540,37 @@ void StandardViewer::set_callbacks() {
 
       // Always upload all float aux attributes as named GL buffers so that mode
       // switching on existing drawables (via set_colormap_buffer) works without re-upload.
+      // Also unconditionally track per-attr min/max so cmap_range can be seeded correctly
+      // even when the user switches to aux mode after submaps were already inserted.
       std::string active_attr_name;
       for (const auto& attr_name : aux_attribute_names) {
         const auto it = submap->frame->aux_attributes.find(attr_name);
-        if (it == submap->frame->aux_attributes.end() || it->second.first != sizeof(float)) {
+        if (it == submap->frame->aux_attributes.end()) {
+          continue;
+        }
+        const size_t elem_size = it->second.first;
+        if (elem_size != sizeof(float) && elem_size != sizeof(double)) {
           continue;
         }
         const int n = submap->frame->size();
-        const float* data = static_cast<const float*>(it->second.second);
-        std::vector<float> vals(data, data + n);
+        std::vector<float> vals(n);
+        if (elem_size == sizeof(float)) {
+          const float* data = static_cast<const float*>(it->second.second);
+          std::copy(data, data + n, vals.begin());
+        } else {
+          const double* data = static_cast<const double*>(it->second.second);
+          for (int i = 0; i < n; i++) vals[i] = static_cast<float>(data[i]);
+        }
         cloud_buffer->add_buffer(attr_name, vals);
         if (active_attr_name.empty()) {
           active_attr_name = attr_name;  // first available becomes default
         }
+        // Track data range unconditionally (regardless of current color mode)
+        const float vmin = *std::min_element(vals.begin(), vals.end());
+        const float vmax = *std::max_element(vals.begin(), vals.end());
+        auto& range = aux_data_range.emplace(attr_name, std::make_pair(vmin, vmax)).first->second;
+        range.first = std::min(range.first, vmin);
+        range.second = std::max(range.second, vmax);
       }
 
       // Select and activate the colormap buffer for the current mode (3+ = aux attributes)
@@ -562,10 +579,16 @@ void StandardViewer::set_callbacks() {
         if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
           const auto& attr_name = aux_attribute_names[aux_idx];
           const auto it = submap->frame->aux_attributes.find(attr_name);
-          if (it != submap->frame->aux_attributes.end() && it->second.first == sizeof(float)) {
+          if (it != submap->frame->aux_attributes.end()) {
+            const size_t elem_size = it->second.first;
             const int n = submap->frame->size();
-            const float* data = static_cast<const float*>(it->second.second);
-            for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
+            if (elem_size == sizeof(float)) {
+              const float* data = static_cast<const float*>(it->second.second);
+              for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
+            } else if (elem_size == sizeof(double)) {
+              const double* data = static_cast<const double*>(it->second.second);
+              for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
+            }
             cloud_buffer->set_colormap_buffer(attr_name);
           }
         }

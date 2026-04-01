@@ -190,6 +190,9 @@ EstimationFrame::ConstPtr OdometryEstimationIMU::insert_frame(const Preprocessed
     for (const auto& attrib : raw_frame->aux_attributes) {
       frame->add_aux_attribute<float>(attrib.first, attrib.second);
     }
+    for (const auto& attrib : raw_frame->double_aux_attributes) {
+      frame->add_aux_attribute<double>(attrib.first, attrib.second);
+    }
     frame->add_covs(covs);
     frame->add_normals(normals);
     new_frame->frame = frame;
@@ -324,6 +327,9 @@ EstimationFrame::ConstPtr OdometryEstimationIMU::insert_frame(const Preprocessed
   }
   for (const auto& attrib : raw_frame->aux_attributes) {
     frame->add_aux_attribute<float>(attrib.first, attrib.second);
+  }
+  for (const auto& attrib : raw_frame->double_aux_attributes) {
+    frame->add_aux_attribute<double>(attrib.first, attrib.second);
   }
   frame->add_covs(deskewed_covs);
   frame->add_normals(deskewed_normals);

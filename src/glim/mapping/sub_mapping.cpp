@@ -378,6 +378,9 @@ void SubMapping::insert_keyframe(const int current, const EstimationFrame::Const
     for (const auto& attrib : odom_frame->raw_frame->aux_attributes) {
       frame->add_aux_attribute<float>(attrib.first, attrib.second);
     }
+    for (const auto& attrib : odom_frame->raw_frame->double_aux_attributes) {
+      frame->add_aux_attribute<double>(attrib.first, attrib.second);
+    }
     deskewed_frame = frame;
   }
 
@@ -494,8 +497,10 @@ SubMap::Ptr SubMapping::create_submap(bool force_create) const {
 
   if (submap->frame == nullptr) {
     const std::unordered_map<std::string, gtsam_points::AttributeBlendMode> blend_modes = {
-      {"intensity", gtsam_points::AttributeBlendMode::MAX},   // brightest return per voxel
-      {"range", gtsam_points::AttributeBlendMode::MIN},       // closest return per voxel
+      {"intensity", gtsam_points::AttributeBlendMode::MAX},      // brightest return per voxel
+      {"range", gtsam_points::AttributeBlendMode::MIN},          // closest return per voxel
+      {"gps_time", gtsam_points::AttributeBlendMode::AVERAGE},   // average timestamp for merged voxel
+      {"scanner_id", gtsam_points::AttributeBlendMode::FIRST},   // first (all identical per frame)
     };
     submap->frame = gtsam_points::merge_frames_auto(poses_to_merge, keyframes_to_merge, params.submap_downsample_resolution, blend_modes);
   }
