@@ -344,16 +344,14 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     return false;
   }
 
-  // Collect float/double aux_attribute names present in all submaps, excluding primary PLY properties.
+  // Collect float aux_attribute names present in all submaps, excluding primary PLY properties.
   // "intensity" is excluded because it collides with ply.intensities (primary double field);
   // it will be exported separately as "intensity_aux" for pipeline comparison.
   static const std::unordered_set<std::string> primary_ply_props = {"x", "y", "z", "nx", "ny", "nz", "intensity", "r", "g", "b", "a"};
   std::vector<std::string> aux_names;
-  std::unordered_map<std::string, size_t> aux_elem_sizes;
   if (submaps[0] && submaps[0]->frame) {
     for (const auto& attrib : submaps[0]->frame->aux_attributes) {
-      const size_t elem_size = attrib.second.first;
-      if (elem_size != sizeof(float) && elem_size != sizeof(double)) {
+      if (attrib.second.first != sizeof(float)) {
         continue;
       }
       if (primary_ply_props.count(attrib.first)) {
@@ -366,14 +364,13 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
           break;
         }
         const auto it = sm->frame->aux_attributes.find(attrib.first);
-        if (it == sm->frame->aux_attributes.end() || it->second.first != elem_size) {
+        if (it == sm->frame->aux_attributes.end() || it->second.first != sizeof(float)) {
           all_have = false;
           break;
         }
       }
       if (all_have) {
         aux_names.push_back(attrib.first);
-        aux_elem_sizes[attrib.first] = elem_size;
       }
     }
   }
@@ -432,15 +429,8 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     }
 
     for (const auto& name : aux_names) {
-      const auto& attr = frame->aux_attributes.at(name);
-      const int n = frame->size();
-      if (aux_elem_sizes.at(name) == sizeof(double)) {
-        const double* src = static_cast<const double*>(attr.second);
-        for (int i = 0; i < n; i++) aux_data[name].push_back(static_cast<float>(src[i]));
-      } else {
-        const float* src = static_cast<const float*>(attr.second);
-        aux_data[name].insert(aux_data[name].end(), src, src + n);
-      }
+      const float* src = static_cast<const float*>(frame->aux_attributes.at(name).second);
+      aux_data[name].insert(aux_data[name].end(), src, src + frame->size());
     }
 
     if (has_aux_intensity) {

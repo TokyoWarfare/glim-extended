@@ -149,12 +149,14 @@ void StandardViewer::drawable_selection() {
     const int aux_idx = (submap_color_mode >= 3) ? submap_color_mode - 3 : -1;
     const std::string aux_attr = (aux_idx >= 0 && aux_idx < static_cast<int>(aux_attribute_names.size())) ? aux_attribute_names[aux_idx] : "";
 
-    // Seed intensity_range from the submap stats for the newly selected attribute.
+    // Seed intensity_range from pre-accumulated data range when switching to an aux mode,
+    // so cmap_range is immediately correct for data that arrived before this mode was selected.
     if (!aux_attr.empty()) {
-      const auto it = submap_attr_stats.find(aux_attr);
-      if (it != submap_attr_stats.end() && it->second.size() > 0) {
-        intensity_range[0] = static_cast<float>(it->second.min());
-        intensity_range[1] = static_cast<float>(it->second.max());
+      const auto it = aux_data_range.find(aux_attr);
+      if (it != aux_data_range.end() && it->second.first <= it->second.second) {
+        intensity_range[0] = it->second.first;
+        intensity_range[1] = it->second.second;
+        intensity_dist = gtsam_points::RunningStatistics<double>();  // reset so it refills from new submaps
       }
     }
 
@@ -210,27 +212,9 @@ void StandardViewer::drawable_selection() {
 
   if (odom_color_mode >= 2 || submap_color_mode >= 3) {
     ImGui::Checkbox("auto_intensity_range", &auto_intensity_range);
-    if (auto_intensity_range) {
-      // Prefer submap stats when submaps are in aux mode; fall back to odom stats otherwise.
-      if (submap_color_mode >= 3) {
-        const int aux_idx = submap_color_mode - 3;
-        if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
-          const auto it = submap_attr_stats.find(aux_attribute_names[aux_idx]);
-          if (it != submap_attr_stats.end() && it->second.size() > 0) {
-            intensity_range[0] = static_cast<float>(it->second.min());
-            intensity_range[1] = static_cast<float>(it->second.max());
-          }
-        }
-      } else if (odom_color_mode >= 2) {
-        const int aux_idx = odom_color_mode - 2;
-        if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
-          const auto it = odom_attr_stats.find(aux_attribute_names[aux_idx]);
-          if (it != odom_attr_stats.end() && it->second.size() > 0) {
-            intensity_range[0] = static_cast<float>(it->second.min());
-            intensity_range[1] = static_cast<float>(it->second.max());
-          }
-        }
-      }
+    if (auto_intensity_range && intensity_dist.size() > 0) {
+      intensity_range[0] = static_cast<float>(intensity_dist.min());
+      intensity_range[1] = static_cast<float>(intensity_dist.max());
     }
 
     ImGui::SetNextItemWidth(150);

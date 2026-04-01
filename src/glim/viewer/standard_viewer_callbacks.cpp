@@ -92,7 +92,7 @@ void StandardViewer::set_callbacks() {
         }
       }
 
-      // Upload colormap for the selected aux attribute (odom mode 2+) and update odom_attr_stats
+      // Upload colormap for the selected aux attribute (odom mode 2+) and seed intensity_dist
       if (odom_color_mode >= 2) {
         const int aux_idx = odom_color_mode - 2;
         if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
@@ -109,10 +109,9 @@ void StandardViewer::set_callbacks() {
               const double* dptr = static_cast<const double*>(data);
               for (int i = 0; i < n; i++) colormap_vals[i] = static_cast<float>(dptr[i]);
             }
-            // Feed odom-only stats for this attribute so cmap_range auto-adjusts without polluting submap range
-            auto& stats = odom_attr_stats[attr_name];
+            // Feed actual data range into intensity_dist so cmap_range auto-adjusts to the data
             for (float v : colormap_vals) {
-              stats.add(v);
+              intensity_dist.add(v);
             }
             cloud_buffer->add_buffer(attr_name, colormap_vals);
             cloud_buffer->set_colormap_buffer(attr_name);
@@ -566,11 +565,12 @@ void StandardViewer::set_callbacks() {
         if (active_attr_name.empty()) {
           active_attr_name = attr_name;  // first available becomes default
         }
-        // Track data range in submap stats unconditionally (regardless of current color mode)
-        auto& stats = submap_attr_stats[attr_name];
-        for (float v : vals) {
-          stats.add(v);
-        }
+        // Track data range unconditionally (regardless of current color mode)
+        const float vmin = *std::min_element(vals.begin(), vals.end());
+        const float vmax = *std::max_element(vals.begin(), vals.end());
+        auto& range = aux_data_range.emplace(attr_name, std::make_pair(vmin, vmax)).first->second;
+        range.first = std::min(range.first, vmin);
+        range.second = std::max(range.second, vmax);
       }
 
       // Select and activate the colormap buffer for the current mode (3+ = aux attributes)
@@ -582,6 +582,13 @@ void StandardViewer::set_callbacks() {
           if (it != submap->frame->aux_attributes.end()) {
             const size_t elem_size = it->second.first;
             const int n = submap->frame->size();
+            if (elem_size == sizeof(float)) {
+              const float* data = static_cast<const float*>(it->second.second);
+              for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
+            } else if (elem_size == sizeof(double)) {
+              const double* data = static_cast<const double*>(it->second.second);
+              for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
+            }
             cloud_buffer->set_colormap_buffer(attr_name);
           }
         }

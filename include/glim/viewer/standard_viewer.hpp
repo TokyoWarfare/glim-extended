@@ -113,11 +113,10 @@ private:
 
   bool auto_intensity_range;
   Eigen::Vector2f intensity_range;
-  // Per-attribute running stats, kept separate so odom stream never pollutes submap range.
-  std::unordered_map<std::string, gtsam_points::RunningStatistics<double>> odom_attr_stats;
-  std::unordered_map<std::string, gtsam_points::RunningStatistics<double>> submap_attr_stats;
+  gtsam_points::RunningStatistics<double> intensity_dist;
 
   std::vector<std::string> aux_attribute_names;  // populated from first odom frame, used to build dynamic dropdowns
+  std::unordered_map<std::string, std::pair<float, float>> aux_data_range;  // unconditional per-attr [min,max] across all submaps
 
   std::unique_ptr<TrajectoryManager> trajectory;
   std::vector<Eigen::Isometry3f> submap_keyframes;
