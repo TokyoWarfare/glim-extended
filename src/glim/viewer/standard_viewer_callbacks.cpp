@@ -109,9 +109,12 @@ void StandardViewer::set_callbacks() {
               const double* dptr = static_cast<const double*>(data);
               for (int i = 0; i < n; i++) colormap_vals[i] = static_cast<float>(dptr[i]);
             }
-            // Feed actual data range into intensity_dist so cmap_range auto-adjusts to the data
-            for (float v : colormap_vals) {
-              intensity_dist.add(v);
+            // Only feed intensity_dist when odom and submap are showing the same attribute,
+            // so odom stream cannot corrupt the submap cmap_range when modes differ.
+            if (odom_color_mode - 2 == submap_color_mode - 3) {
+              for (float v : colormap_vals) {
+                intensity_dist.add(v);
+              }
             }
             cloud_buffer->add_buffer(attr_name, colormap_vals);
             cloud_buffer->set_colormap_buffer(attr_name);
