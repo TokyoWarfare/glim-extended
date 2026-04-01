@@ -488,16 +488,23 @@ void InteractiveViewer::update_viewer() {
         cloud_buffer->add_color(normal_colors);
       }
 
-      // Always upload ALL float aux attributes as named GL buffers so mode-switching works
+      // Always upload ALL float/double aux attributes as named GL buffers so mode-switching works
       std::string first_aux_name;
       for (const auto& attr_name : aux_attribute_names) {
         const auto it = submap->frame->aux_attributes.find(attr_name);
-        if (it == submap->frame->aux_attributes.end() || it->second.first != sizeof(float)) {
+        if (it == submap->frame->aux_attributes.end()) continue;
+        const size_t elem_size = it->second.first;
+        const int n = submap->frame->size();
+        std::vector<float> vals(n);
+        if (elem_size == sizeof(float)) {
+          const float* data = static_cast<const float*>(it->second.second);
+          std::copy(data, data + n, vals.begin());
+        } else if (elem_size == sizeof(double)) {
+          const double* data = static_cast<const double*>(it->second.second);
+          for (int i = 0; i < n; i++) vals[i] = static_cast<float>(data[i]);
+        } else {
           continue;
         }
-        const int n = submap->frame->size();
-        const float* data = static_cast<const float*>(it->second.second);
-        std::vector<float> vals(data, data + n);
         cloud_buffer->add_buffer(attr_name, vals);
         if (first_aux_name.empty()) {
           first_aux_name = attr_name;
@@ -555,17 +562,31 @@ void InteractiveViewer::update_viewer() {
         const auto& attr_name = aux_attribute_names[aux_idx];
         for (const auto& sm : submaps) {
           const auto it = sm->frame->aux_attributes.find(attr_name);
-          if (it == sm->frame->aux_attributes.end() || it->second.first != sizeof(float)) continue;
-          const float* data = static_cast<const float*>(it->second.second);
+          if (it == sm->frame->aux_attributes.end()) continue;
           const int n = sm->frame->size();
-          for (int k = 0; k < n; k++) {
-            aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
-            aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
+          if (it->second.first == sizeof(float)) {
+            const float* data = static_cast<const float*>(it->second.second);
+            for (int k = 0; k < n; k++) {
+              if (std::isfinite(data[k])) {
+                aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
+                aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
+              }
+            }
+          } else if (it->second.first == sizeof(double)) {
+            const double* data = static_cast<const double*>(it->second.second);
+            for (int k = 0; k < n; k++) {
+              const float v = static_cast<float>(data[k]);
+              if (std::isfinite(v)) {
+                aux_cmap_range[0] = std::min(aux_cmap_range[0], v);
+                aux_cmap_range[1] = std::max(aux_cmap_range[1], v);
+              }
+            }
           }
         }
       }
     }
     if (aux_cmap_range[0] <= aux_cmap_range[1]) {
+      std::cerr << "[DEBUG] cmap_range=" << aux_cmap_range[0] << " " << aux_cmap_range[1] << std::endl;
       viewer->shader_setting().add<Eigen::Vector2f>("cmap_range", aux_cmap_range);
     }
   }
@@ -673,12 +694,25 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
       const int aux_idx = color_mode - 3;
       if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
         const auto it = submap->frame->aux_attributes.find(aux_attribute_names[aux_idx]);
-        if (it != submap->frame->aux_attributes.end() && it->second.first == sizeof(float)) {
-          const float* data = static_cast<const float*>(it->second.second);
+        if (it != submap->frame->aux_attributes.end()) {
           const int n = submap->frame->size();
-          for (int k = 0; k < n; k++) {
-            aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
-            aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
+          if (it->second.first == sizeof(float)) {
+            const float* data = static_cast<const float*>(it->second.second);
+            for (int k = 0; k < n; k++) {
+              if (std::isfinite(data[k])) {
+                aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
+                aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
+              }
+            }
+          } else if (it->second.first == sizeof(double)) {
+            const double* data = static_cast<const double*>(it->second.second);
+            for (int k = 0; k < n; k++) {
+              const float v = static_cast<float>(data[k]);
+              if (std::isfinite(v)) {
+                aux_cmap_range[0] = std::min(aux_cmap_range[0], v);
+                aux_cmap_range[1] = std::max(aux_cmap_range[1], v);
+              }
+            }
           }
         }
       }
