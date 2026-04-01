@@ -149,6 +149,17 @@ void StandardViewer::drawable_selection() {
     const int aux_idx = (submap_color_mode >= 3) ? submap_color_mode - 3 : -1;
     const std::string aux_attr = (aux_idx >= 0 && aux_idx < static_cast<int>(aux_attribute_names.size())) ? aux_attribute_names[aux_idx] : "";
 
+    // Seed intensity_range from pre-accumulated data range when switching to an aux mode,
+    // so cmap_range is immediately correct for data that arrived before this mode was selected.
+    if (!aux_attr.empty()) {
+      const auto it = aux_data_range.find(aux_attr);
+      if (it != aux_data_range.end() && it->second.first <= it->second.second) {
+        intensity_range[0] = it->second.first;
+        intensity_range[1] = it->second.second;
+        intensity_dist = gtsam_points::RunningStatistics<double>();  // reset so it refills from new submaps
+      }
+    }
+
     for (int i = 0;; i++) {
       const auto found = viewer->find_drawable("submap_" + std::to_string(i));
       if (!found.first) {

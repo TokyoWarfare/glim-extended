@@ -344,7 +344,9 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     return false;
   }
 
-  // Collect float aux_attribute names present in all submaps, excluding primary PLY properties
+  // Collect float aux_attribute names present in all submaps, excluding primary PLY properties.
+  // "intensity" is excluded because it collides with ply.intensities (primary double field);
+  // it will be exported separately as "intensity_aux" for pipeline comparison.
   static const std::unordered_set<std::string> primary_ply_props = {"x", "y", "z", "nx", "ny", "nz", "intensity", "r", "g", "b", "a"};
   std::vector<std::string> aux_names;
   if (submaps[0] && submaps[0]->frame) {
@@ -376,6 +378,20 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
   progress.set_text("Writing to file");
   progress.increment();
 
+  // Check whether aux_attributes["intensity"] (float) is present in all submaps.
+  // This is distinct from frame->intensities (primary double field exported via ply.intensities).
+  bool has_aux_intensity = true;
+  for (const auto& submap : submaps) {
+    if (!submap || !submap->frame) {
+      continue;
+    }
+    const auto it = submap->frame->aux_attributes.find("intensity");
+    if (it == submap->frame->aux_attributes.end() || it->second.first != sizeof(float)) {
+      has_aux_intensity = false;
+      break;
+    }
+  }
+
   glk::PLYData ply;
   ply.vertices.reserve(total_points);
   if (has_normals) {
@@ -388,6 +404,10 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
   std::unordered_map<std::string, std::vector<float>> aux_data;
   for (const auto& name : aux_names) {
     aux_data[name].reserve(total_points);
+  }
+  std::vector<float> aux_intensity_data;
+  if (has_aux_intensity) {
+    aux_intensity_data.reserve(total_points);
   }
 
   for (const auto& submap : submaps) {
@@ -412,10 +432,18 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
       const float* src = static_cast<const float*>(frame->aux_attributes.at(name).second);
       aux_data[name].insert(aux_data[name].end(), src, src + frame->size());
     }
+
+    if (has_aux_intensity) {
+      const float* src = static_cast<const float*>(frame->aux_attributes.at("intensity").second);
+      aux_intensity_data.insert(aux_intensity_data.end(), src, src + frame->size());
+    }
   }
 
   for (const auto& name : aux_names) {
     ply.add_prop<float>(name, aux_data[name].data(), aux_data[name].size());
+  }
+  if (has_aux_intensity) {
+    ply.add_prop<float>("intensity_aux", aux_intensity_data.data(), aux_intensity_data.size());
   }
 
   glk::save_ply_binary(path, ply);

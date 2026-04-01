@@ -58,6 +58,8 @@ CloudPreprocessorParams::CloudPreprocessorParams() {
   k_correspondences = config.param<int>("preprocess", "k_correspondences", 8);
 
   num_threads = config.param<int>("preprocess", "num_threads", 2);
+
+  scanner_id = sensor_config.param<int>("sensors", "scanner_id", 1);
 }
 
 CloudPreprocessorParams::~CloudPreprocessorParams() {}
@@ -175,6 +177,17 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
   }
   frame->add_aux_attribute<float>("range", ranges);
 
+  // Compute absolute per-point GPS time (frame stamp + per-point relative time)
+  std::vector<double> gps_times(frame->size());
+  for (int i = 0; i < frame->size(); i++) {
+    gps_times[i] = raw_points->stamp + frame->times[i];
+  }
+  frame->add_aux_attribute<double>("gps_time", gps_times);
+
+  // Tag every point with the scanner ID (constant per frame, read from config)
+  std::vector<float> scanner_ids(frame->size(), static_cast<float>(params.scanner_id));
+  frame->add_aux_attribute<float>("scanner_id", scanner_ids);
+
   // Create a preprocessed frame
   PreprocessedFrame::Ptr preprocessed(new PreprocessedFrame);
   preprocessed->stamp = raw_points->stamp;
@@ -186,11 +199,14 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
     preprocessed->intensities.assign(frame->intensities, frame->intensities + frame->size());
   }
 
-  // Propagate float aux_attributes (e.g., range) to the preprocessed frame
+  // Propagate float and double aux_attributes to the preprocessed frame
   for (const auto& attrib : frame->aux_attributes) {
     if (attrib.second.first == sizeof(float)) {
       const float* data = static_cast<const float*>(attrib.second.second);
       preprocessed->aux_attributes[attrib.first].assign(data, data + frame->size());
+    } else if (attrib.second.first == sizeof(double)) {
+      const double* data = static_cast<const double*>(attrib.second.second);
+      preprocessed->double_aux_attributes[attrib.first].assign(data, data + frame->size());
     }
   }
 

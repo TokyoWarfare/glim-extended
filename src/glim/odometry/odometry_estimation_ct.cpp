@@ -96,6 +96,9 @@ EstimationFrame::ConstPtr OdometryEstimationCT::insert_frame(const PreprocessedF
   for (const auto& attrib : raw_frame->aux_attributes) {
     frame_cpu->add_aux_attribute<float>(attrib.first, attrib.second);
   }
+  for (const auto& attrib : raw_frame->double_aux_attributes) {
+    frame_cpu->add_aux_attribute<double>(attrib.first, attrib.second);
+  }
 
   covariance_estimation->estimate(raw_frame->points, raw_frame->neighbors, frame_cpu->normals_storage, frame_cpu->covs_storage);
   frame_cpu->normals = frame_cpu->normals_storage.data();

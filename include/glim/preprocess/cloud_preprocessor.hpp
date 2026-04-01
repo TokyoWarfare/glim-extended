@@ -36,6 +36,8 @@ public:
   int k_correspondences;              ///< Number of neighboring points
 
   int num_threads;                    ///< Number of threads
+
+  int scanner_id;  ///< Scanner identifier tag written to every point (read from sensors.scanner_id, default=1)
 };
 
 /**
