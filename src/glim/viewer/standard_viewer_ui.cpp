@@ -211,14 +211,25 @@ void StandardViewer::drawable_selection() {
   }
 
   if (odom_color_mode >= 2 || submap_color_mode >= 3) {
-    ImGui::Checkbox("auto_intensity_range", &auto_intensity_range);
-    if (auto_intensity_range && intensity_dist.size() > 0) {
-      intensity_range[0] = static_cast<float>(intensity_dist.min());
-      intensity_range[1] = static_cast<float>(intensity_dist.max());
+    ImGui::Checkbox("auto scalar range", &auto_intensity_range);
+    if (auto_intensity_range) {
+      // Prefer aux_data_range (per-submap percentile) when in submap aux mode
+      const int aux_idx_s = (submap_color_mode >= 3) ? submap_color_mode - 3 : -1;
+      const std::string submap_attr =
+        (aux_idx_s >= 0 && aux_idx_s < static_cast<int>(aux_attribute_names.size())) ? aux_attribute_names[aux_idx_s] : "";
+      const auto it = (!submap_attr.empty()) ? aux_data_range.find(submap_attr) : aux_data_range.end();
+      if (it != aux_data_range.end() && it->second.first <= it->second.second) {
+        intensity_range[0] = it->second.first;
+        intensity_range[1] = it->second.second;
+      } else if (intensity_dist.size() > 0) {
+        // Fallback to filtered min/max from intensity_dist (odom-only mode or no submap data yet)
+        intensity_range[0] = static_cast<float>(intensity_dist.min());
+        intensity_range[1] = static_cast<float>(intensity_dist.max());
+      }
     }
 
     ImGui::SetNextItemWidth(150);
-    ImGui::DragFloatRange2("intensity_range", &intensity_range[0], &intensity_range[1], 0.1f, -65536.0f, 65536.0f);
+    ImGui::DragFloatRange2("scalar range", &intensity_range[0], &intensity_range[1], 0.1f, -65536.0f, 65536.0f);
     viewer->shader_setting().add<Eigen::Vector2f>("cmap_range", Eigen::Vector2f(intensity_range[0], intensity_range[1]));
   }
 

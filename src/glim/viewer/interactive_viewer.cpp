@@ -1,5 +1,6 @@
 #include <glim/viewer/interactive_viewer.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <limits>
 #include <thread>
@@ -37,6 +38,18 @@
 namespace glim {
 using gtsam::symbol_shorthand::X;
 
+// Compute the [lo_pct, hi_pct] percentile range from a vector of samples.
+// The vector is sorted in-place; caller should keep a persistent copy or accept the sort.
+static Eigen::Vector2f percentile_range(std::vector<float>& samples, float lo_pct = 0.01f, float hi_pct = 0.99f) {
+  if (samples.size() < 2) {
+    return samples.empty() ? Eigen::Vector2f(0.0f, 1.0f) : Eigen::Vector2f(samples[0], samples[0]);
+  }
+  std::sort(samples.begin(), samples.end());
+  const int lo = static_cast<int>(lo_pct * static_cast<float>(samples.size() - 1));
+  const int hi = static_cast<int>(hi_pct * static_cast<float>(samples.size() - 1));
+  return Eigen::Vector2f(samples[lo], samples[hi]);
+}
+
 InteractiveViewer::InteractiveViewer() : logger(create_module_logger("viewer")) {
   glim::Config config(glim::GlobalConfig::get_config_path("config_viewer"));
 
@@ -52,6 +65,7 @@ InteractiveViewer::InteractiveViewer() : logger(create_module_logger("viewer")) 
 
   color_mode = 0;
   aux_cmap_range = Eigen::Vector2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest());
+  gps_time_base = 0.0;
   coord_scale = 1.0f;
   sphere_scale = 0.5f;
 
@@ -214,7 +228,8 @@ void InteractiveViewer::drawable_selection() {
     color_modes.push_back(name.c_str());
   }
   if (ImGui::Combo("ColorMode", &color_mode, color_modes.data(), color_modes.size())) {
-    aux_cmap_range = Eigen::Vector2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest());  // force recompute for new attribute
+    aux_attr_samples.clear();  // discard old samples so full-scan re-collects for new attribute
+    aux_cmap_range = Eigen::Vector2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest());
     update_viewer();
   }
   show_note("Color mode for rendering submaps.\n- RAINBOW=Altitude encoding color\n- SESSION=Session ID\n- NORMAL=Surface normal direction\n- others=Per-point attribute colormap");
@@ -501,7 +516,17 @@ void InteractiveViewer::update_viewer() {
           std::copy(data, data + n, vals.begin());
         } else if (elem_size == sizeof(double)) {
           const double* data = static_cast<const double*>(it->second.second);
-          for (int i = 0; i < n; i++) vals[i] = static_cast<float>(data[i]);
+          // Set gps_time_base on first encounter. Scan past any zero-sentinel voxels
+          // (FIRST-mode boundary voxels store 0) to find the first valid timestamp.
+          if (attr_name == "gps_time" && gps_time_base == 0.0) {
+            double min_gps = std::numeric_limits<double>::max();
+            for (int i = 0; i < n; i++) {
+              if (std::isfinite(data[i])) min_gps = std::min(min_gps, data[i]);
+            }
+            if (min_gps < std::numeric_limits<double>::max()) gps_time_base = min_gps;
+          }
+          const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
+          for (int i = 0; i < n; i++) vals[i] = static_cast<float>(data[i] - base);
         } else {
           continue;
         }
@@ -555,38 +580,46 @@ void InteractiveViewer::update_viewer() {
 
   // Set colormap range for aux attribute rendering
   if (color_mode >= 3) {
-    // If range is unset (min > max sentinel), compute it from all loaded submaps
+    // If range is unset (min > max sentinel), collect all valid samples and compute percentile
     if (aux_cmap_range[0] > aux_cmap_range[1]) {
       const int aux_idx = color_mode - 3;
       if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
         const auto& attr_name = aux_attribute_names[aux_idx];
-        for (const auto& sm : submaps) {
-          const auto it = sm->frame->aux_attributes.find(attr_name);
-          if (it == sm->frame->aux_attributes.end()) continue;
-          const int n = sm->frame->size();
-          if (it->second.first == sizeof(float)) {
-            const float* data = static_cast<const float*>(it->second.second);
-            for (int k = 0; k < n; k++) {
-              if (std::isfinite(data[k])) {
-                aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
-                aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
+        auto& samples = aux_attr_samples[attr_name];
+        if (samples.empty()) {
+          for (const auto& sm : submaps) {
+            const auto it = sm->frame->aux_attributes.find(attr_name);
+            if (it == sm->frame->aux_attributes.end()) continue;
+            const int n = sm->frame->size();
+            if (it->second.first == sizeof(float)) {
+              const float* data = static_cast<const float*>(it->second.second);
+              for (int k = 0; k < n; k++) {
+                const float v = data[k];
+                if (std::isfinite(v) && v > 0.0f && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
               }
-            }
-          } else if (it->second.first == sizeof(double)) {
-            const double* data = static_cast<const double*>(it->second.second);
-            for (int k = 0; k < n; k++) {
-              const float v = static_cast<float>(data[k]);
-              if (std::isfinite(v)) {
-                aux_cmap_range[0] = std::min(aux_cmap_range[0], v);
-                aux_cmap_range[1] = std::max(aux_cmap_range[1], v);
+            } else if (it->second.first == sizeof(double)) {
+              const double* data = static_cast<const double*>(it->second.second);
+              if (attr_name == "gps_time" && gps_time_base == 0.0) {
+                double min_gps = std::numeric_limits<double>::max();
+                for (int k = 0; k < n; k++) {
+                  if (std::isfinite(data[k])) min_gps = std::min(min_gps, data[k]);
+                }
+                if (min_gps < std::numeric_limits<double>::max()) gps_time_base = min_gps;
+              }
+              const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
+              for (int k = 0; k < n; k++) {
+                const float v = static_cast<float>(data[k] - base);
+                if (std::isfinite(v) && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
               }
             }
           }
         }
+        if (!samples.empty()) {
+          aux_cmap_range = percentile_range(samples);
+        }
       }
     }
     if (aux_cmap_range[0] <= aux_cmap_range[1]) {
-      std::cerr << "[DEBUG] cmap_range=" << aux_cmap_range[0] << " " << aux_cmap_range[1] << std::endl;
       viewer->shader_setting().add<Eigen::Vector2f>("cmap_range", aux_cmap_range);
     }
   }
@@ -679,6 +712,15 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
 
     trajectory->update_anchor(submap->frames[submap->frames.size() / 2]->stamp, submap->T_world_origin);
 
+    {
+      const double* gps = submap->frame->aux_attribute<double>("gps_time");
+      if (gps) {
+        for (int i = 0; i < std::min(10, (int)submap->frame->size()); i++) {
+          std::cerr << "[RAW] gps[" << i << "]=" << gps[i] << std::endl;
+        }
+      }
+    }
+
     // Populate aux_attribute_names from first submap; guaranteed to run for every new submap.
     if (aux_attribute_names.empty()) {
       for (const auto& attrib : submap->frame->aux_attributes) {
@@ -689,30 +731,38 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
       }
     }
 
-    // Update aux_cmap_range incrementally from this submap's active aux attribute
+    // Extend per-attr sample pool from this submap, then recompute percentile range
     if (color_mode >= 3) {
       const int aux_idx = color_mode - 3;
       if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
-        const auto it = submap->frame->aux_attributes.find(aux_attribute_names[aux_idx]);
+        const auto& attr_name = aux_attribute_names[aux_idx];
+        const auto it = submap->frame->aux_attributes.find(attr_name);
         if (it != submap->frame->aux_attributes.end()) {
+          auto& samples = aux_attr_samples[attr_name];
           const int n = submap->frame->size();
           if (it->second.first == sizeof(float)) {
             const float* data = static_cast<const float*>(it->second.second);
             for (int k = 0; k < n; k++) {
-              if (std::isfinite(data[k])) {
-                aux_cmap_range[0] = std::min(aux_cmap_range[0], data[k]);
-                aux_cmap_range[1] = std::max(aux_cmap_range[1], data[k]);
-              }
+              const float v = data[k];
+              if (std::isfinite(v) && v > 0.0f && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
             }
           } else if (it->second.first == sizeof(double)) {
             const double* data = static_cast<const double*>(it->second.second);
-            for (int k = 0; k < n; k++) {
-              const float v = static_cast<float>(data[k]);
-              if (std::isfinite(v)) {
-                aux_cmap_range[0] = std::min(aux_cmap_range[0], v);
-                aux_cmap_range[1] = std::max(aux_cmap_range[1], v);
+            if (attr_name == "gps_time" && gps_time_base == 0.0) {
+              double min_gps = std::numeric_limits<double>::max();
+              for (int k = 0; k < n; k++) {
+                if (std::isfinite(data[k])) min_gps = std::min(min_gps, data[k]);
               }
+              if (min_gps < std::numeric_limits<double>::max()) gps_time_base = min_gps;
             }
+            const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
+            for (int k = 0; k < n; k++) {
+              const float v = static_cast<float>(data[k] - base);
+              if (std::isfinite(v) && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
+            }
+          }
+          if (!samples.empty()) {
+            aux_cmap_range = percentile_range(samples);
           }
         }
       }
