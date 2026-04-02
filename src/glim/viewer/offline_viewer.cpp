@@ -1,6 +1,5 @@
 #include <glim/viewer/offline_viewer.hpp>
 
-#include <cstring>
 #include <unordered_set>
 #include <boost/filesystem.hpp>
 #include <gtsam_points/config.hpp>
@@ -9,7 +8,7 @@
 #include <glim/util/config.hpp>
 
 #include <spdlog/spdlog.h>
-#include <imgui.h>
+#include <portable-file-dialogs.h>
 #include <glk/io/ply_io.hpp>
 #include <guik/recent_files.hpp>
 #include <guik/progress_modal.hpp>
@@ -17,11 +16,7 @@
 
 namespace glim {
 
-OfflineViewer::OfflineViewer(const std::string& init_map_path) : init_map_path(init_map_path) {
-  dialog_path_buf[0] = '\0';
-  dialog_optimize_on_load = true;
-  show_load_error = false;
-}
+OfflineViewer::OfflineViewer(const std::string& init_map_path) : init_map_path(init_map_path) {}
 
 OfflineViewer::~OfflineViewer() {}
 
@@ -37,41 +32,43 @@ void OfflineViewer::setup_ui() {
 }
 
 void OfflineViewer::main_menu() {
-  // Track which dialog to open this frame
-  bool open_dialog = !init_map_path.empty();  // auto-trigger if init path provided
-  bool close_confirm = false;
-  bool save_dialog = false;
-  bool export_dialog = false;
-  bool quit_confirm = false;
+  bool start_open_map = !init_map_path.empty();
+  bool start_close_map = false;
+  bool start_save_map = false;
+  bool start_export_map = false;
 
   if (ImGui::BeginMainMenuBar()) {
     if (ImGui::BeginMenu("File")) {
       if (!async_global_mapping) {
         if (ImGui::MenuItem("Open New Map")) {
-          open_dialog = true;
+          start_open_map = true;
         }
       } else {
         if (ImGui::MenuItem("Open Additional Map")) {
-          open_dialog = true;
+          start_open_map = true;
         }
       }
 
       if (ImGui::MenuItem("Close Map")) {
-        close_confirm = true;
+        if (pfd::message("Warning", "Close the map?").result() == pfd::button::ok) {
+          start_close_map = true;
+        }
       }
 
       if (ImGui::BeginMenu("Save")) {
         if (ImGui::MenuItem("Save Map")) {
-          save_dialog = true;
+          start_save_map = true;
         }
         if (ImGui::MenuItem("Export Points")) {
-          export_dialog = true;
+          start_export_map = true;
         }
         ImGui::EndMenu();
       }
 
       if (ImGui::MenuItem("Quit")) {
-        quit_confirm = true;
+        if (pfd::message("Warning", "Quit?").result() == pfd::button::ok) {
+          request_to_terminate = true;
+        }
       }
 
       ImGui::EndMenu();
@@ -80,209 +77,108 @@ void OfflineViewer::main_menu() {
   }
 
   // --- Open map ---
-  if (open_dialog) {
-    if (!init_map_path.empty()) {
-      // Auto-load from command-line path: skip dialog, start immediately
-      const std::string map_path = init_map_path;
-      init_map_path.clear();
-      do_open_map(map_path, true);
+  if (start_open_map) {
+    logger->debug("open map");
+    std::string map_path;
+
+    guik::RecentFiles recent_files("offline_viewer_open");
+    if (init_map_path.empty()) {
+      map_path = pfd::select_folder("Select a dump directory", recent_files.most_recent()).result();
     } else {
-      guik::RecentFiles recent_files("offline_viewer_open");
-      const std::string recent = recent_files.most_recent();
-      strncpy(dialog_path_buf, recent.c_str(), sizeof(dialog_path_buf) - 1);
-      dialog_path_buf[sizeof(dialog_path_buf) - 1] = '\0';
-      dialog_optimize_on_load = true;
-      ImGui::OpenPopup("Open Map##dlg");
+      map_path = init_map_path;
+      init_map_path.clear();
     }
-  }
-  if (ImGui::BeginPopupModal("Open Map##dlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::Text("Map directory:");
-    ImGui::SetNextItemWidth(400.0f);
-    ImGui::InputText("##open_path", dialog_path_buf, sizeof(dialog_path_buf));
-    ImGui::Checkbox("Enable optimization", &dialog_optimize_on_load);
-    ImGui::Separator();
-    if (ImGui::Button("OK", ImVec2(120, 0))) {
-      const std::string map_path(dialog_path_buf);
-      if (!map_path.empty()) {
-        guik::RecentFiles("offline_viewer_open").push(map_path);
-        do_open_map(map_path, dialog_optimize_on_load);
+
+    if (!map_path.empty()) {
+      logger->debug("open map from {}", map_path);
+      recent_files.push(map_path);
+
+      if (boost::filesystem::exists(map_path + "/config")) {
+        logger->info("Use config from {}", map_path + "/config");
+        GlobalConfig::instance(map_path + "/config", true);
+      } else {
+        logger->warn("No config found in {}", map_path);
       }
-      ImGui::CloseCurrentPopup();
+
+      const Config config_ros(GlobalConfig::get_config_path("config_ros"));
+      const std::vector<std::string> ext_module_names = config_ros.param<std::vector<std::string>>("glim_ros", "extension_modules", {});
+      for (const auto& name : ext_module_names) {
+        if (name.find("viewer") != std::string::npos || name.find("monitor") != std::string::npos) {
+          continue;
+        }
+        if (imported_shared_libs.count(name)) {
+          logger->debug("Extension module {} already loaded", name);
+          continue;
+        }
+        logger->info("Export classes from {}", name);
+        ExtensionModule::export_classes(name);
+        imported_shared_libs.insert(name);
+      }
+
+      std::shared_ptr<GlobalMapping> existing_mapping;
+      if (async_global_mapping) {
+        logger->info("global map already exists, loading new map into existing global map");
+        existing_mapping = std::dynamic_pointer_cast<GlobalMapping>(async_global_mapping->get_global_mapping());
+      }
+
+      progress_modal->open<std::shared_ptr<GlobalMapping>>(
+        "open",
+        [this, map_path, existing_mapping](guik::ProgressInterface& progress) { return load_map(progress, map_path, existing_mapping); });
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
   }
 
-  // Process open result
   auto open_result = progress_modal->run<std::shared_ptr<GlobalMapping>>("open");
   if (open_result) {
     if (!(*open_result)) {
-      show_load_error = true;
+      pfd::message("Error", "Failed to load map").result();
     } else {
       async_global_mapping.reset(new glim::AsyncGlobalMapping(*open_result, 1e6));
     }
   }
-  if (show_load_error) {
-    ImGui::OpenPopup("Load Error##dlg");
-    show_load_error = false;
-  }
-  if (ImGui::BeginPopupModal("Load Error##dlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::Text("Failed to load map.");
-    ImGui::Separator();
-    if (ImGui::Button("OK", ImVec2(120, 0))) {
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
-  }
-
-  // --- Close map ---
-  if (close_confirm) {
-    ImGui::OpenPopup("Close Map?##dlg");
-  }
-  if (ImGui::BeginPopupModal("Close Map?##dlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::Text("Close the current map?");
-    ImGui::Separator();
-    if (ImGui::Button("OK", ImVec2(120, 0))) {
-      if (async_global_mapping) {
-        logger->info("Closing map");
-        async_global_mapping->join();
-        async_global_mapping.reset();
-        clear();
-      }
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
-  }
 
   // --- Save map ---
-  if (save_dialog) {
+  if (start_save_map) {
     if (!async_global_mapping) {
       logger->warn("No map data to save");
     } else {
       guik::RecentFiles recent_files("offline_viewer_save");
-      const std::string recent = recent_files.most_recent();
-      strncpy(dialog_path_buf, recent.empty() ? "/tmp/glim_map" : recent.c_str(), sizeof(dialog_path_buf) - 1);
-      dialog_path_buf[sizeof(dialog_path_buf) - 1] = '\0';
-      ImGui::OpenPopup("Save Map##dlg");
-    }
-  }
-  if (ImGui::BeginPopupModal("Save Map##dlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::Text("Save directory:");
-    ImGui::SetNextItemWidth(400.0f);
-    ImGui::InputText("##save_path", dialog_path_buf, sizeof(dialog_path_buf));
-    ImGui::Separator();
-    if (ImGui::Button("OK", ImVec2(120, 0))) {
-      const std::string path(dialog_path_buf);
+      const std::string path = pfd::select_folder("Select a directory to save the map", recent_files.most_recent()).result();
       if (!path.empty()) {
-        guik::RecentFiles("offline_viewer_save").push(path);
+        recent_files.push(path);
         progress_modal->open<bool>("save", [this, path](guik::ProgressInterface& progress) { return save_map(progress, path); });
       }
-      ImGui::CloseCurrentPopup();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
   }
-  progress_modal->run<bool>("save");
+  auto save_result = progress_modal->run<bool>("save");
 
   // --- Export points ---
-  if (export_dialog) {
+  if (start_export_map) {
     guik::RecentFiles recent_files("offline_viewer_export");
-    const std::string recent = recent_files.most_recent();
-    strncpy(dialog_path_buf, recent.empty() ? "/tmp/glim_points.ply" : recent.c_str(), sizeof(dialog_path_buf) - 1);
-    dialog_path_buf[sizeof(dialog_path_buf) - 1] = '\0';
-    ImGui::OpenPopup("Export Points##dlg");
-  }
-  if (ImGui::BeginPopupModal("Export Points##dlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::Text("Output PLY file:");
-    ImGui::SetNextItemWidth(400.0f);
-    ImGui::InputText("##export_path", dialog_path_buf, sizeof(dialog_path_buf));
-    ImGui::Separator();
-    if (ImGui::Button("OK", ImVec2(120, 0))) {
-      const std::string path(dialog_path_buf);
-      if (!path.empty()) {
-        guik::RecentFiles("offline_viewer_export").push(path);
-        progress_modal->open<bool>("export", [this, path](guik::ProgressInterface& progress) { return export_map(progress, path); });
-      }
-      ImGui::CloseCurrentPopup();
+    const std::string path = pfd::save_file("Select the file destination", recent_files.most_recent(), {"PLY", "*.ply"}).result();
+    if (!path.empty()) {
+      recent_files.push(path);
+      progress_modal->open<bool>("export", [this, path](guik::ProgressInterface& progress) { return export_map(progress, path); });
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
   }
-  progress_modal->run<bool>("export");
+  auto export_result = progress_modal->run<bool>("export");
 
-  // --- Quit ---
-  if (quit_confirm) {
-    ImGui::OpenPopup("Quit?##dlg");
-  }
-  if (ImGui::BeginPopupModal("Quit?##dlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::Text("Quit the application?");
-    ImGui::Separator();
-    if (ImGui::Button("OK", ImVec2(120, 0))) {
-      request_to_terminate = true;
-      ImGui::CloseCurrentPopup();
+  // --- Close map ---
+  if (start_close_map) {
+    if (async_global_mapping) {
+      logger->info("Closing map");
+      async_global_mapping->join();
+      async_global_mapping.reset();
+      clear();
+    } else {
+      logger->warn("No map to close");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(120, 0))) {
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
   }
 }
 
-void OfflineViewer::do_open_map(const std::string& map_path, bool optimize) {
-  logger->debug("open map from {}", map_path);
-
-  if (boost::filesystem::exists(map_path + "/config")) {
-    logger->info("Use config from {}", map_path + "/config");
-    GlobalConfig::instance(map_path + "/config", true);
-  } else {
-    logger->warn("No config found in {}", map_path);
-  }
-
-  const Config config_ros(GlobalConfig::get_config_path("config_ros"));
-  const std::vector<std::string> ext_module_names = config_ros.param<std::vector<std::string>>("glim_ros", "extension_modules", {});
-  for (const auto& name : ext_module_names) {
-    if (name.find("viewer") != std::string::npos || name.find("monitor") != std::string::npos) {
-      continue;
-    }
-    if (imported_shared_libs.count(name)) {
-      logger->debug("Extension module {} already loaded", name);
-      continue;
-    }
-    logger->info("Export classes from {}", name);
-    ExtensionModule::export_classes(name);
-    imported_shared_libs.insert(name);
-  }
-
-  std::shared_ptr<GlobalMapping> existing_mapping;
-  if (async_global_mapping) {
-    logger->info("global map already exists, loading new map into existing global map");
-    existing_mapping = std::dynamic_pointer_cast<GlobalMapping>(async_global_mapping->get_global_mapping());
-  }
-
-  progress_modal->open<std::shared_ptr<GlobalMapping>>(
-    "open",
-    [this, map_path, existing_mapping, optimize](guik::ProgressInterface& progress) { return load_map_with_optimize(progress, map_path, existing_mapping, optimize); });
-}
-
-std::shared_ptr<glim::GlobalMapping> OfflineViewer::load_map_with_optimize(
+std::shared_ptr<glim::GlobalMapping> OfflineViewer::load_map(
   guik::ProgressInterface& progress,
   const std::string& path,
-  std::shared_ptr<GlobalMapping> global_mapping,
-  bool optimize) {
+  std::shared_ptr<GlobalMapping> global_mapping) {
   progress.set_title("Load map");
   progress.set_text("Now loading");
   progress.set_maximum(1);
@@ -291,7 +187,10 @@ std::shared_ptr<glim::GlobalMapping> OfflineViewer::load_map_with_optimize(
     glim::GlobalMappingParams params;
     params.isam2_relinearize_skip = 1;
     params.isam2_relinearize_thresh = 0.0;
-    params.enable_optimization = optimize;
+
+    const auto result = pfd::message("Confirm", "Do optimization?", pfd::choice::yes_no).result();
+    params.enable_optimization = (result == pfd::button::ok) || (result == pfd::button::yes);
+
     logger->info("enable_optimization={}", params.enable_optimization);
     global_mapping.reset(new glim::GlobalMapping(params));
   }
