@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Core>
@@ -84,7 +85,11 @@ protected:
   // Visualization params
   int color_mode;
   std::vector<std::string> aux_attribute_names;
-  Eigen::Vector2f aux_cmap_range;  // auto-computed min/max across all submaps for the active aux attribute
+  Eigen::Vector2f aux_cmap_range;  // 1st–99th percentile range for the active aux attribute
+
+  static constexpr size_t AUX_SAMPLE_CAP = 500000;
+  std::unordered_map<std::string, std::vector<float>> aux_attr_samples;  // filtered (isfinite && >0) samples per attr
+  double gps_time_base;  // first gps_time seen; subtract before float cast to preserve float32 precision
 
   float coord_scale;
   float sphere_scale;

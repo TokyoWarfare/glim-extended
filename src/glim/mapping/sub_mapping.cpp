@@ -499,7 +499,7 @@ SubMap::Ptr SubMapping::create_submap(bool force_create) const {
     const std::unordered_map<std::string, gtsam_points::AttributeBlendMode> blend_modes = {
       {"intensity", gtsam_points::AttributeBlendMode::MAX},      // brightest return per voxel
       {"range", gtsam_points::AttributeBlendMode::MIN},          // closest return per voxel
-      {"gps_time", gtsam_points::AttributeBlendMode::AVERAGE},   // average timestamp for merged voxel
+      {"gps_time", gtsam_points::AttributeBlendMode::AVERAGE},    // mean timestamp; avoids zero-sentinel boundary voxels
       {"scanner_id", gtsam_points::AttributeBlendMode::FIRST},   // first (all identical per frame)
     };
     submap->frame = gtsam_points::merge_frames_auto(poses_to_merge, keyframes_to_merge, params.submap_downsample_resolution, blend_modes);

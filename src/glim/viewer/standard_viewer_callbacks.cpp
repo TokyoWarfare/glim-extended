@@ -92,7 +92,8 @@ void StandardViewer::set_callbacks() {
         }
       }
 
-      // Upload colormap for the selected aux attribute (odom mode 2+) and seed intensity_dist
+      // Upload colormap for the selected aux attribute (odom mode 2+) and seed intensity_dist.
+      // intensity_dist is exclusively for odom; submap range uses aux_data_range — no cross-pollution.
       if (odom_color_mode >= 2) {
         const int aux_idx = odom_color_mode - 2;
         if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
@@ -107,14 +108,19 @@ void StandardViewer::set_callbacks() {
               std::copy(static_cast<const float*>(data), static_cast<const float*>(data) + n, colormap_vals.begin());
             } else {
               const double* dptr = static_cast<const double*>(data);
-              for (int i = 0; i < n; i++) colormap_vals[i] = static_cast<float>(dptr[i]);
-            }
-            // Only feed intensity_dist when odom and submap are showing the same attribute,
-            // so odom stream cannot corrupt the submap cmap_range when modes differ.
-            if (odom_color_mode - 2 == submap_color_mode - 3) {
-              for (float v : colormap_vals) {
-                intensity_dist.add(v);
+              if (attr_name == "gps_time" && gps_time_base == 0.0) {
+                double min_gps = std::numeric_limits<double>::max();
+                for (int i = 0; i < n; i++) {
+                  if (std::isfinite(dptr[i])) min_gps = std::min(min_gps, dptr[i]);
+                }
+                if (min_gps < std::numeric_limits<double>::max()) gps_time_base = min_gps;
               }
+              const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
+              for (int i = 0; i < n; i++) colormap_vals[i] = static_cast<float>(dptr[i] - base);
+            }
+            // Always feed intensity_dist from odom (no submap-mode guard; the two stats are independent)
+            for (float v : colormap_vals) {
+              if (std::isfinite(v)) intensity_dist.add(v);
             }
             cloud_buffer->add_buffer(attr_name, colormap_vals);
             cloud_buffer->set_colormap_buffer(attr_name);
@@ -562,18 +568,35 @@ void StandardViewer::set_callbacks() {
           std::copy(data, data + n, vals.begin());
         } else {
           const double* data = static_cast<const double*>(it->second.second);
-          for (int i = 0; i < n; i++) vals[i] = static_cast<float>(data[i]);
+          if (attr_name == "gps_time" && gps_time_base == 0.0) {
+            double min_gps = std::numeric_limits<double>::max();
+            for (int i = 0; i < n; i++) {
+              if (std::isfinite(data[i])) min_gps = std::min(min_gps, data[i]);
+            }
+            if (min_gps < std::numeric_limits<double>::max()) gps_time_base = min_gps;
+          }
+          const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
+          for (int i = 0; i < n; i++) vals[i] = static_cast<float>(data[i] - base);
         }
         cloud_buffer->add_buffer(attr_name, vals);
         if (active_attr_name.empty()) {
           active_attr_name = attr_name;  // first available becomes default
         }
-        // Track data range unconditionally (regardless of current color mode)
-        const float vmin = *std::min_element(vals.begin(), vals.end());
-        const float vmax = *std::max_element(vals.begin(), vals.end());
-        auto& range = aux_data_range.emplace(attr_name, std::make_pair(vmin, vmax)).first->second;
-        range.first = std::min(range.first, vmin);
-        range.second = std::max(range.second, vmax);
+        // Track submap data range as [1st, 99th] percentile of finite values.
+        // submap uses aux_data_range exclusively; intensity_dist is for odom only.
+        std::vector<float> filtered;
+        filtered.reserve(vals.size());
+        for (float v : vals) {
+          if (std::isfinite(v)) filtered.push_back(v);
+        }
+        if (!filtered.empty()) {
+          std::sort(filtered.begin(), filtered.end());
+          const float plo = filtered[static_cast<int>(0.01f * static_cast<float>(filtered.size() - 1))];
+          const float phi = filtered[static_cast<int>(0.99f * static_cast<float>(filtered.size() - 1))];
+          auto& range = aux_data_range.emplace(attr_name, std::make_pair(plo, phi)).first->second;
+          range.first = std::min(range.first, plo);
+          range.second = std::max(range.second, phi);
+        }
       }
 
       // Select and activate the colormap buffer for the current mode (3+ = aux attributes)
@@ -583,15 +606,6 @@ void StandardViewer::set_callbacks() {
           const auto& attr_name = aux_attribute_names[aux_idx];
           const auto it = submap->frame->aux_attributes.find(attr_name);
           if (it != submap->frame->aux_attributes.end()) {
-            const size_t elem_size = it->second.first;
-            const int n = submap->frame->size();
-            if (elem_size == sizeof(float)) {
-              const float* data = static_cast<const float*>(it->second.second);
-              for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
-            } else if (elem_size == sizeof(double)) {
-              const double* data = static_cast<const double*>(it->second.second);
-              for (int i = 0; i < n; i++) intensity_dist.add(data[i]);
-            }
             cloud_buffer->set_colormap_buffer(attr_name);
           }
         }

@@ -115,6 +115,8 @@ private:
   Eigen::Vector2f intensity_range;
   gtsam_points::RunningStatistics<double> intensity_dist;
 
+  double gps_time_base;  // first gps_time seen; subtract before float cast to preserve float32 precision
+
   std::vector<std::string> aux_attribute_names;  // populated from first odom frame, used to build dynamic dropdowns
   std::unordered_map<std::string, std::pair<float, float>> aux_data_range;  // unconditional per-attr [min,max] across all submaps
 

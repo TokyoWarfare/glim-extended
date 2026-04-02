@@ -83,6 +83,7 @@ StandardViewer::StandardViewer() : logger(create_module_logger("viewer")) {
 
   auto_intensity_range = true;
   intensity_range = Eigen::Vector2f(0.0f, 1.0f);
+  gps_time_base = 0.0;
 
   point_size = config.param("standard_viewer", "point_size", 0.025);
   point_size_metric = config.param("standard_viewer", "point_size_metric", true);
