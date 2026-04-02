@@ -580,22 +580,37 @@ void InteractiveViewer::update_viewer() {
 
   // Set colormap range for aux attribute rendering
   if (color_mode >= 3) {
-    // If range is unset (min > max sentinel), collect all valid samples and compute percentile
+    // If range is unset (min > max sentinel), full-scan ALL submaps for global min/max.
+    // BUG FIXED: the old path used samples[] capped at AUX_SAMPLE_CAP; if early submaps
+    // filled the cap, later submaps never contributed to percentile_range, so the maximum
+    // was underestimated and all late-submap points clamped to max color.
+    // Fix: track global_min/global_max per-submap (one scalar each), independent of the cap,
+    // then set aux_cmap_range from those true global extremes.
     if (aux_cmap_range[0] > aux_cmap_range[1]) {
       const int aux_idx = color_mode - 3;
       if (aux_idx < static_cast<int>(aux_attribute_names.size())) {
         const auto& attr_name = aux_attribute_names[aux_idx];
         auto& samples = aux_attr_samples[attr_name];
         if (samples.empty()) {
+          int scanned = 0;
+          float global_min = std::numeric_limits<float>::max();
+          float global_max = std::numeric_limits<float>::lowest();
           for (const auto& sm : submaps) {
             const auto it = sm->frame->aux_attributes.find(attr_name);
             if (it == sm->frame->aux_attributes.end()) continue;
+            scanned++;
             const int n = sm->frame->size();
+            float sm_min = std::numeric_limits<float>::max();
+            float sm_max = std::numeric_limits<float>::lowest();
             if (it->second.first == sizeof(float)) {
               const float* data = static_cast<const float*>(it->second.second);
               for (int k = 0; k < n; k++) {
                 const float v = data[k];
-                if (std::isfinite(v) && v > 0.0f && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
+                if (std::isfinite(v) && v > 0.0f) {
+                  sm_min = std::min(sm_min, v);
+                  sm_max = std::max(sm_max, v);
+                  if (samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
+                }
               }
             } else if (it->second.first == sizeof(double)) {
               const double* data = static_cast<const double*>(it->second.second);
@@ -609,17 +624,35 @@ void InteractiveViewer::update_viewer() {
               const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
               for (int k = 0; k < n; k++) {
                 const float v = static_cast<float>(data[k] - base);
-                if (std::isfinite(v) && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
+                if (std::isfinite(v)) {
+                  sm_min = std::min(sm_min, v);
+                  sm_max = std::max(sm_max, v);
+                  if (samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
+                }
               }
             }
+            // Accumulate per-submap extremes into global — this is cap-independent
+            if (sm_min <= sm_max) {
+              global_min = std::min(global_min, sm_min);
+              global_max = std::max(global_max, sm_max);
+            }
           }
-        }
-        if (!samples.empty()) {
-          aux_cmap_range = percentile_range(samples);
+          std::cerr << "[FULL-SCAN] attr=" << attr_name
+                    << " scanned=" << scanned << "/" << submaps.size() << " submaps"
+                    << " global_min=" << global_min << " global_max=" << global_max
+                    << " samples=" << samples.size() << std::endl;
+          // Use global min/max (covers all submaps regardless of cap) as the range.
+          // Fall back to percentile of samples if no global range was computed.
+          if (global_min <= global_max) {
+            aux_cmap_range = Eigen::Vector2f(global_min, global_max);
+          } else if (!samples.empty()) {
+            aux_cmap_range = percentile_range(samples);
+          }
         }
       }
     }
     if (aux_cmap_range[0] <= aux_cmap_range[1]) {
+      std::cerr << "[CMAP] uploading cmap_range=[" << aux_cmap_range[0] << ", " << aux_cmap_range[1] << "]" << std::endl;
       viewer->shader_setting().add<Eigen::Vector2f>("cmap_range", aux_cmap_range);
     }
   }

@@ -21,9 +21,8 @@ private:
   virtual void setup_ui() override;
 
   void main_menu();
-  void do_open_map(const std::string& map_path, bool optimize);
 
-  std::shared_ptr<GlobalMapping> load_map_with_optimize(guik::ProgressInterface& progress, const std::string& path, std::shared_ptr<GlobalMapping> global_mapping, bool optimize);
+  std::shared_ptr<GlobalMapping> load_map(guik::ProgressInterface& progress, const std::string& path, std::shared_ptr<GlobalMapping> global_mapping);
   bool save_map(guik::ProgressInterface& progress, const std::string& path);
   bool export_map(guik::ProgressInterface& progress, const std::string& path);
 
@@ -33,11 +32,6 @@ private:
 
   std::unordered_set<std::string> imported_shared_libs;
   std::unique_ptr<AsyncGlobalMapping> async_global_mapping;
-
-  // ImGui dialog state (replaces pfd/zenity)
-  char dialog_path_buf[512];
-  bool dialog_optimize_on_load;
-  bool show_load_error;
 };
 
 }  // namespace glim
