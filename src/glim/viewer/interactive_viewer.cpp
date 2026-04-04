@@ -745,15 +745,6 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
 
     trajectory->update_anchor(submap->frames[submap->frames.size() / 2]->stamp, submap->T_world_origin);
 
-    {
-      const double* gps = submap->frame->aux_attribute<double>("gps_time");
-      if (gps) {
-        for (int i = 0; i < std::min(10, (int)submap->frame->size()); i++) {
-          std::cerr << "[RAW] gps[" << i << "]=" << gps[i] << std::endl;
-        }
-      }
-    }
-
     // Populate aux_attribute_names from first submap; guaranteed to run for every new submap.
     if (aux_attribute_names.empty()) {
       for (const auto& attrib : submap->frame->aux_attributes) {
