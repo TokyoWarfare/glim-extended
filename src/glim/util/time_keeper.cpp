@@ -189,8 +189,24 @@ void TimeKeeper::replace_points_stamp(const glim::RawPoints::Ptr& points) {
   // Per-point timestamps are absolute
 
   if (!settings.prefer_frame_time) {
-    // Overwrite the frame timestamp with the first point timestamp
-    points->stamp = min_time * settings.point_time_scale;
+    // Previously this overwrote the double-precision ROS header stamp with
+    // min_time directly.  When per-point times come from a FLOAT32 field at
+    // GPS-epoch scale (~1.7e9 s), min_time has only ~128 s quantisation,
+    // causing every gps_time value in the scan to cluster at a float32-
+    // quantised base and produce discrete bands in visualisation.
+    //
+    // Fix: keep the original double-precision header stamp as the frame
+    // anchor.  Per-point relative offsets (t_i - min_t) are small (<0.1 s),
+    // so float32 precision is perfectly adequate for them.  gps_time computed
+    // downstream as (header_stamp + relative_offset) therefore retains full
+    // double precision.
+    //
+    // For FLOAT64 LiDAR sources the original overwrite was exact anyway; for
+    // FLOAT32 sources this eliminates the ~128 s quantisation artefact.
+    spdlog::debug(
+      "time_keeper: absolute per-point timestamps detected; keeping double-precision header stamp={:.9f} (min_time={:.3f})",
+      points->stamp,
+      min_time * settings.point_time_scale);
   }
 
   // Make per-point timestamps relative to the frame timestamp

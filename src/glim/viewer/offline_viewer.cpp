@@ -1,5 +1,6 @@
 #include <glim/viewer/offline_viewer.hpp>
 
+#include <algorithm>
 #include <unordered_set>
 #include <boost/filesystem.hpp>
 #include <gtsam_points/config.hpp>
@@ -294,6 +295,17 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     }
   }
 
+  // Split aux names by element size so double attrs (gps_time) are written as
+  // "property double" in the PLY header — float32 loses ~128 s precision on GPS epoch values.
+  std::vector<std::string> aux_names_float, aux_names_double;
+  for (const auto& name : aux_names) {
+    if (aux_elem_sizes.at(name) == sizeof(double)) {
+      aux_names_double.push_back(name);
+    } else {
+      aux_names_float.push_back(name);
+    }
+  }
+
   glk::PLYData ply;
   ply.vertices.reserve(total_points);
   if (has_normals) {
@@ -303,25 +315,69 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     ply.intensities.reserve(total_points);
   }
 
-  std::unordered_map<std::string, std::vector<float>> aux_data;
-  for (const auto& name : aux_names) {
-    aux_data[name].reserve(total_points);
+  std::unordered_map<std::string, std::vector<float>> aux_data_float;
+  std::unordered_map<std::string, std::vector<double>> aux_data_double;
+  for (const auto& name : aux_names_float) {
+    aux_data_float[name].reserve(total_points);
+  }
+  for (const auto& name : aux_names_double) {
+    aux_data_double[name].reserve(total_points);
   }
   std::vector<float> aux_intensity_data;
   if (has_aux_intensity) {
     aux_intensity_data.reserve(total_points);
   }
 
+  size_t total_nan_filtered = 0;
+
   for (const auto& submap : submaps) {
     if (!submap || !submap->frame) {
       continue;
     }
     const auto& frame = submap->frame;
+    const int n = frame->size();
     const Eigen::Matrix3d R = submap->T_world_origin.rotation();
 
-    for (int i = 0; i < frame->size(); i++) {
-      ply.vertices.push_back((submap->T_world_origin * frame->points[i]).head<3>().cast<float>());
+    // Build per-point valid mask: exclude points where any aux attribute is non-finite or
+    // where gps_time == 0.0 exactly (sentinel left by voxels merged before gps_time was
+    // populated — these would corrupt MIN-blend colorisation by pulling the range to zero).
+    std::vector<bool> valid(n, true);
+    for (const auto& name : aux_names_float) {
+      const float* src = static_cast<const float*>(frame->aux_attributes.at(name).second);
+      for (int i = 0; i < n; i++) {
+        if (valid[i] && !std::isfinite(src[i])) valid[i] = false;
+      }
+    }
+    for (const auto& name : aux_names_double) {
+      const double* src = static_cast<const double*>(frame->aux_attributes.at(name).second);
+      for (int i = 0; i < n; i++) {
+        if (valid[i] && !std::isfinite(src[i])) valid[i] = false;
+      }
+    }
+    // Filter gps_time == 0.0: these are voxels that inherited a zero stamp from a keyframe
+    // that was processed before the per-point GPS timestamps were available.
+    {
+      const auto gps_it = frame->aux_attributes.find("gps_time");
+      if (gps_it != frame->aux_attributes.end() && gps_it->second.first == sizeof(double)) {
+        const double* gps_src = static_cast<const double*>(gps_it->second.second);
+        for (int i = 0; i < n; i++) {
+          if (valid[i] && gps_src[i] == 0.0) valid[i] = false;
+        }
+      }
+    }
+    if (has_aux_intensity) {
+      const float* src = static_cast<const float*>(frame->aux_attributes.at("intensity").second);
+      for (int i = 0; i < n; i++) {
+        if (valid[i] && !std::isfinite(src[i])) valid[i] = false;
+      }
+    }
+    const size_t sm_nan = static_cast<size_t>(std::count(valid.begin(), valid.end(), false));
+    total_nan_filtered += sm_nan;
 
+    // Write geometry arrays, skipping NaN points
+    for (int i = 0; i < n; i++) {
+      if (!valid[i]) continue;
+      ply.vertices.push_back((submap->T_world_origin * frame->points[i]).head<3>().cast<float>());
       if (has_normals) {
         ply.normals.push_back((R * frame->normals[i].head<3>()).cast<float>().normalized());
       }
@@ -330,29 +386,54 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
       }
     }
 
-    for (const auto& name : aux_names) {
-      const auto& attr = frame->aux_attributes.at(name);
-      const int n = frame->size();
-      if (aux_elem_sizes.at(name) == sizeof(double)) {
-        const double* src = static_cast<const double*>(attr.second);
-        for (int i = 0; i < n; i++) aux_data[name].push_back(static_cast<float>(src[i]));
-      } else {
-        const float* src = static_cast<const float*>(attr.second);
-        aux_data[name].insert(aux_data[name].end(), src, src + n);
+    // Write float aux attributes, skipping NaN points
+    for (const auto& name : aux_names_float) {
+      const float* src = static_cast<const float*>(frame->aux_attributes.at(name).second);
+      for (int i = 0; i < n; i++) {
+        if (valid[i]) aux_data_float[name].push_back(src[i]);
+      }
+    }
+
+    // Write double aux attributes as double (preserves full GPS time precision), skipping NaN points
+    for (const auto& name : aux_names_double) {
+      const double* src = static_cast<const double*>(frame->aux_attributes.at(name).second);
+      for (int i = 0; i < n; i++) {
+        if (valid[i]) aux_data_double[name].push_back(src[i]);
       }
     }
 
     if (has_aux_intensity) {
       const float* src = static_cast<const float*>(frame->aux_attributes.at("intensity").second);
-      aux_intensity_data.insert(aux_intensity_data.end(), src, src + frame->size());
+      for (int i = 0; i < n; i++) {
+        if (valid[i]) aux_intensity_data.push_back(src[i]);
+      }
     }
   }
 
-  for (const auto& name : aux_names) {
-    ply.add_prop<float>(name, aux_data[name].data(), aux_data[name].size());
+  if (total_nan_filtered > 0) {
+    logger->info("PLY export: filtered {} / {} points with NaN aux attributes", total_nan_filtered, total_points);
+  } else {
+    logger->info("PLY export: no NaN points filtered ({} points total)", total_points);
+  }
+
+  for (const auto& name : aux_names_float) {
+    ply.add_prop<float>(name, aux_data_float[name].data(), aux_data_float[name].size());
+  }
+  for (const auto& name : aux_names_double) {
+    // Written as "property double <name>" — full 64-bit precision in the PLY file.
+    ply.add_prop<double>(name, aux_data_double[name].data(), aux_data_double[name].size());
   }
   if (has_aux_intensity) {
     ply.add_prop<float>("intensity_aux", aux_intensity_data.data(), aux_intensity_data.size());
+  }
+
+  // Print gps_time range summary so we can verify precision in the exported file.
+  const auto gps_it = aux_data_double.find("gps_time");
+  if (gps_it != aux_data_double.end() && !gps_it->second.empty()) {
+    const auto& gps_vec = gps_it->second;
+    const double gps_min = *std::min_element(gps_vec.begin(), gps_vec.end());
+    const double gps_max = *std::max_element(gps_vec.begin(), gps_vec.end());
+    logger->info("PLY export: gps_time range [{:.9f}, {:.9f}] ({} points)", gps_min, gps_max, gps_vec.size());
   }
 
   glk::save_ply_binary(path, ply);

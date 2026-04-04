@@ -182,6 +182,35 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_impl(const RawPoints::Const
   for (int i = 0; i < frame->size(); i++) {
     gps_times[i] = raw_points->stamp + frame->times[i];
   }
+
+  // Debug: check gps_time range and float32-quantisation on the first frame only
+  {
+    static bool printed = false;
+    if (!printed && !gps_times.empty()) {
+      printed = true;
+      const double gmin = *std::min_element(gps_times.begin(), gps_times.end());
+      const double gmax = *std::max_element(gps_times.begin(), gps_times.end());
+      spdlog::info("[GPS_TIME_DEBUG] stamp={:.9f}  gps_time range=[{:.9f}, {:.9f}]  span={:.6f}s", raw_points->stamp, gmin, gmax, gmax - gmin);
+      spdlog::info("[GPS_TIME_DEBUG] first 5 values: {:.9f}  {:.9f}  {:.9f}  {:.9f}  {:.9f}", gps_times[0], gps_times[1], gps_times[2], gps_times[3], gps_times[4]);
+
+      // Check if the values are float32-quantised: cast each to float and back; if they all match
+      // it means the double values carry no more precision than float32.
+      int f32_matches = 0;
+      for (int i = 0; i < std::min((int)gps_times.size(), 200); i++) {
+        if (static_cast<double>(static_cast<float>(gps_times[i])) == gps_times[i]) f32_matches++;
+      }
+      spdlog::info("[GPS_TIME_DEBUG] float32-match count = {}/200 (>190 = values are float32-quantised!)", f32_matches);
+
+      // Check step size: large steps (>1s) at GPS epoch scale indicate float32 quantisation
+      std::vector<double> sorted = gps_times;
+      std::sort(sorted.begin(), sorted.end());
+      sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+      double max_step = 0.0;
+      for (size_t i = 1; i < sorted.size(); i++) max_step = std::max(max_step, sorted[i] - sorted[i - 1]);
+      spdlog::info("[GPS_TIME_DEBUG] max step between consecutive unique values = {:.9f}s ({} unique values)", max_step, sorted.size());
+    }
+  }
+
   frame->add_aux_attribute<double>("gps_time", gps_times);
 
   // Tag every point with the scanner ID (constant per frame, read from config)
