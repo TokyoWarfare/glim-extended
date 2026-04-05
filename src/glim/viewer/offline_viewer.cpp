@@ -1,7 +1,9 @@
 #include <glim/viewer/offline_viewer.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <unordered_set>
 #include <boost/filesystem.hpp>
 #include <nlohmann/json.hpp>
@@ -18,6 +20,131 @@
 #include <guik/viewer/light_viewer.hpp>
 
 namespace glim {
+
+// ---------------------------------------------------------------------------
+// Geoid undulation lookup — EGM2008 table files
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Parsed contents of one .geoid file.
+struct GeoidTable {
+  std::string path;
+  double lat_min, lat_max, lon_min, lon_max;
+  double lat_step, lon_step;
+  int nrows, ncols;
+  std::vector<float> data;  // row-major: row 0 = lat_min, col 0 = lon_min
+
+  float at(int row, int col) const { return data[row * ncols + col]; }
+
+  bool covers(double lat, double lon) const {
+    return lat >= lat_min && lat <= lat_max &&
+           lon >= lon_min && lon <= lon_max;
+  }
+};
+
+// Parse a GLIM_GEOID_V1 text file.  Returns false on any format error.
+bool load_geoid_table(const std::string& path, GeoidTable& out) {
+  std::ifstream f(path);
+  if (!f) return false;
+
+  std::string line;
+  if (!std::getline(f, line) || line != "GLIM_GEOID_V1") return false;
+
+  out.path = path;
+  out.lat_min = out.lat_max = out.lon_min = out.lon_max = 0.0;
+  out.lat_step = out.lon_step = 1.0;
+  out.nrows = out.ncols = 0;
+  bool have_lat_min = false, have_lat_max = false;
+  bool have_lon_min = false, have_lon_max = false;
+  bool have_lat_step = false, have_lon_step = false;
+
+  // Read header key=value lines and data rows.
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+
+    // Key=value header?
+    const auto eq = line.find('=');
+    if (eq != std::string::npos) {
+      const std::string key = line.substr(0, eq);
+      const double val = std::stod(line.substr(eq + 1));
+      if      (key == "lat_min")  { out.lat_min  = val; have_lat_min  = true; }
+      else if (key == "lat_max")  { out.lat_max  = val; have_lat_max  = true; }
+      else if (key == "lon_min")  { out.lon_min  = val; have_lon_min  = true; }
+      else if (key == "lon_max")  { out.lon_max  = val; have_lon_max  = true; }
+      else if (key == "lat_step") { out.lat_step = val; have_lat_step = true; }
+      else if (key == "lon_step") { out.lon_step = val; have_lon_step = true; }
+      continue;
+    }
+
+    // Must be a data row.
+    if (!have_lat_min || !have_lat_max || !have_lon_min ||
+        !have_lon_max || !have_lat_step || !have_lon_step) {
+      return false;  // data before all headers — malformed
+    }
+
+    // Derive expected dimensions on first data row encounter.
+    if (out.nrows == 0) {
+      out.nrows = static_cast<int>(
+        std::round((out.lat_max - out.lat_min) / out.lat_step) + 1);
+      out.ncols = static_cast<int>(
+        std::round((out.lon_max - out.lon_min) / out.lon_step) + 1);
+      out.data.reserve(out.nrows * out.ncols);
+    }
+
+    std::istringstream ss(line);
+    float v;
+    while (ss >> v) out.data.push_back(v);
+  }
+
+  if (out.nrows == 0 || out.ncols == 0) return false;
+  if (static_cast<int>(out.data.size()) != out.nrows * out.ncols) return false;
+  return true;
+}
+
+// Scan for EGM_tables directories.  Search order:
+//   1. Each prefix in AMENT_PREFIX_PATH: <prefix>/share/glim_ext/EGM_tables
+//   2. <config_dir>/EGM_tables  (allows local per-map overrides)
+std::vector<std::string> find_egm_table_files() {
+  std::vector<std::string> dirs;
+
+  // 1. AMENT_PREFIX_PATH entries
+  const char* ament = std::getenv("AMENT_PREFIX_PATH");
+  if (ament) {
+    std::istringstream ss(ament);
+    std::string prefix;
+    while (std::getline(ss, prefix, ':')) {
+      if (!prefix.empty()) {
+        dirs.push_back(prefix + "/share/glim_ext/EGM_tables");
+      }
+    }
+  }
+
+  // 2. Local config-dir override
+  const std::string config_dir =
+    GlobalConfig::instance()->param<std::string>("global", "config_path", ".");
+  dirs.push_back(config_dir + "/EGM_tables");
+
+  // Collect all *.geoid files from the first directory that exists.
+  std::vector<std::string> files;
+  for (const auto& dir : dirs) {
+    if (!boost::filesystem::is_directory(dir)) continue;
+    for (boost::filesystem::directory_iterator it(dir), end; it != end; ++it) {
+      const auto& p = it->path();
+      if (p.extension() == ".geoid") {
+        files.push_back(p.string());
+      }
+    }
+    if (!files.empty()) break;  // stop at first dir that has files
+  }
+
+  std::sort(files.begin(), files.end());  // prefix 01_, 02_ controls priority
+  return files;
+}
+
+}  // anonymous namespace
+
+// ---------------------------------------------------------------------------
 
 OfflineViewer::OfflineViewer(const std::string& init_map_path) : init_map_path(init_map_path) {}
 
@@ -43,6 +170,8 @@ void OfflineViewer::load_gnss_datum() {
   gnss_utm_easting_origin    = j.value("utm_easting_origin", 0.0);
   gnss_utm_northing_origin   = j.value("utm_northing_origin", 0.0);
   gnss_datum_alt             = j.value("altitude", 0.0);
+  gnss_datum_lat             = j.value("latitude",  0.0);
+  gnss_datum_lon             = j.value("longitude", 0.0);
 
   // T_enu_world: flat row-major 12-element array [R00 R01 R02 tx | R10 ... | R20 ...]
   gnss_T_enu_world = Eigen::Isometry3d::Identity();
@@ -78,6 +207,58 @@ void OfflineViewer::load_gnss_datum() {
                  "(0=East, 90=North, ±180=West; near-zero means identity — no heading correction)",
                  yaw_deg);
   }
+}
+
+double OfflineViewer::lookup_geoid_undulation(double lat, double lon) const {
+  const std::vector<std::string> files = find_egm_table_files();
+
+  if (files.empty()) {
+    logger->warn(
+      "[Geoid] No EGM table files found.  Place *.geoid files in "
+      "<ament_prefix>/share/glim_ext/EGM_tables/ or <config_dir>/EGM_tables/. "
+      "Falling back to no geoid correction.");
+    return 0.0;
+  }
+
+  for (const auto& file : files) {
+    GeoidTable table;
+    if (!load_geoid_table(file, table)) {
+      logger->warn("[Geoid] Failed to parse table file: {}", file);
+      continue;
+    }
+    if (!table.covers(lat, lon)) continue;
+
+    // Bilinear interpolation.
+    const double row_f = (lat - table.lat_min) / table.lat_step;
+    const double col_f = (lon - table.lon_min) / table.lon_step;
+    const int r0 = static_cast<int>(std::floor(row_f));
+    const int c0 = static_cast<int>(std::floor(col_f));
+    const int r1 = std::min(r0 + 1, table.nrows - 1);
+    const int c1 = std::min(c0 + 1, table.ncols - 1);
+    const double dr = row_f - r0;
+    const double dc = col_f - c0;
+
+    const double N =
+      (1 - dr) * (1 - dc) * table.at(r0, c0) +
+      (1 - dr) *      dc  * table.at(r0, c1) +
+           dr  * (1 - dc) * table.at(r1, c0) +
+           dr  *      dc  * table.at(r1, c1);
+
+    logger->info("[Geoid] Using table: {}  N({:.4f}, {:.4f}) = {:.3f} m",
+                 boost::filesystem::path(file).filename().string(), lat, lon, N);
+    return N;
+  }
+
+  // No table covered the datum location.
+  logger->warn(
+    "[Geoid] No EGM table covers datum location (lat={:.4f}, lon={:.4f}). "
+    "Currently only Spain (01_Spain.geoid) and Japan (02_Japan.geoid) are bundled. "
+    "To correct your data, obtain EGM2008 undulation values for your region "
+    "(e.g. from geographiclib or the NGA EGM2008 online calculator) and add a "
+    "numbered .geoid file to the EGM_tables directory. "
+    "Falling back to no geoid correction for this export.",
+    lat, lon);
+  return 0.0;
 }
 
 void OfflineViewer::setup_ui() {
@@ -131,6 +312,26 @@ void OfflineViewer::main_menu() {
           if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip("No GNSS datum available (gnss_datum.json not found)");
           }
+          ImGui::EndDisabled();
+        }
+
+        // Geoid correction controls (only active when UTM export is enabled)
+        if (!export_in_utm || !gnss_datum_available) {
+          ImGui::BeginDisabled();
+        }
+        ImGui::Separator();
+        ImGui::Text("Geoid correction");
+        ImGui::RadioButton("None",          &geoid_correction_mode, 0);
+        ImGui::RadioButton("Manual offset", &geoid_correction_mode, 1);
+        ImGui::RadioButton("Auto EGM2008",  &geoid_correction_mode, 2);
+        if (geoid_correction_mode == 1) {
+          ImGui::SetNextItemWidth(120.0f);
+          ImGui::InputFloat("N (m)", &geoid_manual_offset, 0.1f, 1.0f, "%.3f");
+          if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Geoid undulation in metres.\nH_ortho = h_ellipsoidal - N");
+          }
+        }
+        if (!export_in_utm || !gnss_datum_available) {
           ImGui::EndDisabled();
         }
         ImGui::EndMenu();
@@ -528,6 +729,17 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
       logger->info("[DEBUG]   R row2: [{:.6f}, {:.6f}, {:.6f}]", R(2,0), R(2,1), R(2,2));
       logger->info("[DEBUG]   translation: [{:.4f}, {:.4f}, {:.4f}]", t(0), t(1), t(2));
     }
+    // Geoid correction: convert ellipsoidal height to orthometric.
+    // H_orthometric = h_ellipsoidal - N
+    double geoid_N = 0.0;
+    if (geoid_correction_mode == 1) {
+      geoid_N = static_cast<double>(geoid_manual_offset);
+      logger->info("PLY export: applying manual geoid offset N = {:.3f} m", geoid_N);
+    } else if (geoid_correction_mode == 2) {
+      geoid_N = lookup_geoid_undulation(gnss_datum_lat, gnss_datum_lon);
+      logger->info("PLY export: applying EGM2008 geoid undulation N = {:.3f} m", geoid_N);
+    }
+
     const size_t n = ply.vertices.size();
     std::vector<double> utm_x(n), utm_y(n), utm_z(n);
     for (size_t i = 0; i < n; i++) {
@@ -535,7 +747,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
       const Eigen::Vector3d enu_pt   = gnss_T_enu_world * world_pt;
       utm_x[i] = gnss_utm_easting_origin  + enu_pt.x();
       utm_y[i] = gnss_utm_northing_origin + enu_pt.y();
-      utm_z[i] = gnss_datum_alt           + enu_pt.z();
+      utm_z[i] = gnss_datum_alt           + enu_pt.z() - geoid_N;
     }
     ply.vertices.clear();  // prevent float x/y/z from shadowing the double properties
     ply.add_prop<double>("x", utm_x.data(), n);
