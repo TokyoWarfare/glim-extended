@@ -150,5 +150,6 @@ struct GlobalMappingCallbacks {
    * @note  This is a special inverse-direction callback slot
    */
   static CallbackSlot<void(double)> request_to_find_overlapping_submaps;
+
 };
 }  // namespace glim
