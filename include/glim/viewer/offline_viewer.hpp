@@ -28,7 +28,7 @@ private:
   bool export_map(guik::ProgressInterface& progress, const std::string& path);
 
   /// Tries to load gnss_datum.json from the current GlobalConfig config path.
-  /// Sets gnss_datum_available and populates UTM origin + T_enu_world on success.
+  /// Sets gnss_datum_available and populates UTM origin on success.
   void load_gnss_datum();
 
   // Geoid undulation lookup (Issue 1 — ellipsoidal→orthometric correction).
@@ -44,15 +44,15 @@ private:
   std::unordered_set<std::string> imported_shared_libs;
   std::unique_ptr<AsyncGlobalMapping> async_global_mapping;
 
-  // GNSS datum loaded from gnss_datum.json (written by GNSSGlobal::on_save).
+  // GNSS datum loaded from gnss_datum.json (written by GNSSGlobal).
+  // World frame = UTM frame (origin subtracted). No rotation needed.
   bool             gnss_datum_available     = false;
   int              gnss_utm_zone            = 0;
   double           gnss_utm_easting_origin  = 0.0;
   double           gnss_utm_northing_origin = 0.0;
   double           gnss_datum_alt           = 0.0;
-  double           gnss_datum_lat           = 0.0;  // WGS84 latitude  of ENU origin
-  double           gnss_datum_lon           = 0.0;  // WGS84 longitude of ENU origin
-  Eigen::Isometry3d gnss_T_enu_world{Eigen::Isometry3d::Identity()};
+  double           gnss_datum_lat           = 0.0;
+  double           gnss_datum_lon           = 0.0;
 
   // PLY export options (persistent across export invocations).
   bool  export_in_utm          = false;

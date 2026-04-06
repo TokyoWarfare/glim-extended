@@ -173,40 +173,10 @@ void OfflineViewer::load_gnss_datum() {
   gnss_datum_lat             = j.value("latitude",  0.0);
   gnss_datum_lon             = j.value("longitude", 0.0);
 
-  // T_enu_world: flat row-major 12-element array [R00 R01 R02 tx | R10 ... | R20 ...]
-  gnss_T_enu_world = Eigen::Isometry3d::Identity();
-  if (j.contains("T_enu_world") && j["T_enu_world"].size() == 12) {
-    const auto& T = j["T_enu_world"];
-    gnss_T_enu_world.linear()(0, 0) = T[0];  gnss_T_enu_world.linear()(0, 1) = T[1];
-    gnss_T_enu_world.linear()(0, 2) = T[2];  gnss_T_enu_world.translation()(0) = T[3];
-    gnss_T_enu_world.linear()(1, 0) = T[4];  gnss_T_enu_world.linear()(1, 1) = T[5];
-    gnss_T_enu_world.linear()(1, 2) = T[6];  gnss_T_enu_world.translation()(1) = T[7];
-    gnss_T_enu_world.linear()(2, 0) = T[8];  gnss_T_enu_world.linear()(2, 1) = T[9];
-    gnss_T_enu_world.linear()(2, 2) = T[10]; gnss_T_enu_world.translation()(2) = T[11];
-  } else {
-    logger->warn("gnss_datum.json missing or malformed T_enu_world — UTM export will use identity");
-  }
-
   gnss_datum_available = true;
   logger->info(
     "GNSS datum loaded: UTM zone {} E={:.3f} N={:.3f} alt={:.3f}",
     gnss_utm_zone, gnss_utm_easting_origin, gnss_utm_northing_origin, gnss_datum_alt);
-
-  // DEBUG: print the T_enu_world that will be applied to all points during UTM export.
-  // If this is near-identity the SVD rotation was not captured in gnss_datum.json.
-  {
-    const Eigen::Matrix3d R = gnss_T_enu_world.linear();
-    const Eigen::Vector3d t = gnss_T_enu_world.translation();
-    logger->info("[DEBUG] gnss_T_enu_world loaded from JSON (will be applied in UTM export):");
-    logger->info("[DEBUG]   R row0: [{:.6f}, {:.6f}, {:.6f}]", R(0,0), R(0,1), R(0,2));
-    logger->info("[DEBUG]   R row1: [{:.6f}, {:.6f}, {:.6f}]", R(1,0), R(1,1), R(1,2));
-    logger->info("[DEBUG]   R row2: [{:.6f}, {:.6f}, {:.6f}]", R(2,0), R(2,1), R(2,2));
-    logger->info("[DEBUG]   translation: [{:.4f}, {:.4f}, {:.4f}]", t(0), t(1), t(2));
-    const double yaw_deg = std::atan2(R(1,0), R(0,0)) * 180.0 / M_PI;
-    logger->info("[DEBUG] yaw of world +X relative to geographic East: {:.2f} deg "
-                 "(0=East, 90=North, ±180=West; near-zero means identity — no heading correction)",
-                 yaw_deg);
-  }
 }
 
 double OfflineViewer::lookup_geoid_undulation(double lat, double lon) const {
@@ -709,28 +679,11 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
   }
 
   // Apply UTM coordinate transform if requested.
-  // Each vertex is currently in GLIM's world frame.  We apply T_enu_world to
-  // get the ENU offset from the datum, then add the absolute UTM origin.
-  //
-  // Absolute UTM northing (~4.6 M m) cannot be represented with sub-metre
-  // precision in float32 (ULP = 0.5 m), which causes visible banding.
-  // We therefore write x/y/z as property double instead of property float.
-  // To achieve this we clear ply.vertices (which would emit float x/y/z) and
-  // add the coordinates as double generic properties, which the iridescence
-  // PLY writer emits verbatim as "property double x/y/z".
+  // The world frame is already UTM-origin aligned (East=+X, North=+Y, Up=+Z).
+  // To get absolute UTM coordinates we just add the origin offset in double
+  // precision. Absolute UTM northing (~4.6 M m) needs double to avoid banding.
   if (export_in_utm && gnss_datum_available) {
-    // DEBUG: confirm which transform is in use at export time.
-    {
-      const Eigen::Matrix3d R = gnss_T_enu_world.linear();
-      const Eigen::Vector3d t = gnss_T_enu_world.translation();
-      logger->info("[DEBUG] PLY UTM export — gnss_T_enu_world at export time:");
-      logger->info("[DEBUG]   R row0: [{:.6f}, {:.6f}, {:.6f}]", R(0,0), R(0,1), R(0,2));
-      logger->info("[DEBUG]   R row1: [{:.6f}, {:.6f}, {:.6f}]", R(1,0), R(1,1), R(1,2));
-      logger->info("[DEBUG]   R row2: [{:.6f}, {:.6f}, {:.6f}]", R(2,0), R(2,1), R(2,2));
-      logger->info("[DEBUG]   translation: [{:.4f}, {:.4f}, {:.4f}]", t(0), t(1), t(2));
-    }
     // Geoid correction: convert ellipsoidal height to orthometric.
-    // H_orthometric = h_ellipsoidal - N
     double geoid_N = 0.0;
     if (geoid_correction_mode == 1) {
       geoid_N = static_cast<double>(geoid_manual_offset);
@@ -743,13 +696,12 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     const size_t n = ply.vertices.size();
     std::vector<double> utm_x(n), utm_y(n), utm_z(n);
     for (size_t i = 0; i < n; i++) {
-      const Eigen::Vector3d world_pt = ply.vertices[i].cast<double>();
-      const Eigen::Vector3d enu_pt   = gnss_T_enu_world * world_pt;
-      utm_x[i] = gnss_utm_easting_origin  + enu_pt.x();
-      utm_y[i] = gnss_utm_northing_origin + enu_pt.y();
-      utm_z[i] = gnss_datum_alt           + enu_pt.z() - geoid_N;
+      const Eigen::Vector3d pt = ply.vertices[i].cast<double>();
+      utm_x[i] = gnss_utm_easting_origin  + pt.x();
+      utm_y[i] = gnss_utm_northing_origin + pt.y();
+      utm_z[i] = gnss_datum_alt           + pt.z() - geoid_N;
     }
-    ply.vertices.clear();  // prevent float x/y/z from shadowing the double properties
+    ply.vertices.clear();
     ply.add_prop<double>("x", utm_x.data(), n);
     ply.add_prop<double>("y", utm_y.data(), n);
     ply.add_prop<double>("z", utm_z.data(), n);
