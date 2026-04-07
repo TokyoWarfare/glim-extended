@@ -9,6 +9,7 @@
     "config_preprocess": "config_preprocess.json",
     "config_odometry": "config_odometry_gpu.json",
     "config_sub_mapping": "config_sub_mapping_gpu.json",
-    "config_global_mapping": "config_global_mapping_gpu.json"
+    "config_global_mapping": "config_global_mapping_gpu.json",
+    "config_gnss_global": "config_gnss_global.json"
   }
 }
