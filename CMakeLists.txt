@@ -66,6 +66,7 @@ add_library(glim SHARED
   src/glim/util/data_validator.cpp
   src/glim/util/serialization.cpp
   src/glim/util/debug.cpp
+  src/glim/util/geodetic.cpp
   # preprocess
   src/glim/preprocess/callbacks.cpp
   src/glim/preprocess/cloud_preprocessor.cpp
@@ -193,6 +194,22 @@ if(BUILD_WITH_VIEWER)
   list(APPEND glim_LIBRARIES standard_viewer interactive_viewer memory_monitor map_editor)
 endif()
 
+# GNSS global module (ROS2 only — needs sensor_msgs + rclcpp)
+if(DEFINED ENV{ROS_VERSION} AND $ENV{ROS_VERSION} EQUAL 2)
+  find_package(rclcpp REQUIRED)
+  find_package(sensor_msgs REQUIRED)
+  add_library(gnss_global SHARED
+    src/glim/mapping/gnss_global_module_ros2.cpp
+  )
+  target_link_libraries(gnss_global
+    glim
+    ${GTSAM_LIBRARIES}
+    spdlog::spdlog
+  )
+  ament_target_dependencies(gnss_global rclcpp sensor_msgs)
+  list(APPEND glim_LIBRARIES gnss_global)
+endif()
+
 #############
 ## Install ##
 #############
@@ -259,6 +276,7 @@ if(DEFINED ENV{ROS_VERSION})
     # ROS2
     find_package(ament_cmake REQUIRED)
     install(DIRECTORY config DESTINATION share/glim)
+    install(DIRECTORY EGM_tables DESTINATION share/glim)
     ament_export_include_directories(include ${EIGEN3_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS})
     ament_export_libraries(${glim_LIBRARIES} ${GTSAM_LIBRARIES} fmt spdlog::spdlog)
     ament_export_targets(glim-targets HAS_LIBRARY_TARGET)
