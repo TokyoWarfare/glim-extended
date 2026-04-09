@@ -35,6 +35,12 @@ public:
 
   void set_submaps(const std::vector<SubMap::ConstPtr>& target_submaps, const std::vector<SubMap::ConstPtr>& source_submaps);
 
+  /// Replace target/source with HD point clouds (with covariances already computed)
+  void replace_with_hd(const gtsam_points::PointCloudCPU::Ptr& hd_target, const gtsam_points::PointCloudCPU::Ptr& hd_source);
+
+  /// Callback to load HD data — set by the viewer
+  std::function<std::pair<gtsam_points::PointCloudCPU::Ptr, gtsam_points::PointCloudCPU::Ptr>()> load_hd_callback;
+
   void clear();
 
   gtsam::NonlinearFactor::shared_ptr run();

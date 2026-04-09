@@ -25,6 +25,7 @@ void SubMap::save(const std::string& path) const {
   boost::filesystem::create_directories(path);
   std::ofstream ofs(path + "/data.txt");
   ofs << "id: " << id << std::endl;
+  ofs << "session_id: " << session_id << std::endl;
   ofs << "T_world_origin: " << std::endl << T_world_origin.matrix() << std::endl;
   ofs << "T_origin_endpoint_L: " << std::endl << T_origin_endpoint_L.matrix() << std::endl;
   ofs << "T_origin_endpoint_R: " << std::endl << T_origin_endpoint_R.matrix() << std::endl;
@@ -86,7 +87,12 @@ SubMap::Ptr SubMap::load(const std::string& path) {
   std::string token;
   ifs >> token >> submap->id;
 
+  // Read next token — may be "session_id:" (new format) or "T_world_origin:" (old format)
   ifs >> token;
+  if (token == "session_id:") {
+    ifs >> submap->session_id;
+    ifs >> token;  // consume "T_world_origin:"
+  }
   submap->T_world_origin.matrix() = read_matrix<4, 4>(ifs);
   ifs >> token;
   submap->T_origin_endpoint_L.matrix() = read_matrix<4, 4>(ifs);

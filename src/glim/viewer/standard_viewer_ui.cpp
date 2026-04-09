@@ -129,6 +129,17 @@ void StandardViewer::drawable_selection() {
   ImGui::SameLine();
   ImGui::Checkbox("factors", &show_factors);
 
+  // Camera mode selector
+  static const char* camera_modes[] = {"Orbit", "FPV", "TopDown"};
+  ImGui::SetNextItemWidth(92);
+  if (ImGui::Combo("Camera", &camera_mode, camera_modes, 3)) {
+    switch (camera_mode) {
+      case 0: viewer->use_orbit_camera_control(); break;
+      case 1: viewer->use_fps_camera_control(60.0); break;
+      case 2: viewer->use_topdown_camera_control(); break;
+    }
+  }
+
   ImGui::Separator();
 
   // Odom color modes: 0=FLAT, 1=NORMAL, 2+=aux_attributes

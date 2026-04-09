@@ -73,9 +73,12 @@ public:
 
   /**
    * @brief Load a mapping result from a dumped directory
-   * @param path Input dump path
+   * @param path          Input dump path
+   * @param datum_offset  Translation to apply to all loaded submap poses and GNSS factors
+   *                      when merging into an existing map (multi-session alignment).
+   *                      Zero vector preserves original behavior.
    */
-  bool load(const std::string& path);
+  bool load(const std::string& path, const Eigen::Vector3d& datum_offset = Eigen::Vector3d::Zero());
 
 private:
   void insert_submap(int current, const SubMap::Ptr& submap);
@@ -95,6 +98,18 @@ private:
 
   std::mt19937 mt;
   int session_id;
+
+public:
+  /// Per-session metadata (for multi-map session management in the viewer).
+  struct SessionInfo {
+    int id;
+    std::string source_path;  // dump directory this session was loaded from
+  };
+  std::vector<SessionInfo> session_infos;
+
+  /// Access pending (not yet optimized) factors for visualization.
+  const gtsam::NonlinearFactorGraph& pending_factors() const { return *new_factors; }
+private:
 
   std::unique_ptr<IMUIntegration> imu_integration;
   std::any stream_buffer_roundrobin;
