@@ -4,12 +4,14 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
 #include <glim/mapping/sub_map.hpp>
+#include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <glim/util/extension_module.hpp>
 #include <glim/util/concurrent_vector.hpp>
 #include <gtsam_points/util/gtsam_migration.hpp>
@@ -99,6 +101,7 @@ protected:
   bool draw_points;
   bool draw_factors;
   bool draw_spheres;
+  bool draw_coords;
 
   float min_overlap;
   bool cont_optimize;
@@ -120,6 +123,8 @@ protected:
   // Click information
   Eigen::Vector4i right_clicked_info;
   Eigen::Vector3f right_clicked_pos;
+  int lc_target_frame_id = -1;  // for HD loop closure callback
+  int lc_source_frame_id = -1;
 
   // GUI widgets
   std::unique_ptr<ManualLoopCloseModal> manual_loop_close_modal;
@@ -131,6 +136,65 @@ protected:
   // Submaps
   std::vector<Eigen::Isometry3d> submap_poses;
   std::vector<SubMap::ConstPtr> submaps;
+  std::unordered_set<int> hidden_sessions;  // session IDs to exclude from trajectory/factor rendering
+  std::unordered_map<int, std::string> session_hd_paths;  // session_id → HD frames directory
+
+  /// Load HD frames for a submap, compute covariances, return as PointCloudCPU.
+  /// Returns nullptr if HD frames not available.
+  gtsam_points::PointCloudCPU::Ptr load_hd_for_submap(int submap_index) const;
+
+  // LOD memory management
+  enum class SubmapLOD { UNLOADED = 0, BBOX = 1, LOADING = 2, SD = 3, LOADING_HD = 4, HD = 5 };
+  struct SubmapRenderState {
+    SubmapLOD current_lod = SubmapLOD::UNLOADED;
+    Eigen::AlignedBox3f world_bbox;
+    size_t gpu_bytes = 0;
+    size_t hd_points = 0;   // HD points loaded for this submap (for counter tracking)
+    bool bbox_computed = false;
+  };
+  std::vector<SubmapRenderState> render_states;
+  size_t total_gpu_bytes = 0;
+
+  // LOD settings (managed by Memory Manager UI)
+  bool lod_enabled = true;         // distance-based streaming active
+  bool lod_hd_enabled = false;     // LOD 0 (HD frames) enabled for nearby submaps
+  bool lod_hd_only = false;        // hide SD submaps, show only HD (LOD 0)
+  bool lod_hide_all_submaps = false;  // hide all submaps (for preview overlay mode)
+  bool lod_load_full_sd = false;   // "Load full SD map" in progress
+  bool lod_load_full_hd = false;   // "Load full HD map" in progress
+  float lod_hd_range = 150.0f;    // metres — submaps within this distance get HD
+  bool lod_show_bboxes = true;     // show wire cube bounding boxes
+  float lod_sd_range = 300.0f;     // metres — submaps within this distance get SD
+  float lod_vram_budget_mb = 4096.0f;
+  bool show_memory_manager = false;
+
+  // Frustum culling
+  static bool frustum_test_aabb(const Eigen::Matrix4f& vp, const Eigen::AlignedBox3f& box);
+
+  // HD frame availability
+  bool hd_available = false;
+  std::string hd_frames_path;
+  size_t total_hd_points = 0;    // from frame_meta.json scan (no data loading needed)
+  size_t loaded_hd_points = 0;   // currently in GPU
+
+  /// Scan hd_frames/ directory for availability and total point count.
+  void detect_hd_frames(const std::string& map_path);
+
+  // Async LOD worker
+  struct LODWorkItem {
+    int submap_index;
+    SubMap::ConstPtr submap;
+    Eigen::Isometry3d pose;
+    int session_id;
+    float distance;
+    bool load_hd = false;
+    std::string hd_path;  // per-session HD frames directory
+  };
+  void lod_worker_task();
+
+  ConcurrentVector<LODWorkItem> lod_work_queue;
+  std::thread lod_worker_thread;
+  std::atomic_bool lod_worker_kill{false};
 
   // Factors
   std::vector<std::tuple<FactorType, std::uint64_t, std::uint64_t>> global_factors;

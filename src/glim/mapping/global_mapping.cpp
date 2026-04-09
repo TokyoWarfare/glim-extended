@@ -358,6 +358,29 @@ void GlobalMapping::find_overlapping_submaps(double min_overlap) {
 }
 
 void GlobalMapping::optimize() {
+  // Lazy upgrade: if ISAM2 is a dummy (optimization was disabled at load time),
+  // replace it with a real ISAM2 now that the user wants to optimize.
+  if (dynamic_cast<gtsam_points::ISAM2ExtDummy*>(isam2.get())) {
+    logger->info("Upgrading from dummy ISAM2 to real optimizer...");
+    // Collect current state from the dummy
+    auto factors = isam2->getFactorsUnsafe();
+    auto values = isam2->calculateEstimate();
+
+    // Create real ISAM2
+    gtsam::ISAM2Params isam2_params;
+    if (params.use_isam2_dogleg) {
+      gtsam::ISAM2DoglegParams dogleg_params;
+      isam2_params.setOptimizationParams(dogleg_params);
+    }
+    isam2_params.relinearizeSkip = params.isam2_relinearize_skip;
+    isam2_params.setRelinearizeThreshold(params.isam2_relinearize_thresh);
+    isam2.reset(new gtsam_points::ISAM2Ext(isam2_params));
+
+    // Initialize with current state
+    update_isam2(factors, values);
+    logger->info("ISAM2 upgraded — optimization now active");
+  }
+
   if (isam2->empty()) {
     return;
   }
@@ -687,7 +710,7 @@ gtsam_points::PointCloud::Ptr GlobalMapping::export_points() {
   return merged;
 }
 
-bool GlobalMapping::load(const std::string& path) {
+bool GlobalMapping::load(const std::string& path, const Eigen::Vector3d& datum_offset) {
   std::ifstream ifs(path + "/graph.txt");
   if (!ifs) {
     logger->error("failed to open {}/graph.txt", path);
@@ -760,6 +783,11 @@ bool GlobalMapping::load(const std::string& path) {
       }
     }
 
+    // Apply datum offset translation to submap poses (multi-session alignment)
+    if (start_from_frame_id > 0 && datum_offset.squaredNorm() > 1e-10) {
+      submap->T_world_origin.translation() += datum_offset;
+    }
+
     Callbacks::on_insert_submap(submap);
   }
 
@@ -804,23 +832,43 @@ bool GlobalMapping::load(const std::string& path) {
       rekey_mapping[V(i * 2 + 1)] = V((i + start_from_frame_id) * 2 + 1);
     }
 
-    logger->info("removing translation prior factors");
-    auto remove_loc = std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) {
-      return dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(factor.get()) != nullptr;
-    });
-    logger->info("removed {} prior factors", std::distance(remove_loc, loaded_graph.end()));
-    loaded_graph.erase(remove_loc, loaded_graph.end());
+    const bool has_offset = datum_offset.squaredNorm() > 1e-10;
+
+    // Translate GNSS factors (PoseTranslationPrior) by datum offset instead of stripping them.
+    // When offset is zero (GPS-less additional maps), strip them as before — there's no
+    // reference frame to translate to, and the factors would conflict with the first map's anchors.
+    if (has_offset) {
+      int gnss_factor_count = 0;
+      for (size_t fi = 0; fi < loaded_graph.size(); fi++) {
+        auto* ptp = dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(loaded_graph[fi].get());
+        if (ptp) {
+          const gtsam::Point3 translated = ptp->measured() + datum_offset;
+          loaded_graph.replace(fi, std::make_shared<gtsam::PoseTranslationPrior<gtsam::Pose3>>(
+            ptp->keys()[0], translated, ptp->noiseModel()));
+          gnss_factor_count++;
+        }
+      }
+      logger->info("translated {} GNSS factors by datum offset ({:.3f}, {:.3f}, {:.3f})",
+                   gnss_factor_count, datum_offset.x(), datum_offset.y(), datum_offset.z());
+    } else {
+      logger->info("removing translation prior factors (no datum offset)");
+      auto remove_loc = std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) {
+        return dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(factor.get()) != nullptr;
+      });
+      logger->info("removed {} translation prior factors", std::distance(remove_loc, loaded_graph.end()));
+      loaded_graph.erase(remove_loc, loaded_graph.end());
+    }
 
     logger->info("removing damping factors");
-    remove_loc =
+    auto remove_loc =
       std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) { return dynamic_cast<gtsam_points::LinearDampingFactor*>(factor.get()) != nullptr; });
-    logger->info("removed {} prior factors", std::distance(remove_loc, loaded_graph.end()));
+    logger->info("removed {} damping factors", std::distance(remove_loc, loaded_graph.end()));
     loaded_graph.erase(remove_loc, loaded_graph.end());
 
-    logger->info("removing prior factors");
+    logger->info("removing pose prior factors");
     remove_loc =
       std::remove_if(loaded_graph.begin(), loaded_graph.end(), [](const auto& factor) { return dynamic_cast<gtsam::PriorFactor<gtsam::Pose3>*>(factor.get()) != nullptr; });
-    logger->info("removed {} prior factors", std::distance(remove_loc, loaded_graph.end()));
+    logger->info("removed {} pose prior factors", std::distance(remove_loc, loaded_graph.end()));
     loaded_graph.erase(remove_loc, loaded_graph.end());
 
     // rekey graph
@@ -828,15 +876,25 @@ bool GlobalMapping::load(const std::string& path) {
     logger->info("rekeying factors");
     graph = graph.rekey(rekey_mapping);
 
-    // rekey values
+    // rekey values and apply datum offset to pose translations
     for (auto it = loaded_values.begin(); it != loaded_values.end(); ++it) {
       auto matched_key = rekey_mapping.find(it->key);
-      if (matched_key != rekey_mapping.end()) {
-        values.insert(matched_key->second, it->value);
-      } else {
+      const gtsam::Key out_key = (matched_key != rekey_mapping.end()) ? matched_key->second : it->key;
+
+      if (matched_key == rekey_mapping.end()) {
         logger->warn("No remapping found for Value with key {}, keeping it as is", gtsam::Symbol(it->key).string());
-        values.insert(it->key, it->value);
       }
+
+      // Apply datum offset to Pose3 values (submap poses and endpoint poses)
+      if (has_offset) {
+        try {
+          gtsam::Pose3 pose = it->value.cast<gtsam::Pose3>();
+          pose = gtsam::Pose3(pose.rotation(), pose.translation() + datum_offset);
+          values.insert(out_key, pose);
+          continue;
+        } catch (...) {}
+      }
+      values.insert(out_key, it->value);
     }
   } else {
     graph = loaded_graph;
@@ -898,12 +956,14 @@ bool GlobalMapping::load(const std::string& path) {
     update_submaps();
     Callbacks::on_update_submaps(submaps);
   } else {
-    logger->info("skip optimization");
+    logger->info("skip optimization (additional map)");
     this->new_factors->add(graph);
     this->new_values->insert(values);
   }
 
-  logger->info("done");
+  // Record session metadata
+  session_infos.push_back({session_id, path});
+  logger->info("done (session_id={}, path={})", session_id, path);
   session_id++;
 
   return true;

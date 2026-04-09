@@ -1,0 +1,7 @@
+{
+  "hd_frames": {
+    "output_path": "",
+    "num_threads": 4,
+    "k_neighbors": 10
+  }
+}

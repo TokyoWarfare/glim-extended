@@ -118,6 +118,31 @@ void ManualLoopCloseModal::set_submaps(const std::vector<SubMap::ConstPtr>& targ
   request_to_open = true;
 }
 
+void ManualLoopCloseModal::replace_with_hd(const gtsam_points::PointCloudCPU::Ptr& hd_target, const gtsam_points::PointCloudCPU::Ptr& hd_source) {
+  if (hd_target) {
+    this->target = hd_target;
+    // Apply gravity alignment (rotation only)
+    Eigen::Isometry3d T_world_local = Eigen::Isometry3d::Identity();
+    T_world_local.linear() = target_pose.linear();
+    gtsam_points::transform_inplace(this->target, T_world_local);
+    this->target_drawable = std::make_shared<glk::PointCloudBuffer>(this->target->points, this->target->size());
+    // Clear cached FPFH
+    this->target->aux_attributes.erase("fpfh");
+    this->target_fpfh_tree = nullptr;
+  }
+  if (hd_source) {
+    this->source = hd_source;
+    Eigen::Isometry3d T_world_local = Eigen::Isometry3d::Identity();
+    T_world_local.linear() = source_pose.linear();
+    gtsam_points::transform_inplace(this->source, T_world_local);
+    this->source_drawable = std::make_shared<glk::PointCloudBuffer>(this->source->points, this->source->size());
+    this->source->aux_attributes.erase("fpfh");
+    this->source_fpfh_tree = nullptr;
+  }
+  logger->info("[HD ICP] Replaced with HD data: target={} pts, source={} pts",
+               hd_target ? hd_target->size() : 0, hd_source ? hd_source->size() : 0);
+}
+
 void ManualLoopCloseModal::clear() {
   target_key = -1;
   source_key = -1;
@@ -214,19 +239,53 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::run() {
   }
 
   // Manual loop close modal
-  if (ImGui::BeginPopupModal("manual loop close", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    // Draw canvas
+  ImGui::SetNextWindowSize(ImVec2(800, 700), ImGuiCond_FirstUseEver);
+  if (ImGui::BeginPopupModal("manual loop close", nullptr, 0)) {
+    // SD/HD data source buttons
+    ImGui::Text("Data source:");
+    ImGui::SameLine();
+    if (ImGui::Button("SD")) {
+      // Current behavior — already using SD
+    }
+    ImGui::SameLine();
+    if (!load_hd_callback) ImGui::BeginDisabled();
+    if (ImGui::Button("HD")) {
+      if (load_hd_callback) {
+        auto [hd_target, hd_source] = load_hd_callback();
+        replace_with_hd(hd_target, hd_source);
+      }
+    }
+    if (!load_hd_callback) {
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("No HD frames available.");
+      }
+      ImGui::EndDisabled();
+    } else {
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Load HD frames with computed covariances\nfor higher-quality registration.");
+      }
+    }
+    ImGui::Separator();
+
+    // Draw canvas — adapt to available space (width, and height minus ~250px for controls)
+    const float canvas_w = std::max(256.0f, ImGui::GetContentRegionAvail().x - 10.0f);
+    const float canvas_h = std::max(256.0f, ImGui::GetContentRegionAvail().y - 250.0f);
+    const int cw = static_cast<int>(canvas_w);
+    const int ch = static_cast<int>(canvas_h);
+    if (canvas->size[0] != cw || canvas->size[1] != ch) {
+      canvas.reset(new guik::GLCanvas(Eigen::Vector2i(cw, ch)));
+    }
     ImGui::BeginChild(
       "canvas",
-      ImVec2(512, 512),
+      ImVec2(canvas_w, canvas_h),
       false,
-      ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings |
+      ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoNavFocus);
     if (ImGui::IsWindowFocused() && !model_control->is_guizmo_using()) {
       canvas->mouse_control();
     }
     draw_canvas();
-    ImGui::Image(reinterpret_cast<void*>(canvas->frame_buffer->color().id()), ImVec2(512, 512), ImVec2(0, 1), ImVec2(1, 0));
+    ImGui::Image(reinterpret_cast<void*>(canvas->frame_buffer->color().id()), ImVec2(canvas_w, canvas_h), ImVec2(0, 1), ImVec2(1, 0));
 
     ImVec2 canvas_rect_min = ImGui::GetItemRectMin();
     ImVec2 canvas_rect_max = ImGui::GetItemRectMax();

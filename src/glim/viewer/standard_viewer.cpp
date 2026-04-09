@@ -47,6 +47,7 @@ StandardViewer::StandardViewer() : logger(create_module_logger("viewer")) {
   request_to_terminate = false;
 
   track = true;
+  camera_mode = 0;
   show_current_coord = true;
   show_current_points = true;
   odom_color_mode = 0;

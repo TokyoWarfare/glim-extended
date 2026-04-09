@@ -62,6 +62,7 @@ private:
   int partial_rendering_budget;
 
   bool track;
+  int camera_mode;  // 0=Orbit, 1=FPV, 2=TopDown
   bool show_current_coord;
   bool show_current_points;
   int odom_color_mode;

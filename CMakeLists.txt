@@ -208,6 +208,18 @@ if(DEFINED ENV{ROS_VERSION} AND $ENV{ROS_VERSION} EQUAL 2)
   )
   ament_target_dependencies(gnss_global rclcpp sensor_msgs)
   list(APPEND glim_LIBRARIES gnss_global)
+
+  # HD frame saver module
+  add_library(hd_frame_saver SHARED
+    src/glim/mapping/hd_frame_saver_ros2.cpp
+  )
+  target_link_libraries(hd_frame_saver
+    glim
+    ${GTSAM_LIBRARIES}
+    spdlog::spdlog
+  )
+  ament_target_dependencies(hd_frame_saver rclcpp)
+  list(APPEND glim_LIBRARIES hd_frame_saver)
 endif()
 
 #############
