@@ -52,6 +52,7 @@ private:
 
   std::shared_ptr<Eigen::Isometry3d> align(guik::ProgressInterface& progress);
   gtsam::NonlinearFactor::shared_ptr create_factor();
+  void ensure_covs(gtsam_points::PointCloudCPU::Ptr& cloud, const std::string& label);
   void draw_canvas();
 
   bool show_note(const std::string& note);
@@ -60,6 +61,10 @@ private:
   const int num_threads;
 
   bool request_to_open;
+  bool helper_gizmo_active = false;
+  std::unique_ptr<guik::ModelControl> helper_model_control;
+  Eigen::Matrix4f helper_prev_matrix = Eigen::Matrix4f::Identity();
+  Eigen::Matrix4f initial_model_matrix = Eigen::Matrix4f::Identity();  // for reset
   std::unique_ptr<guik::GLCanvas> canvas;
   std::unique_ptr<guik::ProgressModal> progress_modal;
   std::unique_ptr<guik::ModelControl> model_control;
@@ -87,14 +92,30 @@ private:
   gtsam::Key target_key;
   gtsam::Key source_key;
 
+public:
+  float target_gps_sigma = -1.0f;  // GPS sigma for target submap (-1 = N/A)
+  float source_gps_sigma = -1.0f;  // GPS sigma for source submap (-1 = N/A)
+
+  // Neighbor relaxation params (exposed for viewer to read after factor creation)
+  bool modal_intensity_mode = false;  // toggle between red/green and intensity rendering
+  bool relax_neighbors = false;
+  int relax_radius = 5;
+  float relax_scale = 5.0f;
+  bool relax_between = true;
+  bool relax_gps = true;
+private:
   Eigen::Isometry3d target_pose;  // Target pose in world frame
   Eigen::Isometry3d source_pose;  // Source pose in world frame
 
   gtsam_points::PointCloudCPU::Ptr target;  // Gravity aligned target point cloud
   gtsam_points::PointCloudCPU::Ptr source;  // Gravity aligned source point cloud
+  gtsam_points::PointCloudCPU::Ptr sd_target;  // Original SD data (for reverting from HD)
+  gtsam_points::PointCloudCPU::Ptr sd_source;
 
   glk::Drawable::ConstPtr target_drawable;  // Gravity aligned target drawable
   glk::Drawable::ConstPtr source_drawable;  // Gravity aligned source drawable
+  glk::Drawable::ConstPtr modal_target_intensity_drawable;  // Intensity-colored target
+  glk::Drawable::ConstPtr modal_source_intensity_drawable;  // Intensity-colored source
 
   gtsam_points::NearestNeighborSearch::Ptr target_fpfh_tree;
   gtsam_points::NearestNeighborSearch::Ptr source_fpfh_tree;

@@ -41,6 +41,7 @@ private:
 
 private:
   std::string init_map_path;
+  std::string loaded_map_path;  // path to the currently loaded dump directory
   std::unique_ptr<guik::ProgressModal> progress_modal;
 
   std::unordered_set<std::string> imported_shared_libs;
@@ -142,6 +143,7 @@ private:
   float rf_voxel_size = 1.0f;        // metres
   float rf_safe_range = 30.0f;      // metres — points within this always kept
   float rf_range_delta = 10.0f;     // metres — remove if >delta further than closest in voxel
+  float rf_far_delta = 30.0f;       // metres — in voxels with no safe-range points, remove if > min_range + far_delta
   int   rf_min_close_pts = 3;       // min close points to trigger removal of distant ones
   float rf_range_highlight = 0.0f; // range threshold for red tinting (0=off)
   bool rf_preview_active = false;  // preview overlay is showing — hide other LOD data

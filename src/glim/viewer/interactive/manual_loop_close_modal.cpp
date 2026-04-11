@@ -7,6 +7,7 @@
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam_points/ann/ivox.hpp>
+#include <gtsam_points/ann/kdtree.hpp>
 #include <gtsam_points/ann/kdtree2.hpp>
 #include <gtsam_points/ann/kdtreex.hpp>
 #include <gtsam_points/types/point_cloud.hpp>
@@ -22,9 +23,11 @@
 #include <glim/util/convert_to_string.hpp>
 #include <glim/common/cloud_covariance_estimation.hpp>
 
+#include <glk/colormap.hpp>
 #include <glk/pointcloud_buffer.hpp>
 #include <glk/primitives/primitives.hpp>
 #include <guik/gl_canvas.hpp>
+#include <guik/camera/basic_projection_control.hpp>
 #include <guik/model_control.hpp>
 #include <guik/progress_modal.hpp>
 #include <guik/viewer/light_viewer.hpp>
@@ -57,6 +60,7 @@ ManualLoopCloseModal::ManualLoopCloseModal(const std::shared_ptr<spdlog::logger>
   canvas.reset(new guik::GLCanvas(Eigen::Vector2i(512, 512)));
   progress_modal.reset(new guik::ProgressModal("manual_loop_close_progress"));
   model_control.reset(new guik::ModelControl("model_control"));
+  helper_model_control.reset(new guik::ModelControl("helper_gizmo"));
 
 #ifdef GTSAM_USE_TBB
   tbb_task_arena = std::make_shared<tbb::task_arena>(1);
@@ -84,6 +88,7 @@ void ManualLoopCloseModal::set_target(const gtsam::Key target_key, const gtsam_p
   gtsam_points::transform_inplace(this->target, T_world_local);
 
   this->target_drawable = std::make_shared<glk::PointCloudBuffer>(this->target->points, this->target->size());
+  this->sd_target = gtsam_points::PointCloudCPU::clone(*this->target);  // cache SD
 }
 
 void ManualLoopCloseModal::set_source(const gtsam::Key source_key, const gtsam_points::PointCloud::ConstPtr& source, const Eigen::Isometry3d& source_pose) {
@@ -97,6 +102,7 @@ void ManualLoopCloseModal::set_source(const gtsam::Key source_key, const gtsam_p
   gtsam_points::transform_inplace(this->source, T_world_local);
 
   this->source_drawable = std::make_shared<glk::PointCloudBuffer>(this->source->points, this->source->size());
+  this->sd_source = gtsam_points::PointCloudCPU::clone(*this->source);  // cache SD
   request_to_open = true;
 }
 
@@ -144,6 +150,7 @@ void ManualLoopCloseModal::replace_with_hd(const gtsam_points::PointCloudCPU::Pt
 }
 
 void ManualLoopCloseModal::clear() {
+  helper_gizmo_active = false;
   target_key = -1;
   source_key = -1;
   target = nullptr;
@@ -152,6 +159,11 @@ void ManualLoopCloseModal::clear() {
   source_fpfh_tree = nullptr;
   target_drawable = nullptr;
   source_drawable = nullptr;
+  modal_target_intensity_drawable = nullptr;
+  modal_source_intensity_drawable = nullptr;
+  modal_intensity_mode = false;
+  sd_target = nullptr;
+  sd_source = nullptr;
   target_submaps.clear();
   source_submaps.clear();
 }
@@ -171,6 +183,7 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::run() {
 
     init_T_target_source.translation() = (R_world_target * target_pose.inverse() * source_pose * R_world_source.inverse()).translation();
     model_control->set_model_matrix(init_T_target_source);
+    initial_model_matrix = init_T_target_source.cast<float>().matrix();
 
     // Open the manual loop close modal
     ImGui::OpenPopup("manual loop close");
@@ -245,7 +258,18 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::run() {
     ImGui::Text("Data source:");
     ImGui::SameLine();
     if (ImGui::Button("SD")) {
-      // Current behavior — already using SD
+      if (sd_target) {
+        this->target = gtsam_points::PointCloudCPU::clone(*sd_target);
+        this->target_drawable = std::make_shared<glk::PointCloudBuffer>(this->target->points, this->target->size());
+        this->target->aux_attributes.erase("fpfh");
+        this->target_fpfh_tree = nullptr;
+      }
+      if (sd_source) {
+        this->source = gtsam_points::PointCloudCPU::clone(*sd_source);
+        this->source_drawable = std::make_shared<glk::PointCloudBuffer>(this->source->points, this->source->size());
+        this->source->aux_attributes.erase("fpfh");
+        this->source_fpfh_tree = nullptr;
+      }
     }
     ImGui::SameLine();
     if (!load_hd_callback) ImGui::BeginDisabled();
@@ -265,11 +289,64 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::run() {
         ImGui::SetTooltip("Load HD frames with computed covariances\nfor higher-quality registration.");
       }
     }
+    ImGui::SameLine();
+    if (ImGui::Button(modal_intensity_mode ? "Color" : "Intensity")) {
+      modal_intensity_mode = !modal_intensity_mode;
+      if (modal_intensity_mode) {
+        // Build intensity-colored drawables using TURBO colormap (same as range filter)
+        auto build_intensity_drawable = [this](const gtsam_points::PointCloudCPU::Ptr& cloud, const std::string& label) -> glk::Drawable::ConstPtr {
+          if (!cloud || !cloud->intensities || cloud->size() == 0) {
+            logger->warn("[ICP] No intensity data for {}", label);
+            return nullptr;
+          }
+          // Use 1st-99th percentile for range (avoids outlier stretching)
+          std::vector<float> sorted_vals;
+          sorted_vals.reserve(std::min<size_t>(cloud->num_points, 50000));
+          const size_t step = std::max<size_t>(1, cloud->num_points / 50000);
+          for (size_t i = 0; i < cloud->num_points; i += step) {
+            const float v = static_cast<float>(cloud->intensities[i]);
+            if (std::isfinite(v)) sorted_vals.push_back(v);
+          }
+          std::sort(sorted_vals.begin(), sorted_vals.end());
+          const float imin = sorted_vals.empty() ? 0.0f : sorted_vals[sorted_vals.size() / 100];
+          const float imax = sorted_vals.empty() ? 1.0f : sorted_vals[sorted_vals.size() * 99 / 100];
+          const float inv_range = (imax > imin) ? 1.0f / (imax - imin) : 1.0f;
+          // Build vertex colors
+          std::vector<float> cmap_vals(cloud->num_points);
+          for (size_t i = 0; i < cloud->num_points; i++) {
+            cmap_vals[i] = std::clamp((static_cast<float>(cloud->intensities[i]) - imin) * inv_range, 0.0f, 1.0f);
+          }
+          auto buf = std::make_shared<glk::PointCloudBuffer>(cloud->points, cloud->size());
+          buf->add_intensity(glk::COLORMAP::TURBO, cmap_vals);
+          logger->info("[ICP] Intensity drawable for {}: {} pts, range [{:.1f}, {:.1f}]", label, cloud->num_points, imin, imax);
+          return buf;
+        };
+        modal_target_intensity_drawable = build_intensity_drawable(target, "target");
+        modal_source_intensity_drawable = build_intensity_drawable(source, "source");
+      }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle between red/green flat colors\nand intensity grayscale rendering.");
+
+    // GPS sigma display (red=target, green=source, matching canvas colors)
+    ImGui::SameLine();
+    ImGui::Text("  | GPS sigma:");
+    ImGui::SameLine();
+    if (target_gps_sigma >= 0.0f) {
+      ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Target: %.3f m", target_gps_sigma);
+    } else {
+      ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Target: N/A");
+    }
+    ImGui::SameLine();
+    if (source_gps_sigma >= 0.0f) {
+      ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Source: %.3f m", source_gps_sigma);
+    } else {
+      ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Source: N/A");
+    }
     ImGui::Separator();
 
     // Draw canvas — adapt to available space (width, and height minus ~250px for controls)
     const float canvas_w = std::max(256.0f, ImGui::GetContentRegionAvail().x - 10.0f);
-    const float canvas_h = std::max(256.0f, ImGui::GetContentRegionAvail().y - 250.0f);
+    const float canvas_h = std::max(200.0f, ImGui::GetContentRegionAvail().y - 450.0f);
     const int cw = static_cast<int>(canvas_w);
     const int ch = static_cast<int>(canvas_h);
     if (canvas->size[0] != cw || canvas->size[1] != ch) {
@@ -290,27 +367,115 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::run() {
     ImVec2 canvas_rect_min = ImGui::GetItemRectMin();
     ImVec2 canvas_rect_max = ImGui::GetItemRectMax();
 
-    model_control->draw_gizmo(
-      canvas_rect_min.x,
-      canvas_rect_min.y,
-      canvas_rect_max.x - canvas_rect_min.x,
-      canvas_rect_max.y - canvas_rect_min.y,
-      canvas->camera_control->view_matrix(),
-      canvas->projection_control->projection_matrix(),
-      true);
+    if (helper_gizmo_active) {
+      // Helper mode: render ONLY the helper gizmo (avoids ImGuizmo conflict)
+      // Compute delta from helper gizmo movement and apply to real model_control
+      const Eigen::Matrix4f helper_current = helper_model_control->model_matrix();
+      const Eigen::Vector3f delta_t = helper_current.block<3, 1>(0, 3) - helper_prev_matrix.block<3, 1>(0, 3);
+
+      if (delta_t.squaredNorm() > 1e-8f) {
+        Eigen::Matrix4f m = model_control->model_matrix();
+        m.block<3, 1>(0, 3) += delta_t;
+        model_control->set_model_matrix(m);
+      }
+      helper_prev_matrix = helper_current;
+
+      helper_model_control->draw_gizmo(
+        canvas_rect_min.x,
+        canvas_rect_min.y,
+        canvas_rect_max.x - canvas_rect_min.x,
+        canvas_rect_max.y - canvas_rect_min.y,
+        canvas->camera_control->view_matrix(),
+        canvas->projection_control->projection_matrix(),
+        true);
+    } else {
+      // Normal mode: render original gizmo
+      model_control->draw_gizmo(
+        canvas_rect_min.x,
+        canvas_rect_min.y,
+        canvas_rect_max.x - canvas_rect_min.x,
+        canvas_rect_max.y - canvas_rect_min.y,
+        canvas->camera_control->view_matrix(),
+        canvas->projection_control->projection_matrix(),
+        true);
+    }
 
     ImGui::EndChild();
 
+    /*** Helper gizmo + manual controls ***/
     ImGui::Separator();
 
+    if (ImGui::Button(helper_gizmo_active ? "Hide helper gizmo" : "Helper gizmo")) {
+      helper_gizmo_active = !helper_gizmo_active;
+      if (helper_gizmo_active) {
+        // Place helper at the 3D point at the center of the canvas viewport
+        const Eigen::Matrix4f vm = canvas->camera_control->view_matrix();
+        const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
+        const Eigen::Vector3f cam_fwd = -vm.block<1, 3>(2, 0).transpose().normalized();
+        // Place helper 20 units in front of camera, at source Z
+        const float source_z = model_control->model_matrix()(2, 3);
+        Eigen::Vector3f helper_pos = cam_pos + cam_fwd * 20.0f;
+        helper_pos.z() = source_z;
+        Eigen::Matrix4f helper_m = Eigen::Matrix4f::Identity();
+        helper_m.block<3, 1>(0, 3) = helper_pos;
+        helper_model_control->set_model_matrix(helper_m);
+        helper_prev_matrix = helper_m;
+      }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show a helper gizmo at the view center.\nDrag it to translate the source cloud\nwithout needing to see the original gizmo.");
+
+    ImGui::SameLine();
+    {
+      auto proj = std::dynamic_pointer_cast<guik::BasicProjectionControl>(canvas->projection_control);
+      if (proj) {
+        static bool ortho_mode = false;
+        if (ImGui::Button(ortho_mode ? "Perspective" : "Ortho")) {
+          ortho_mode = !ortho_mode;
+          proj->set_projection_mode(ortho_mode ? 1 : 0);
+          if (ortho_mode) proj->set_ortho_width(100.0);
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle orthographic/perspective view.\nOrtho is useful for top-down alignment.");
+      }
+    }
+
+    // XYZ translation + rotation on two rows
+    {
+      Eigen::Matrix4f m = model_control->model_matrix();
+      Eigen::Vector3f t = m.block<3, 1>(0, 3);
+      ImGui::SetNextItemWidth(200.0f);
+      if (ImGui::DragFloat3("Translate", t.data(), 0.05f, -500.0f, 500.0f, "%.2f")) {
+        m.block<3, 1>(0, 3) = t;
+        model_control->set_model_matrix(m);
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Manual XYZ translation offset (metres).\nDrag or Ctrl+click to type exact values.");
+    }
+    {
+      Eigen::Matrix4f m = model_control->model_matrix();
+      Eigen::Matrix3f rot = m.block<3, 3>(0, 0);
+      Eigen::Vector3f euler = rot.eulerAngles(2, 1, 0) * 180.0f / static_cast<float>(M_PI);
+      ImGui::SetNextItemWidth(200.0f);
+      if (ImGui::DragFloat3("Rotate (deg)", euler.data(), 0.1f, -180.0f, 180.0f, "%.1f")) {
+        Eigen::Matrix3f new_rot;
+        new_rot = Eigen::AngleAxisf(euler.x() * static_cast<float>(M_PI) / 180.0f, Eigen::Vector3f::UnitZ())
+                * Eigen::AngleAxisf(euler.y() * static_cast<float>(M_PI) / 180.0f, Eigen::Vector3f::UnitY())
+                * Eigen::AngleAxisf(euler.z() * static_cast<float>(M_PI) / 180.0f, Eigen::Vector3f::UnitX());
+        m.block<3, 3>(0, 0) = new_rot;
+        model_control->set_model_matrix(m);
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Manual rotation in degrees (Yaw, Pitch, Roll).\nDrag or Ctrl+click to type exact values.");
+    }
+
     /*** Global registration ***/
+    ImGui::Separator();
 
     ImGui::Combo("Global registration type", &global_registration_type, "RANSAC\0GNC\0");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("RANSAC: fast, random sampling based.\nGNC: graduated non-convexity, more robust but slower.");
 
-    if (ImGui::DragFloat("fpfh_radius", &fpfh_radius, 0.01f, 0.01f, 100.0f) || show_note("Neighbor search radius for FPFH extraction.\n~2.5m for indoors, ~5.0m for outdoors.")) {
+    if (ImGui::DragFloat("fpfh_radius", &fpfh_radius, 0.01f, 0.01f, 100.0f)) {
       target->aux_attributes.erase("fpfh");
       source->aux_attributes.erase("fpfh");
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Neighbour search radius for FPFH feature extraction.\n~2.5m indoors, ~5.0m outdoors.\nChanging this clears cached features.");
     if (target->aux_attributes.count("fpfh")) {
       ImGui::SameLine();
       ImGui::Text("[Cached]");
@@ -318,30 +483,44 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::run() {
 
     switch (global_registration_type) {
       case 0:  // RANSAC
-        ImGui::DragInt("max_iterations", &ransac_max_iterations, 100, 1, 100000) || show_note("Maximum number of RANSAC iterations.");
-        ImGui::DragFloat("inlier_voxel_resolution", &ransac_inlier_voxel_resolution, 0.01f, 0.01f, 100.0f) || show_note("Resolution of voxelmap used for inlier check.");
+        ImGui::DragInt("max_iterations", &ransac_max_iterations, 100, 1, 100000);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Maximum RANSAC iterations.\nHigher = better chance of finding correct alignment, slower.");
+        ImGui::DragFloat("inlier_voxel_resolution", &ransac_inlier_voxel_resolution, 0.01f, 0.01f, 100.0f);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Voxel resolution for RANSAC inlier counting.\nSmaller = stricter matching.");
         break;
       case 1:
-        ImGui::DragInt("max_samples", &gnc_max_samples, 100, 1, 100000) || show_note("Maximum number of feature samples for GNC.");
+        ImGui::DragInt("max_samples", &gnc_max_samples, 100, 1, 100000);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Maximum feature samples for GNC registration.");
         break;
     }
-    ImGui::Checkbox("4dof", &global_registration_4dof) || show_note("Use 4DoF (XYZ + RZ) estimation instead of 6DoF (SE3).");
+    ImGui::Checkbox("4dof", &global_registration_4dof);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restrict to 4-DOF (XYZ + yaw) instead of full 6-DOF.\nUseful for ground vehicles / outdoor MMS.");
 
     bool open_align_global_modal = false;
     if (ImGui::Button("Run global registration")) {
       open_align_global_modal = true;
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Compute initial alignment using FPFH features.\nUse when clouds are far apart or poorly initialised.");
 
     /*** Fine registration ***/
 
     ImGui::Separator();
-    ImGui::DragFloat("max_corr_dist", &max_correspondence_distance, 0.01f, 0.01f, 100.0f) || show_note("Maximum correspondence distance for scan matching.");
-    ImGui::DragFloat("inf_scale", &information_scale, 0.0f, 1.0f, 10000.0f) || show_note("Information scale for loop factor.");
+    ImGui::DragFloat("max_corr_dist", &max_correspondence_distance, 0.01f, 0.01f, 100.0f);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Maximum correspondence distance for ICP.\nPoints farther apart are ignored.\nIncrease if clouds are still misaligned.");
+    ImGui::DragFloat("inf_scale", &information_scale, 0.0f, 1.0f, 10000.0f);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Information (confidence) scale for the loop factor.\nHigher = optimizer trusts this constraint more.\nDefault 1.0 is usually fine.");
 
     bool open_align_modal = false;
-    if (ImGui::Button("Run fine registration")) {
+    bool open_align_icp_modal = false;
+    if (ImGui::Button("GICP")) {
       open_align_modal = true;
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run GICP (point-to-plane) registration.\nUses surface covariances for better accuracy.");
+    ImGui::SameLine();
+    if (ImGui::Button("ICP")) {
+      open_align_icp_modal = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run ICP (point-to-point) registration.\nSimpler, no covariances needed. For comparison.");
 
     if (open_align_global_modal) {
       progress_modal->open<std::shared_ptr<Eigen::Isometry3d>>("align", [this](guik::ProgressInterface& progress) { return align_global(progress); });
@@ -349,25 +528,84 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::run() {
     if (open_align_modal) {
       progress_modal->open<std::shared_ptr<Eigen::Isometry3d>>("align", [this](guik::ProgressInterface& progress) { return align(progress); });
     }
+    if (open_align_icp_modal) {
+      progress_modal->open<std::shared_ptr<Eigen::Isometry3d>>("align", [this](guik::ProgressInterface& progress) {
+        progress.set_title("Aligning frames (ICP)");
+        progress.set_maximum(200);
+        progress.set_text("Creating graph");
+        gtsam::NonlinearFactorGraph graph;
+        graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(0, gtsam::Pose3::Identity(), gtsam::noiseModel::Isotropic::Precision(6, 1e6));
+        auto f = gtsam::make_shared<gtsam_points::IntegratedICPFactor>(0, 1, target, source);
+        f->set_num_threads(num_threads);
+        f->set_max_correspondence_distance(max_correspondence_distance);
+        graph.add(f);
+        gtsam::Values values;
+        values.insert(0, gtsam::Pose3::Identity());
+        values.insert(1, gtsam::Pose3(model_control->model_matrix().cast<double>()));
+        progress.set_text("Optimizing");
+        gtsam_points::LevenbergMarquardtExtParams lm_params;
+        lm_params.setMaxIterations(200);
+        lm_params.callback = [&](const gtsam_points::LevenbergMarquardtOptimizationStatus& status, const gtsam::Values&) {
+          progress.increment();
+          progress.set_text(fmt::format("ICP iter:{} error:{:.3f}", status.iterations, status.error));
+        };
+        gtsam_points::LevenbergMarquardtOptimizerExt optimizer(graph, values, lm_params);
+#ifdef GTSAM_USE_TBB
+        auto arena = static_cast<tbb::task_arena*>(tbb_task_arena.get());
+        arena->execute([&] { values = optimizer.optimize(); });
+#else
+        values = optimizer.optimize();
+#endif
+        const gtsam::Pose3 estimated = values.at<gtsam::Pose3>(0).inverse() * values.at<gtsam::Pose3>(1);
+        return std::shared_ptr<Eigen::Isometry3d>(new Eigen::Isometry3d(estimated.matrix()));
+      });
+    }
     auto align_result = progress_modal->run<std::shared_ptr<Eigen::Isometry3d>>("align");
     if (align_result) {
       model_control->set_model_matrix((*align_result)->cast<float>().matrix());
     }
 
+    /*** Neighbour relaxation ***/
+
+    ImGui::Separator();
+    ImGui::Checkbox("Relax neighbours", &relax_neighbors);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Temporarily weaken nearby factors so the optimizer\nblends the loop correction smoothly over several submaps\ninstead of creating a hard jump at the closure point.");
+    if (relax_neighbors) {
+      ImGui::Indent();
+      ImGui::DragInt("Radius (submaps)", &relax_radius, 1, 1, 30);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Number of submaps on each side of the loop\nendpoints whose factors will be relaxed.");
+      ImGui::DragFloat("Scale", &relax_scale, 0.5f, 1.5f, 50.0f, "%.1fx");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Factor by which to multiply the noise sigma.\nHigher = looser constraints = more movement allowed.\n5x is a good starting point.");
+      ImGui::Checkbox("Between factors", &relax_between);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Relax inter-submap odometry/matching constraints.");
+      ImGui::SameLine();
+      ImGui::Checkbox("GPS factors", &relax_gps);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Relax GNSS position constraints.\nUseful when GPS anchoring prevents submaps from moving.");
+      ImGui::Unindent();
+    }
+
     /*** Factor creation ***/
 
     ImGui::Separator();
-    if (ImGui::Button("Create Factor") || show_note("Create a loop factor with the estimated transformation.")) {
+    if (ImGui::Button("Create Factor")) {
       factor = create_factor();
       ImGui::CloseCurrentPopup();
       clear();
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Create a loop factor with the current transformation\nand close the modal. Triggers optimisation.");
 
     ImGui::SameLine();
     if (ImGui::Button("Cancel")) {
       ImGui::CloseCurrentPopup();
       clear();
     }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) {
+      model_control->set_model_matrix(initial_model_matrix);
+      helper_gizmo_active = false;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset source cloud to its initial position.");
 
     ImGui::EndPopup();
   }
@@ -442,13 +680,37 @@ std::shared_ptr<Eigen::Isometry3d> ManualLoopCloseModal::align_global(guik::Prog
   fpfh_params.num_threads = num_threads;
   fpfh_params.search_radius = fpfh_radius;
 
+  // Helper: ensure normals+covs exist (needed for FPFH). Merged clouds may lack covs.
+  auto ensure_normals = [&](gtsam_points::PointCloudCPU::Ptr& cloud, const std::string& label) {
+    if (cloud->has_normals()) return;
+    if (!cloud->has_covs()) {
+      logger->info("Estimating {} covariances", label);
+      progress.set_text("Estimating " + label + " covariances");
+      const int k = 10;
+      gtsam_points::KdTree tree(cloud->points, cloud->num_points);
+      std::vector<int> neighbors(cloud->num_points * k);
+      for (size_t i = 0; i < cloud->num_points; i++) {
+        std::vector<size_t> k_indices(k, i);
+        std::vector<double> k_sq_dists(k);
+        tree.knn_search(cloud->points[i].data(), k, k_indices.data(), k_sq_dists.data());
+        std::copy(k_indices.begin(), k_indices.begin() + k, neighbors.begin() + i * k);
+      }
+      glim::CloudCovarianceEstimation cov_est(num_threads);
+      std::vector<Eigen::Vector4d> normals;
+      std::vector<Eigen::Matrix4d> covs;
+      cov_est.estimate(cloud->points_storage, neighbors, k, normals, covs);
+      cloud->add_normals(normals);
+      cloud->add_covs(covs);
+    } else {
+      logger->info("Estimating {} normals", label);
+      progress.set_text("Estimating " + label + " normals");
+      cloud->add_normals(gtsam_points::estimate_normals(cloud->points, cloud->covs, cloud->size(), num_threads));
+    }
+  };
+
   progress.increment();
   if (!target->aux_attributes.count("fpfh")) {
-    if (!target->has_normals()) {
-      logger->info("Estimating target normals");
-      progress.set_text("Estimating target normals");
-      target->add_normals(gtsam_points::estimate_normals(target->points, target->covs, target->size(), num_threads));
-    }
+    ensure_normals(target, "target");
 
     logger->info("Estimating target FPFH features");
     progress.set_text("Estimating target FPFH features");
@@ -463,11 +725,7 @@ std::shared_ptr<Eigen::Isometry3d> ManualLoopCloseModal::align_global(guik::Prog
 
   progress.increment();
   if (!source->aux_attributes.count("fpfh")) {
-    if (!source->has_normals()) {
-      logger->info("Estimating source normals");
-      progress.set_text("Estimating source normals");
-      source->add_normals(gtsam_points::estimate_normals(source->points, source->covs, source->size(), num_threads));
-    }
+    ensure_normals(source, "source");
 
     logger->info("Estimating source FPFH features");
     progress.set_text("Estimating source FPFH features");
@@ -526,29 +784,44 @@ std::shared_ptr<Eigen::Isometry3d> ManualLoopCloseModal::align_global(guik::Prog
   return trans;
 }
 
+void ManualLoopCloseModal::ensure_covs(gtsam_points::PointCloudCPU::Ptr& cloud, const std::string& label) {
+  if (!cloud || cloud->has_covs()) return;
+  logger->info("Computing covariances for {} ({} pts)", label, cloud->num_points);
+  const int k = 10;
+  gtsam_points::KdTree tree(cloud->points, cloud->num_points);
+  std::vector<int> neighbors(cloud->num_points * k);
+  for (size_t i = 0; i < cloud->num_points; i++) {
+    std::vector<size_t> k_indices(k, i);
+    std::vector<double> k_sq_dists(k);
+    tree.knn_search(cloud->points[i].data(), k, k_indices.data(), k_sq_dists.data());
+    std::copy(k_indices.begin(), k_indices.begin() + k, neighbors.begin() + i * k);
+  }
+  glim::CloudCovarianceEstimation cov_est(num_threads);
+  std::vector<Eigen::Vector4d> normals;
+  std::vector<Eigen::Matrix4d> covs;
+  cov_est.estimate(cloud->points_storage, neighbors, k, normals, covs);
+  cloud->add_normals(normals);
+  cloud->add_covs(covs);
+}
+
 std::shared_ptr<Eigen::Isometry3d> ManualLoopCloseModal::align(guik::ProgressInterface& progress) {
   progress.set_title("Aligning frames");
   int num_iterations = 20;
   progress.set_maximum(num_iterations);
 
+  // Ensure covariances exist for GICP
+  progress.set_text("Checking covariances");
+  ensure_covs(target, "target");
+  ensure_covs(source, "source");
+
   progress.set_text("Creating graph");
   gtsam::NonlinearFactorGraph graph;
   graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(0, gtsam::Pose3::Identity(), gtsam::noiseModel::Isotropic::Precision(6, 1e6));
 
-  if (target->has_covs() && source->has_covs()) {
-    auto factor = gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(0, 1, target, source);
-    factor->set_num_threads(num_threads);
-    factor->set_max_correspondence_distance(max_correspondence_distance);
-    graph.add(factor);
-  } else {
-    auto factor = gtsam::make_shared<gtsam_points::IntegratedICPFactor>(0, 1, target, source);
-    factor->set_num_threads(num_threads);
-    factor->set_max_correspondence_distance(max_correspondence_distance);
-    graph.add(factor);
-
-    num_iterations = 200;
-    progress.set_maximum(num_iterations);
-  }
+  auto factor = gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(0, 1, target, source);
+  factor->set_num_threads(num_threads);
+  factor->set_max_correspondence_distance(max_correspondence_distance);
+  graph.add(factor);
 
   gtsam::Values values;
   values.insert(0, gtsam::Pose3::Identity());
@@ -618,11 +891,15 @@ gtsam::NonlinearFactor::shared_ptr ManualLoopCloseModal::create_factor() {
   values.insert(0, gtsam::Pose3::Identity());
   values.insert(1, T_target_source);
 
-  auto factor = gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(0, 1, target, source);
-  factor->set_num_threads(num_threads);
-  factor->set_max_correspondence_distance(max_correspondence_distance);
+  // Ensure covariances exist for GICP
+  ensure_covs(target, "target");
+  ensure_covs(source, "source");
 
-  const auto linearized = factor->linearize(values);
+  auto icp_factor = gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(0, 1, target, source);
+  icp_factor->set_num_threads(num_threads);
+  icp_factor->set_max_correspondence_distance(max_correspondence_distance);
+
+  const auto linearized = icp_factor->linearize(values);
   const gtsam::Matrix H = linearized->hessianBlockDiagonal()[1];
 
   // Cancel out the gravity alignment
@@ -640,16 +917,24 @@ void ManualLoopCloseModal::draw_canvas() {
 
   glk::Primitives::coordinate_system()->draw(*canvas->shader);
 
-  canvas->shader->set_uniform("color_mode", guik::ColorMode::FLAT_COLOR);
-  canvas->shader->set_uniform("material_color", Eigen::Vector4f(1.0f, 0.0f, 0.0f, 1.0f));
-  canvas->shader->set_uniform("model_matrix", Eigen::Matrix4f::Identity().eval());
+  if (modal_intensity_mode && modal_target_intensity_drawable && modal_source_intensity_drawable) {
+    // Intensity vertex-color mode
+    canvas->shader->set_uniform("color_mode", guik::ColorMode::VERTEX_COLOR);
+    canvas->shader->set_uniform("model_matrix", Eigen::Matrix4f::Identity().eval());
+    modal_target_intensity_drawable->draw(*canvas->shader);
+    canvas->shader->set_uniform("model_matrix", model_control->model_matrix());
+    modal_source_intensity_drawable->draw(*canvas->shader);
+  } else {
+    // Flat red/green mode
+    canvas->shader->set_uniform("color_mode", guik::ColorMode::FLAT_COLOR);
+    canvas->shader->set_uniform("material_color", Eigen::Vector4f(1.0f, 1.0f, 0.0f, 1.0f));
+    canvas->shader->set_uniform("model_matrix", Eigen::Matrix4f::Identity().eval());
+    target_drawable->draw(*canvas->shader);
 
-  target_drawable->draw(*canvas->shader);
-
-  canvas->shader->set_uniform("material_color", Eigen::Vector4f(0.0f, 1.0f, 0.0f, 1.0f));
-  canvas->shader->set_uniform("model_matrix", model_control->model_matrix());
-
-  source_drawable->draw(*canvas->shader);
+    canvas->shader->set_uniform("material_color", Eigen::Vector4f(0.0f, 1.0f, 0.0f, 1.0f));
+    canvas->shader->set_uniform("model_matrix", model_control->model_matrix());
+    source_drawable->draw(*canvas->shader);
+  }
 
   canvas->unbind();
 }
