@@ -31,6 +31,10 @@ class ISAM2Ext;
 class ISAM2ResultExt;
 }  // namespace gtsam_points
 
+namespace guik {
+class ModelControl;
+}
+
 namespace glim {
 
 class TrajectoryManager;
@@ -112,6 +116,7 @@ protected:
   double point_size;
   bool point_size_metric;
   bool point_shape_circle;
+  bool show_display_settings = false;
 
   Eigen::Vector2f z_range;
 
@@ -125,6 +130,8 @@ protected:
   Eigen::Vector3f right_clicked_pos;
   int lc_target_frame_id = -1;  // for HD loop closure callback
   int lc_source_frame_id = -1;
+  std::vector<int> lc_source_group;  // accumulated loop-end submap indices
+  std::vector<int> lc_target_group;  // target team submap indices (for auto-align)
 
   // GUI widgets
   std::unique_ptr<ManualLoopCloseModal> manual_loop_close_modal;
@@ -136,12 +143,14 @@ protected:
   // Submaps
   std::vector<Eigen::Isometry3d> submap_poses;
   std::vector<SubMap::ConstPtr> submaps;
+  std::vector<float> submap_gps_sigma;  // per-submap average GPS sigma (m), -1 if no GNSS factor
+  std::unordered_map<int, float> pending_sigma_map;  // sigma values waiting for submap insertion
   std::unordered_set<int> hidden_sessions;  // session IDs to exclude from trajectory/factor rendering
   std::unordered_map<int, std::string> session_hd_paths;  // session_id → HD frames directory
 
-  /// Load HD frames for a submap, compute covariances, return as PointCloudCPU.
-  /// Returns nullptr if HD frames not available.
-  gtsam_points::PointCloudCPU::Ptr load_hd_for_submap(int submap_index) const;
+  /// Load HD frames for a submap, return as PointCloudCPU.
+  /// @param compute_covs If true, compute normals+covariances (needed for ICP). If false, points+intensity only (faster).
+  gtsam_points::PointCloudCPU::Ptr load_hd_for_submap(int submap_index, bool compute_covs = true) const;
 
   // LOD memory management
   enum class SubmapLOD { UNLOADED = 0, BBOX = 1, LOADING = 2, SD = 3, LOADING_HD = 4, HD = 5 };
@@ -195,6 +204,40 @@ protected:
   ConcurrentVector<LODWorkItem> lod_work_queue;
   std::thread lod_worker_thread;
   std::atomic_bool lod_worker_kill{false};
+
+  // Source finder — cylinder/box probe to identify which submaps contribute points to an area
+  bool source_finder_active = false;
+  int source_finder_mode = 0;   // 0 = fast (bbox), 1 = precise (per-point)
+  int source_finder_shape = 0;  // 0 = cylinder, 1 = box
+  Eigen::Vector3f source_finder_pos = Eigen::Vector3f::Zero();
+  float source_finder_radius = 0.5f;
+  float source_finder_height = 5.0f;
+  float source_finder_length = 20.0f;  // box: along yaw direction
+  float source_finder_width = 2.0f;    // box: perpendicular
+  float source_finder_yaw = 0.0f;      // box: Z rotation in degrees
+  float source_finder_pitch = 0.0f;   // box: Y rotation in degrees (for slopes)
+  std::unordered_set<int> source_finder_hits;
+  bool source_finder_teams_swapped = false;
+  std::unique_ptr<guik::ModelControl> source_finder_gizmo;
+  void source_finder_scan_fast();
+  void source_finder_scan_precise();
+  void source_finder_color_hits();
+  void source_finder_update_cylinder();
+
+  // Undo last factor
+  std::vector<size_t> last_factor_indices;  // ISAM2 graph indices of last added factors
+  std::mutex last_factor_mutex;
+  std::atomic_bool request_undo_last{false};
+
+  // Factor relaxation (noise scaling around loop closure for smooth blending)
+  struct RelaxationRequest {
+    int center_key = -1;          // submap index around which to relax
+    int radius = 5;               // number of submaps on each side
+    float scale = 5.0f;           // noise sigma multiplier
+    bool relax_between = true;    // relax BetweenFactors
+    bool relax_gps = true;        // relax GNSS PoseTranslationPrior
+  };
+  ConcurrentVector<RelaxationRequest> pending_relaxations;
 
   // Factors
   std::vector<std::tuple<FactorType, std::uint64_t, std::uint64_t>> global_factors;

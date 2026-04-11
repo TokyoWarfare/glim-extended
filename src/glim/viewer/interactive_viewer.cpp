@@ -24,6 +24,7 @@
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/NonlinearFactor.h>
@@ -32,12 +33,14 @@
 #include <gtsam_points/config.hpp>
 #include <gtsam_points/factors/integrated_matching_cost_factor.hpp>
 #include <gtsam_points/factors/integrated_vgicp_factor_gpu.hpp>
+#include <gtsam_points/optimizers/isam2_ext.hpp>
 #include <gtsam_points/optimizers/isam2_result_ext.hpp>
 
 #include <glk/thin_lines.hpp>
 #include <glk/pointcloud_buffer.hpp>
 #include <glk/primitives/primitives.hpp>
 #include <guik/spdlog_sink.hpp>
+#include <guik/model_control.hpp>
 #include <guik/viewer/light_viewer.hpp>
 
 namespace glim {
@@ -190,6 +193,285 @@ void InteractiveViewer::viewer_loop() {
     viewer->shader_setting().add("dynamic_object", 1);
   }
 
+  viewer->register_ui_callback("display_settings", [this] {
+    if (!show_display_settings) return;
+    auto viewer = guik::LightViewer::instance();
+    ImGui::SetNextWindowSize(ImVec2(250, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Display Settings", &show_display_settings)) {
+      bool changed = false;
+      float ps = static_cast<float>(point_size);
+      if (ImGui::DragFloat("Point size", &ps, 0.001f, 0.001f, 0.5f, "%.3f")) {
+        point_size = ps;
+        changed = true;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of rendered points.\nSmaller = finer detail, larger = more visible.");
+      if (changed) {
+        viewer->shader_setting().set_point_size(point_size);
+      }
+      float pa = static_cast<float>(points_alpha);
+      if (ImGui::SliderFloat("Point alpha", &pa, 0.05f, 1.0f, "%.2f")) {
+        points_alpha = pa;
+        changed = true;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Point opacity. Lower = more transparent.");
+    }
+    ImGui::End();
+  });
+  viewer->register_ui_callback("source_finder", [this] {
+    if (!source_finder_active) return;
+    auto viewer = guik::LightViewer::instance();
+
+    // Draw gizmo in the main viewport (skip when ICP modal is open to avoid ImGuizmo conflict)
+    if (!ImGui::IsPopupOpen("manual loop close")) {
+      // Set gizmo operation: translate XYZ for cylinder, translate XYZ + rotate YZ for box
+      source_finder_gizmo->set_gizmo_operation(source_finder_shape == 0 ? (1 | 2 | 4) : (1 | 2 | 4 | 16 | 32));
+
+      const auto display_size = ImGui::GetIO().DisplaySize;
+      source_finder_gizmo->draw_gizmo(
+        0, 0, static_cast<int>(display_size.x), static_cast<int>(display_size.y),
+        viewer->view_matrix(), viewer->projection_matrix());
+
+      // Sync stored values from gizmo (after draw, gizmo has latest user input)
+      const Eigen::Matrix4f new_m = source_finder_gizmo->model_matrix();
+      const Eigen::Vector3f new_pos = new_m.block<3, 1>(0, 3);
+      // Extract Euler YZ from rotation matrix
+      const float new_yaw = std::atan2(new_m(1, 0), new_m(0, 0)) * 180.0f / static_cast<float>(M_PI);
+      const float new_pitch = std::asin(std::clamp(-new_m(2, 0), -1.0f, 1.0f)) * 180.0f / static_cast<float>(M_PI);
+      bool gizmo_changed = false;
+      if ((new_pos - source_finder_pos).squaredNorm() > 1e-6f) {
+        source_finder_pos = new_pos;
+        gizmo_changed = true;
+      }
+      if (std::abs(new_yaw - source_finder_yaw) > 0.1f) {
+        source_finder_yaw = new_yaw;
+        gizmo_changed = true;
+      }
+      if (std::abs(new_pitch - source_finder_pitch) > 0.1f) {
+        source_finder_pitch = new_pitch;
+        gizmo_changed = true;
+      }
+      if (gizmo_changed) {
+        source_finder_update_cylinder();
+        if (source_finder_mode == 0) source_finder_scan_fast();
+      }
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(280, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Source Finder", &source_finder_active)) {
+      ImGui::Combo("Mode", &source_finder_mode, "Fast (bbox)\0Precise (points)\0");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fast: uses bounding boxes, updates live.\nPrecise: checks actual points, click Scan to run.");
+      bool shape_changed = false;
+      shape_changed |= ImGui::Combo("Shape", &source_finder_shape, "Cylinder\0Box\0");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cylinder: radial probe for single features.\nBox: oriented rectangle for linear features (row of trees, curb).");
+      ImGui::Separator();
+
+      bool changed = shape_changed;
+      changed |= ImGui::DragFloat3("Position", source_finder_pos.data(), 0.2f);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Probe center (world coordinates).\nRight-click a new point to re-center.");
+      if (source_finder_shape == 0) {
+        changed |= ImGui::DragFloat("Radius", &source_finder_radius, 0.01f, 0.1f, 2.0f, "%.2f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Horizontal search radius.");
+      } else {
+        changed |= ImGui::DragFloat("Length", &source_finder_length, 0.5f, 1.0f, 200.0f, "%.1f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Box extent along the yaw direction.");
+        changed |= ImGui::DragFloat("Width", &source_finder_width, 0.1f, 0.5f, 20.0f, "%.1f m");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Box extent perpendicular to yaw direction.");
+        changed |= ImGui::DragFloat("Yaw", &source_finder_yaw, 1.0f, -180.0f, 180.0f, "%.0f deg");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Box rotation around Z axis (degrees).");
+      }
+      changed |= ImGui::DragFloat("Height", &source_finder_height, 0.2f, 1.0f, 100.0f, "%.1f m");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Vertical extent (centered on position).");
+      if (changed) {
+        // Push UI values to gizmo matrix (Rz * Ry)
+        const float yr = source_finder_yaw * static_cast<float>(M_PI) / 180.0f;
+        const float pr = source_finder_pitch * static_cast<float>(M_PI) / 180.0f;
+        Eigen::Matrix3f rot = (Eigen::AngleAxisf(yr, Eigen::Vector3f::UnitZ()) * Eigen::AngleAxisf(pr, Eigen::Vector3f::UnitY())).toRotationMatrix();
+        Eigen::Matrix4f gizmo_m = Eigen::Matrix4f::Identity();
+        gizmo_m.block<3, 3>(0, 0) = rot;
+        gizmo_m.block<3, 1>(0, 3) = source_finder_pos;
+        source_finder_gizmo->set_model_matrix(gizmo_m);
+        source_finder_update_cylinder();
+        if (source_finder_mode == 0) source_finder_scan_fast();
+      }
+
+      if (source_finder_mode == 1) {
+        if (ImGui::Button("Scan")) {
+          source_finder_scan_precise();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Check every point in every submap.\nMore accurate but slower.");
+      }
+
+      ImGui::Separator();
+      ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "%zu submaps found", source_finder_hits.size());
+
+      // Group hits by sequence continuity
+      std::vector<std::vector<int>> teams;
+      if (!source_finder_hits.empty()) {
+        std::vector<int> sorted_ids(source_finder_hits.begin(), source_finder_hits.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        teams.push_back({sorted_ids[0]});
+        for (size_t i = 1; i < sorted_ids.size(); i++) {
+          if (sorted_ids[i] - sorted_ids[i - 1] > 2) {
+            teams.push_back({});  // gap > 2 = new team
+          }
+          teams.back().push_back(sorted_ids[i]);
+        }
+        // Sort teams by size descending
+        std::sort(teams.begin(), teams.end(), [](const auto& a, const auto& b) { return a.size() > b.size(); });
+
+        // Apply swap: determine target/source indices
+        const int tgt_idx = source_finder_teams_swapped ? 1 : 0;
+        const int src_idx = source_finder_teams_swapped ? 0 : 1;
+
+        // Display teams with role labels
+        for (size_t ti = 0; ti < teams.size(); ti++) {
+          std::string label;
+          for (int id : teams[ti]) {
+            if (!label.empty()) label += ", ";
+            label += std::to_string(id);
+          }
+          const char* role = (ti == static_cast<size_t>(tgt_idx)) ? " [Target]" : (ti == static_cast<size_t>(src_idx)) ? " [Source]" : " (ignored)";
+          const ImVec4 team_color = (ti == static_cast<size_t>(tgt_idx)) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f) : (ti == static_cast<size_t>(src_idx)) ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 0.7f);
+          ImGui::TextColored(team_color, "Team %zu (%zu)%s: %s", ti + 1, teams[ti].size(), role, label.c_str());
+        }
+      }
+
+      // Auto-align button — needs at least 2 teams
+      if (teams.size() >= 2) {
+        const int tgt_idx = source_finder_teams_swapped ? 1 : 0;
+        const int src_idx = source_finder_teams_swapped ? 0 : 1;
+
+        ImGui::Separator();
+        if (ImGui::Button("Swap teams")) {
+          source_finder_teams_swapped = !source_finder_teams_swapped;
+          source_finder_color_hits();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Swap target and source team roles.");
+        ImGui::SameLine();
+        if (ImGui::Button("Auto-align teams")) {
+          const auto& tgt_team = teams[tgt_idx];
+          const auto& src_team = teams[src_idx];
+
+          // Clean up visual noise before opening ICP modal
+          viewer->remove_drawable("team_lines");
+          viewer->remove_drawable("identify_line");
+          // Restore sphere colors to session defaults
+          static const float sc2[][3] = {
+            {1.0f, 0.0f, 0.0f}, {1.0f, 0.85f, 0.0f}, {0.0f, 0.8f, 0.2f},
+            {1.0f, 0.6f, 0.0f}, {0.8f, 0.0f, 0.8f}, {0.0f, 0.8f, 0.8f},
+          };
+          for (int pi = 0; pi < static_cast<int>(submaps.size()); pi++) {
+            if (!submaps[pi]) continue;
+            const int ci = submaps[pi]->session_id % 6;
+            const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submaps[pi]->id);
+            const Eigen::Affine3f sp = submap_poses[pi].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
+            viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+              guik::FlatColor(sc2[ci][0], sc2[ci][1], sc2[ci][2], 0.5f, sp).add("info_values", info).make_transparent());
+          }
+
+          // Helper: merge a team's points + intensities into a single cloud
+          auto merge_team = [&](const std::vector<int>& team) -> gtsam_points::PointCloudCPU::Ptr {
+            const int ref = team[team.size() / 2];
+            const Eigen::Isometry3d ref_pose = submap_poses[ref];
+            std::vector<Eigen::Vector4d> pts;
+            std::vector<double> ints;
+            for (int si : team) {
+              const auto& sm = submaps[si];
+              if (!sm || !sm->frame) continue;
+              const Eigen::Isometry3d T = ref_pose.inverse() * submap_poses[si];
+              const bool has_int = sm->frame->intensities != nullptr;
+              for (size_t pi = 0; pi < sm->frame->size(); pi++) {
+                const Eigen::Vector3d p = T * sm->frame->points[pi].head<3>();
+                pts.push_back(Eigen::Vector4d(p.x(), p.y(), p.z(), 1.0));
+                ints.push_back(has_int ? sm->frame->intensities[pi] : 0.0);
+              }
+            }
+            auto cloud = std::make_shared<gtsam_points::PointCloudCPU>();
+            cloud->num_points = pts.size();
+            cloud->points_storage = std::move(pts);
+            cloud->points = cloud->points_storage.data();
+            cloud->intensities_storage = std::move(ints);
+            cloud->intensities = cloud->intensities_storage.data();
+            return cloud;
+          };
+
+          int tgt_ref = tgt_team[tgt_team.size() / 2];
+          int src_ref = src_team[src_team.size() / 2];
+          const Eigen::Isometry3d tgt_ref_pose = submap_poses[tgt_ref];
+          const Eigen::Isometry3d src_ref_pose = submap_poses[src_ref];
+          auto tgt_merged = merge_team(tgt_team);
+          auto src_merged = merge_team(src_team);
+
+          logger->info("[Auto-align] Team 1 (target): {} submaps, {} pts | Team 2 (source): {} submaps, {} pts",
+            tgt_team.size(), tgt_merged->num_points, src_team.size(), src_merged->num_points);
+
+          // Set up modal
+          lc_target_frame_id = tgt_ref;
+          lc_source_frame_id = src_ref;
+          lc_source_group = src_team;
+          lc_target_group = tgt_team;
+
+          manual_loop_close_modal->set_target(X(tgt_ref), tgt_merged, tgt_ref_pose);
+          manual_loop_close_modal->target_gps_sigma = (tgt_ref < static_cast<int>(submap_gps_sigma.size())) ? submap_gps_sigma[tgt_ref] : -1.0f;
+
+          manual_loop_close_modal->set_source(X(src_ref), src_merged, src_ref_pose);
+          manual_loop_close_modal->source_gps_sigma = (src_ref < static_cast<int>(submap_gps_sigma.size())) ? submap_gps_sigma[src_ref] : -1.0f;
+
+          // HD callback for both teams
+          manual_loop_close_modal->load_hd_callback = [this, tgt_team, src_team, tgt_ref, src_ref]()
+            -> std::pair<gtsam_points::PointCloudCPU::Ptr, gtsam_points::PointCloudCPU::Ptr> {
+            auto merge_hd = [&](const std::vector<int>& team, int ref_id) -> gtsam_points::PointCloudCPU::Ptr {
+              const Eigen::Isometry3d ref_pose = submap_poses[ref_id];
+              std::vector<Eigen::Vector4d> all_pts;
+              std::vector<double> all_ints;
+              for (int si : team) {
+                auto hd = load_hd_for_submap(si, false);  // points+intensity, covs deferred
+                if (!hd) continue;
+                const Eigen::Isometry3d T = ref_pose.inverse() * submap_poses[si];
+                const bool has_int = hd->intensities != nullptr;
+                for (size_t pi = 0; pi < hd->size(); pi++) {
+                  const Eigen::Vector3d p = T * hd->points[pi].head<3>();
+                  all_pts.push_back(Eigen::Vector4d(p.x(), p.y(), p.z(), 1.0));
+                  all_ints.push_back(has_int ? hd->intensities[pi] : 0.0);
+                }
+              }
+              if (all_pts.empty()) return nullptr;
+              auto merged = std::make_shared<gtsam_points::PointCloudCPU>();
+              merged->num_points = all_pts.size();
+              merged->points_storage = std::move(all_pts);
+              merged->points = merged->points_storage.data();
+              merged->intensities_storage = std::move(all_ints);
+              merged->intensities = merged->intensities_storage.data();
+              return merged;
+            };
+            return {merge_hd(tgt_team, tgt_ref), merge_hd(src_team, src_ref)};
+          };
+          if (session_hd_paths.empty()) manual_loop_close_modal->load_hd_callback = nullptr;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open ICP alignment between the two teams.\nUse 'Swap teams' to change target/source roles.");
+      }
+    }
+    ImGui::End();
+    if (!source_finder_active) {
+      // Window was closed via X button
+      source_finder_hits.clear();
+      viewer->remove_drawable("source_finder_cylinder");
+      viewer->remove_drawable("team_lines");
+      viewer->remove_drawable("identify_line");
+      static const float sc[][3] = {
+        {1.0f, 0.0f, 0.0f}, {1.0f, 0.85f, 0.0f}, {0.0f, 0.8f, 0.2f},
+        {1.0f, 0.6f, 0.0f}, {0.8f, 0.0f, 0.8f}, {0.0f, 0.8f, 0.8f},
+      };
+      for (int pi = 0; pi < static_cast<int>(submaps.size()); pi++) {
+        if (!submaps[pi]) continue;
+        const int ci = submaps[pi]->session_id % 6;
+        const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submaps[pi]->id);
+        const Eigen::Affine3f sp = submap_poses[pi].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
+        viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+          guik::FlatColor(sc[ci][0], sc[ci][1], sc[ci][2], 0.5f, sp).add("info_values", info).make_transparent());
+      }
+    }
+  });
   viewer->register_ui_callback("selection", [this] { drawable_selection(); });
   viewer->register_ui_callback("on_click", [this] { on_click(); });
   viewer->register_ui_callback("context_menu", [this] { context_menu(); });
@@ -403,7 +685,9 @@ void InteractiveViewer::viewer_loop() {
         }
       }
       if (hd_available) {
-        ImGui::Checkbox("Display HD only", &lod_hd_only);
+        if (ImGui::Checkbox("Display HD only", &lod_hd_only)) {
+          if (lod_hd_only) lod_hd_enabled = true;  // auto-enable HD when HD-only is checked
+        }
         if (ImGui::IsItemHovered()) {
           ImGui::SetTooltip("Hide SD submaps, show only HD (LOD 0) data.\nUseful for range filter preview.");
         }
@@ -570,6 +854,8 @@ void InteractiveViewer::viewer_loop() {
 
   manual_loop_close_modal.reset(new ManualLoopCloseModal(logger, num_threads));
   bundle_adjustment_modal.reset(new BundleAdjustmentModal);
+  source_finder_gizmo.reset(new guik::ModelControl("source_finder_gizmo"));
+  source_finder_gizmo->set_gizmo_operation("TRANSLATE");
 
   // Start async LOD worker thread
   lod_worker_kill = false;
@@ -793,23 +1079,32 @@ void InteractiveViewer::on_click() {
     if (depth < 1.0f) {  // valid depth (not background)
       const Eigen::Vector3f point = viewer->unproject(mpos, depth);
 
-      // Just change the orbit center — don't create a new camera.
-      // The camera will shift to orbit around the new point.
+      // Record camera position before lookat
+      const Eigen::Matrix4f vm_before = viewer->view_matrix();
+      const Eigen::Vector3f cam_pos_before = -(vm_before.block<3, 3>(0, 0).transpose() * vm_before.block<3, 1>(0, 3));
+      const float dist_before = (cam_pos_before - point).norm();
+
       viewer->lookat(point);
 
-      // Visual indicator
-      const Eigen::Matrix4f vm = viewer->view_matrix();
-      const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
-      const float dist = (cam_pos - point).norm();
+      // Check if camera ended up too far from the target after lookat
+      const Eigen::Matrix4f vm_after = viewer->view_matrix();
+      const Eigen::Vector3f cam_pos_after = -(vm_after.block<3, 3>(0, 0).transpose() * vm_after.block<3, 1>(0, 3));
+      const float dist_after = (cam_pos_after - point).norm();
 
+      // If camera jumped too far, re-lookat to bring it back (cap at 100m or original distance)
+      if (dist_after > 100.0f && dist_after > dist_before * 2.0f) {
+        viewer->lookat(point);
+      }
+
+      // Visual indicator
       Eigen::Affine3f indicator_tf = Eigen::Affine3f::Identity();
       indicator_tf.translate(point);
-      indicator_tf.scale(std::max(0.1f, dist * 0.005f));
+      indicator_tf.scale(std::max(0.1f, std::min(dist_before, dist_after) * 0.005f));
       viewer->update_drawable("rotation_center", glk::Primitives::sphere(),
         guik::FlatColor(1.0f, 0.4f, 0.0f, 0.6f, indicator_tf).make_transparent());
 
       std::thread([] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
         guik::LightViewer::instance()->invoke([] {
           guik::LightViewer::instance()->remove_drawable("rotation_center");
         });
@@ -831,7 +1126,7 @@ void InteractiveViewer::on_click() {
 /**
  * @brief Context menu
  */
-gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int submap_index) const {
+gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int submap_index, bool compute_covs) const {
   if (submap_index < 0 || submap_index >= static_cast<int>(submaps.size()) || !submaps[submap_index]) {
     return nullptr;
   }
@@ -841,6 +1136,8 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
 
   // Load and merge all HD frames for this submap
   std::vector<Eigen::Vector4d> all_points;
+  std::vector<double> all_intensities;
+  std::vector<double> all_times;  // gps_time = frame_stamp + per-point time offset
   const Eigen::Isometry3d T_ep = submap->T_world_origin * submap->T_origin_endpoint_L;
   const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
 
@@ -858,11 +1155,17 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
 
     std::vector<Eigen::Vector3f> pts(npts);
     std::vector<float> range(npts);
+    std::vector<float> intensity(npts, 0.0f);
+    std::vector<float> frame_times(npts, 0.0f);
     { std::ifstream f(frame_dir + "/points.bin", std::ios::binary);
       if (!f) continue;
       f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * npts); }
     { std::ifstream f(frame_dir + "/range.bin", std::ios::binary);
       if (f) f.read(reinterpret_cast<char*>(range.data()), sizeof(float) * npts); }
+    { std::ifstream f(frame_dir + "/intensities.bin", std::ios::binary);
+      if (f) f.read(reinterpret_cast<char*>(intensity.data()), sizeof(float) * npts); }
+    { std::ifstream f(frame_dir + "/times.bin", std::ios::binary);
+      if (f) f.read(reinterpret_cast<char*>(frame_times.data()), sizeof(float) * npts); }
 
     // Transform to submap-local frame (NOT world frame — modal handles pose separately)
     const Eigen::Isometry3d T_w_imu = T_ep * T_odom0.inverse() * frame->T_world_imu;
@@ -871,10 +1174,13 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
     const Eigen::Matrix3d R = T_origin_lidar.rotation();
     const Eigen::Vector3d t = T_origin_lidar.translation();
 
+    const double frame_stamp = frame->stamp;
     for (int pi = 0; pi < npts; pi++) {
       if (range[pi] < 1.5f) continue;
       const Eigen::Vector3d lp = R * pts[pi].cast<double>() + t;
       all_points.push_back(Eigen::Vector4d(lp.x(), lp.y(), lp.z(), 1.0));
+      all_intensities.push_back(static_cast<double>(intensity[pi]));
+      all_times.push_back(frame_stamp + static_cast<double>(frame_times[pi]));
     }
   }
 
@@ -886,28 +1192,262 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
   cloud->points_storage = all_points;
   cloud->points = cloud->points_storage.data();
 
-  // Compute normals and covariances using k-NN
-  const int k = 10;
-  // Build KdTree and find neighbors
-  gtsam_points::KdTree tree(cloud->points, cloud->num_points);
-  std::vector<int> neighbors(cloud->num_points * k);
-  for (int i = 0; i < static_cast<int>(cloud->num_points); i++) {
-    std::vector<size_t> k_indices(k, i);
-    std::vector<double> k_sq_dists(k);
-    tree.knn_search(cloud->points[i].data(), k, k_indices.data(), k_sq_dists.data());
-    std::copy(k_indices.begin(), k_indices.begin() + k, neighbors.begin() + i * k);
+  // Add intensities
+  cloud->intensities_storage = std::move(all_intensities);
+  cloud->intensities = cloud->intensities_storage.data();
+
+  // Add times (gps_time = frame_stamp + per-point offset)
+  cloud->times_storage = std::move(all_times);
+  cloud->times = cloud->times_storage.data();
+
+  if (compute_covs) {
+    // Compute normals and covariances using k-NN
+    const int k = 10;
+    gtsam_points::KdTree tree(cloud->points, cloud->num_points);
+    std::vector<int> neighbors(cloud->num_points * k);
+    for (int i = 0; i < static_cast<int>(cloud->num_points); i++) {
+      std::vector<size_t> k_indices(k, i);
+      std::vector<double> k_sq_dists(k);
+      tree.knn_search(cloud->points[i].data(), k, k_indices.data(), k_sq_dists.data());
+      std::copy(k_indices.begin(), k_indices.begin() + k, neighbors.begin() + i * k);
+    }
+    CloudCovarianceEstimation cov_estimator(num_threads);
+    std::vector<Eigen::Vector4d> normals;
+    std::vector<Eigen::Matrix4d> covs;
+    cov_estimator.estimate(cloud->points_storage, neighbors, k, normals, covs);
+    cloud->add_normals(normals);
+    cloud->add_covs(covs);
+    logger->info("[HD] Loaded {} pts for submap {} (with covs)", cloud->num_points, submap_index);
+  } else {
+    logger->info("[HD] Loaded {} pts for submap {} (points only)", cloud->num_points, submap_index);
+  }
+  return cloud;
+}
+
+void InteractiveViewer::source_finder_update_cylinder() {
+  const float half_h = source_finder_height * 0.5f;
+  std::vector<Eigen::Vector3f> verts;
+
+  if (source_finder_shape == 0) {
+    // Cylinder
+    const int N = 32;
+    const float r = source_finder_radius;
+    for (int ci = 0; ci < 2; ci++) {
+      const float z = (ci == 0) ? -half_h : half_h;
+      for (int i = 0; i < N; i++) {
+        const float a0 = 2.0f * M_PI * i / N;
+        const float a1 = 2.0f * M_PI * (i + 1) / N;
+        verts.push_back(Eigen::Vector3f(r * std::cos(a0), r * std::sin(a0), z));
+        verts.push_back(Eigen::Vector3f(r * std::cos(a1), r * std::sin(a1), z));
+      }
+    }
+    for (int i = 0; i < 4; i++) {
+      const float a = 2.0f * M_PI * i / 4;
+      verts.push_back(Eigen::Vector3f(r * std::cos(a), r * std::sin(a), -half_h));
+      verts.push_back(Eigen::Vector3f(r * std::cos(a), r * std::sin(a), half_h));
+    }
+  } else {
+    // Oriented box with full rotation (Rz * Ry)
+    const float hl = source_finder_length * 0.5f;
+    const float hw = source_finder_width * 0.5f;
+    const float yr = source_finder_yaw * static_cast<float>(M_PI) / 180.0f;
+    const float pr = source_finder_pitch * static_cast<float>(M_PI) / 180.0f;
+    const Eigen::Matrix3f R = (Eigen::AngleAxisf(yr, Eigen::Vector3f::UnitZ()) * Eigen::AngleAxisf(pr, Eigen::Vector3f::UnitY())).toRotationMatrix();
+    // 8 corners of the box in local frame, transformed by R
+    const Eigen::Vector3f corners[8] = {
+      R * Eigen::Vector3f(-hl, -hw, -half_h), R * Eigen::Vector3f(hl, -hw, -half_h),
+      R * Eigen::Vector3f(hl, hw, -half_h),   R * Eigen::Vector3f(-hl, hw, -half_h),
+      R * Eigen::Vector3f(-hl, -hw, half_h),  R * Eigen::Vector3f(hl, -hw, half_h),
+      R * Eigen::Vector3f(hl, hw, half_h),    R * Eigen::Vector3f(-hl, hw, half_h),
+    };
+    // Bottom face
+    verts.push_back(corners[0]); verts.push_back(corners[1]);
+    verts.push_back(corners[1]); verts.push_back(corners[2]);
+    verts.push_back(corners[2]); verts.push_back(corners[3]);
+    verts.push_back(corners[3]); verts.push_back(corners[0]);
+    // Top face
+    verts.push_back(corners[4]); verts.push_back(corners[5]);
+    verts.push_back(corners[5]); verts.push_back(corners[6]);
+    verts.push_back(corners[6]); verts.push_back(corners[7]);
+    verts.push_back(corners[7]); verts.push_back(corners[4]);
+    // Vertical pillars
+    for (int i = 0; i < 4; i++) { verts.push_back(corners[i]); verts.push_back(corners[i + 4]); }
   }
 
-  // Estimate normals and covariances
-  CloudCovarianceEstimation cov_estimator(num_threads);
-  std::vector<Eigen::Vector4d> normals;
-  std::vector<Eigen::Matrix4d> covs;
-  cov_estimator.estimate(cloud->points_storage, neighbors, k, normals, covs);
-  cloud->add_normals(normals);
-  cloud->add_covs(covs);
+  auto lines = std::make_shared<glk::ThinLines>(verts, false);
+  Eigen::Affine3f tf = Eigen::Translation3f(source_finder_pos) * Eigen::Scaling(1.0f);
+  guik::LightViewer::instance()->update_drawable("source_finder_cylinder", lines,
+    guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f, tf));
+}
 
-  logger->info("[HD ICP] Loaded {} HD points for submap {}, computed normals+covs", cloud->num_points, submap_index);
-  return cloud;
+void InteractiveViewer::source_finder_color_hits() {
+  if (source_finder_hits.empty()) {
+    guik::LightViewer::instance()->remove_drawable("team_lines");
+    return;
+  }
+  // Group by sequence continuity
+  std::vector<int> sorted_ids(source_finder_hits.begin(), source_finder_hits.end());
+  std::sort(sorted_ids.begin(), sorted_ids.end());
+  std::vector<std::vector<int>> teams;
+  teams.push_back({sorted_ids[0]});
+  for (size_t i = 1; i < sorted_ids.size(); i++) {
+    if (sorted_ids[i] - sorted_ids[i - 1] > 2) teams.push_back({});
+    teams.back().push_back(sorted_ids[i]);
+  }
+  std::sort(teams.begin(), teams.end(), [](const auto& a, const auto& b) { return a.size() > b.size(); });
+
+  const int tgt_idx = source_finder_teams_swapped ? 1 : 0;
+  const int src_idx = source_finder_teams_swapped ? 0 : 1;
+  std::unordered_set<int> tgt_set, src_set;
+  if (teams.size() > static_cast<size_t>(tgt_idx)) for (int id : teams[tgt_idx]) tgt_set.insert(id);
+  if (teams.size() > static_cast<size_t>(src_idx)) for (int id : teams[src_idx]) src_set.insert(id);
+
+  auto viewer = guik::LightViewer::instance();
+  static const float sc[][3] = {
+    {1.0f, 0.0f, 0.0f}, {1.0f, 0.85f, 0.0f}, {0.0f, 0.8f, 0.2f},
+    {1.0f, 0.6f, 0.0f}, {0.8f, 0.0f, 0.8f}, {0.0f, 0.8f, 0.8f},
+  };
+  std::vector<Eigen::Vector3f> tgt_lines, src_lines;
+  for (int pi = 0; pi < static_cast<int>(submaps.size()); pi++) {
+    if (!submaps[pi]) continue;
+    const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submaps[pi]->id);
+    const Eigen::Affine3f sp = submap_poses[pi].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
+    if (tgt_set.count(pi)) {
+      viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+        guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f, sp).add("info_values", info));
+      tgt_lines.push_back(submap_poses[pi].translation().cast<float>());
+      tgt_lines.push_back(source_finder_pos);
+    } else if (src_set.count(pi)) {
+      viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+        guik::FlatColor(0.2f, 0.9f, 0.2f, 1.0f, sp).add("info_values", info));
+      src_lines.push_back(submap_poses[pi].translation().cast<float>());
+      src_lines.push_back(source_finder_pos);
+    } else if (source_finder_hits.count(pi)) {
+      // Extra teams — grey
+      viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+        guik::FlatColor(0.6f, 0.6f, 0.6f, 0.8f, sp).add("info_values", info));
+    } else {
+      const int ci = submaps[pi]->session_id % 6;
+      viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+        guik::FlatColor(sc[ci][0], sc[ci][1], sc[ci][2], 0.5f, sp).add("info_values", info).make_transparent());
+    }
+  }
+  // Draw lines: yellow for target, green for source
+  std::vector<Eigen::Vector3f> all_lines;
+  std::vector<Eigen::Vector4f> all_colors;
+  for (size_t i = 0; i < tgt_lines.size(); i++) {
+    all_lines.push_back(tgt_lines[i]);
+    all_colors.push_back(Eigen::Vector4f(1.0f, 1.0f, 0.0f, 0.6f));
+  }
+  for (size_t i = 0; i < src_lines.size(); i++) {
+    all_lines.push_back(src_lines[i]);
+    all_colors.push_back(Eigen::Vector4f(0.2f, 0.9f, 0.2f, 0.6f));
+  }
+  if (!all_lines.empty()) {
+    viewer->update_drawable("team_lines", std::make_shared<glk::ThinLines>(all_lines, all_colors, false),
+      guik::VertexColor());
+  } else {
+    viewer->remove_drawable("team_lines");
+  }
+}
+
+void InteractiveViewer::source_finder_scan_fast() {
+  source_finder_hits.clear();
+  const float z_lo = source_finder_pos.z() - source_finder_height * 0.5f;
+  const float z_hi = source_finder_pos.z() + source_finder_height * 0.5f;
+  const Eigen::Vector2f center_xy(source_finder_pos.x(), source_finder_pos.y());
+
+  // Shape-specific XY test for AABB (fast mode)
+  const float r = source_finder_radius;
+  const float yaw_rad = source_finder_yaw * static_cast<float>(M_PI) / 180.0f;
+  const float cy_r = std::cos(yaw_rad), sy_r = std::sin(yaw_rad);
+  const float hl = source_finder_length * 0.5f, hw = source_finder_width * 0.5f;
+
+  // Test if an AABB potentially overlaps our probe shape in XY
+  auto aabb_overlaps_xy = [&](const Eigen::AlignedBox3f& box) -> bool {
+    if (source_finder_shape == 0) {
+      // Cylinder: closest point on AABB to center
+      const float cx = std::max(box.min().x(), std::min(center_xy.x(), box.max().x()));
+      const float cy = std::max(box.min().y(), std::min(center_xy.y(), box.max().y()));
+      const float dx = cx - center_xy.x(), dy = cy - center_xy.y();
+      return dx * dx + dy * dy <= r * r;
+    } else {
+      // Box: test all 4 AABB corners in rotated frame, or AABB vs OBB overlap
+      // Simplified: test AABB center against enlarged probe box
+      const float bcx = (box.min().x() + box.max().x()) * 0.5f - center_xy.x();
+      const float bcy = (box.min().y() + box.max().y()) * 0.5f - center_xy.y();
+      const float lx = cy_r * bcx + sy_r * bcy;  // rotate to probe-local
+      const float ly = -sy_r * bcx + cy_r * bcy;
+      const float bhl = (box.max().x() - box.min().x()) * 0.5f + hl;
+      const float bhw = (box.max().y() - box.min().y()) * 0.5f + hw;
+      return std::abs(lx) <= bhl && std::abs(ly) <= bhw;
+    }
+  };
+
+  for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+    if (!submaps[si]) continue;
+
+    if (si < static_cast<int>(render_states.size()) && render_states[si].bbox_computed) {
+      const auto& box = render_states[si].world_bbox;
+      if (box.max().z() < z_lo || box.min().z() > z_hi) continue;
+      if (aabb_overlaps_xy(box)) {
+        source_finder_hits.insert(si);
+      }
+    } else if (submaps[si]->frame) {
+      const Eigen::Vector3d origin = submap_poses[si].translation();
+      const float dz = static_cast<float>(origin.z());
+      if (dz >= z_lo - 50.0f && dz <= z_hi + 50.0f) {
+        source_finder_hits.insert(si);
+      }
+    }
+  }
+
+  source_finder_color_hits();
+  logger->info("[Source finder/fast] {} submaps (bbox) in probe (r={:.1f} h={:.1f})", source_finder_hits.size(), source_finder_radius, source_finder_height);
+}
+
+void InteractiveViewer::source_finder_scan_precise() {
+  source_finder_hits.clear();
+  const float z_lo = source_finder_pos.z() - source_finder_height * 0.5f;
+  const float z_hi = source_finder_pos.z() + source_finder_height * 0.5f;
+  const Eigen::Vector2f center_xy(source_finder_pos.x(), source_finder_pos.y());
+
+  // Shape-specific XY point test
+  const float r2 = source_finder_radius * source_finder_radius;
+  const float yaw_rad = source_finder_yaw * static_cast<float>(M_PI) / 180.0f;
+  const float cy_r = std::cos(yaw_rad), sy_r = std::sin(yaw_rad);
+  const float hl = source_finder_length * 0.5f, hw = source_finder_width * 0.5f;
+
+  auto point_in_shape_xy = [&](float dx, float dy) -> bool {
+    if (source_finder_shape == 0) {
+      return dx * dx + dy * dy < r2;
+    } else {
+      const float lx = cy_r * dx + sy_r * dy;
+      const float ly = -sy_r * dx + cy_r * dy;
+      return std::abs(lx) <= hl && std::abs(ly) <= hw;
+    }
+  };
+
+  for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+    if (!submaps[si] || !submaps[si]->frame) continue;
+    const auto& frame = submaps[si]->frame;
+    const Eigen::Isometry3d& pose = submap_poses[si];
+
+    for (size_t pi = 0; pi < frame->size(); pi++) {
+      const Eigen::Vector3d wp = pose * frame->points[pi].head<3>();
+      const float wz = static_cast<float>(wp.z());
+      if (wz < z_lo || wz > z_hi) continue;
+      const float dx = static_cast<float>(wp.x()) - center_xy.x();
+      const float dy = static_cast<float>(wp.y()) - center_xy.y();
+      if (point_in_shape_xy(dx, dy)) {
+        source_finder_hits.insert(si);
+        break;
+      }
+    }
+  }
+
+  source_finder_color_hits();
+  logger->info("[Source finder/precise] {} submaps (per-point) in probe (r={:.1f} h={:.1f})", source_finder_hits.size(), source_finder_radius, source_finder_height);
 }
 
 void InteractiveViewer::context_menu() {
@@ -918,127 +1458,214 @@ void InteractiveViewer::context_menu() {
       const int frame_id = right_clicked_info[3];
       if (frame_id >= 0 && frame_id < static_cast<int>(submaps.size()) && submaps[frame_id]) {
         ImGui::TextUnformatted(("Submap ID : " + std::to_string(frame_id)).c_str());
-        if (ImGui::MenuItem("Loop begin", nullptr, manual_loop_close_modal->is_target_set())) {
-          manual_loop_close_modal->set_target(X(frame_id), submaps[frame_id]->frame, submap_poses[frame_id]);
-          lc_target_frame_id = frame_id;
-          // Update HD callback
-          manual_loop_close_modal->load_hd_callback = [this]() -> std::pair<gtsam_points::PointCloudCPU::Ptr, gtsam_points::PointCloudCPU::Ptr> {
-            auto hd_t = (lc_target_frame_id >= 0) ? load_hd_for_submap(lc_target_frame_id) : nullptr;
-            auto hd_s = (lc_source_frame_id >= 0) ? load_hd_for_submap(lc_source_frame_id) : nullptr;
-            return {hd_t, hd_s};
-          };
-          if (session_hd_paths.empty()) manual_loop_close_modal->load_hd_callback = nullptr;
-        }
-        if (ImGui::MenuItem("Loop end", nullptr, manual_loop_close_modal->is_source_set())) {
-          manual_loop_close_modal->set_source(X(frame_id), submaps[frame_id]->frame, submap_poses[frame_id]);
-          lc_source_frame_id = frame_id;
-          // Update HD callback
-          manual_loop_close_modal->load_hd_callback = [this]() -> std::pair<gtsam_points::PointCloudCPU::Ptr, gtsam_points::PointCloudCPU::Ptr> {
-            auto hd_t = (lc_target_frame_id >= 0) ? load_hd_for_submap(lc_target_frame_id) : nullptr;
-            auto hd_s = (lc_source_frame_id >= 0) ? load_hd_for_submap(lc_source_frame_id) : nullptr;
-            return {hd_t, hd_s};
-          };
-          if (session_hd_paths.empty()) manual_loop_close_modal->load_hd_callback = nullptr;
+        if (frame_id < static_cast<int>(submap_gps_sigma.size()) && submap_gps_sigma[frame_id] >= 0.0f) {
+          char sigma_text[64];
+          std::snprintf(sigma_text, sizeof(sigma_text), "GPS sigma: %.3f m", submap_gps_sigma[frame_id]);
+          ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "%s", sigma_text);
+        } else {
+          ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "GPS sigma: N/A");
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Preview data")) {
-          // Random color for this preview
-          static int preview_counter = 0;
-          const float hue = std::fmod(preview_counter * 0.618f, 1.0f);  // golden ratio spacing
-          const float r = std::abs(std::sin(hue * 6.28f)) * 0.7f + 0.3f;
-          const float g = std::abs(std::sin((hue + 0.33f) * 6.28f)) * 0.7f + 0.3f;
-          const float b = std::abs(std::sin((hue + 0.66f) * 6.28f)) * 0.7f + 0.3f;
 
+        // Helper lambda: show submap preview with given color (HD if available, SD fallback)
+        auto show_preview = [&](int fid, float r, float g, float b) {
           auto viewer = guik::LightViewer::instance();
-          const auto& submap = submaps[frame_id];
-
-          // Try to load HD frames, fall back to SD
+          const auto& sm = submaps[fid];
           std::shared_ptr<glk::PointCloudBuffer> cb;
           bool used_hd = false;
-          const auto hd_it = session_hd_paths.find(submap->session_id);
+          const auto hd_it = session_hd_paths.find(sm->session_id);
           if (hd_it != session_hd_paths.end()) {
-            // Load and merge HD frames for this submap
-            std::vector<Eigen::Vector4d> hd_points;
-            const Eigen::Isometry3d T_ep = submap->T_world_origin * submap->T_origin_endpoint_L;
-            const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
-            for (const auto& frame : submap->frames) {
-              char dir_name[16];
-              std::snprintf(dir_name, sizeof(dir_name), "%08ld", frame->id);
-              const std::string frame_dir = hd_it->second + "/" + dir_name;
-              const std::string meta_path = frame_dir + "/frame_meta.json";
-              if (!boost::filesystem::exists(meta_path)) continue;
-              std::ifstream meta_ifs(meta_path);
-              const auto meta = nlohmann::json::parse(meta_ifs, nullptr, false);
-              if (meta.is_discarded()) continue;
-              const int npts = meta.value("num_points", 0);
-              if (npts == 0) continue;
-              std::vector<Eigen::Vector3f> pts(npts);
-              std::vector<float> range(npts);
-              { std::ifstream f(frame_dir + "/points.bin", std::ios::binary);
-                if (!f) continue;
-                f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * npts); }
-              { std::ifstream f(frame_dir + "/range.bin", std::ios::binary);
-                if (f) f.read(reinterpret_cast<char*>(range.data()), sizeof(float) * npts); }
-              // Transform to world frame
-              const Eigen::Isometry3d T_w_imu = T_ep * T_odom0.inverse() * frame->T_world_imu;
-              const Eigen::Isometry3d T_w_lidar = T_w_imu * frame->T_lidar_imu.inverse();
-              const Eigen::Matrix3d R = T_w_lidar.rotation();
-              const Eigen::Vector3d t = T_w_lidar.translation();
-              for (int pi = 0; pi < npts; pi++) {
-                if (range[pi] < 1.5f) continue;
+            std::vector<Eigen::Vector4d> hd_pts;
+            const Eigen::Isometry3d T_ep = sm->T_world_origin * sm->T_origin_endpoint_L;
+            const Eigen::Isometry3d T_odom0 = sm->frames.front()->T_world_imu;
+            for (const auto& fr : sm->frames) {
+              char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+              const std::string fd = hd_it->second + "/" + dn;
+              if (!boost::filesystem::exists(fd + "/frame_meta.json")) continue;
+              std::ifstream mf(fd + "/frame_meta.json");
+              const auto mj = nlohmann::json::parse(mf, nullptr, false);
+              if (mj.is_discarded()) continue;
+              const int np = mj.value("num_points", 0);
+              if (np == 0) continue;
+              std::vector<Eigen::Vector3f> pts(np);
+              std::vector<float> rng(np);
+              { std::ifstream f(fd + "/points.bin", std::ios::binary); if (!f) continue; f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * np); }
+              { std::ifstream f(fd + "/range.bin", std::ios::binary); if (f) f.read(reinterpret_cast<char*>(rng.data()), sizeof(float) * np); }
+              const Eigen::Isometry3d Tw = T_ep * T_odom0.inverse() * fr->T_world_imu;
+              const Eigen::Isometry3d Tl = Tw * fr->T_lidar_imu.inverse();
+              const Eigen::Matrix3d R = Tl.rotation(); const Eigen::Vector3d t = Tl.translation();
+              for (int pi = 0; pi < np; pi++) {
+                if (rng[pi] < 1.5f) continue;
                 const Eigen::Vector3d wp = R * pts[pi].cast<double>() + t;
-                hd_points.push_back(Eigen::Vector4d(wp.x(), wp.y(), wp.z(), 1.0));
+                hd_pts.push_back(Eigen::Vector4d(wp.x(), wp.y(), wp.z(), 1.0));
               }
             }
-            if (!hd_points.empty()) {
-              cb = std::make_shared<glk::PointCloudBuffer>(hd_points.data(), hd_points.size());
+            if (!hd_pts.empty()) {
+              cb = std::make_shared<glk::PointCloudBuffer>(hd_pts.data(), hd_pts.size());
               used_hd = true;
-              logger->info("[Preview] Loaded {} HD points for submap {}", hd_points.size(), frame_id);
             }
           }
-          if (!cb) {
-            cb = std::make_shared<glk::PointCloudBuffer>(submap->frame->points, submap->frame->size());
-          }
-          const std::string preview_name = "lc_preview_" + std::to_string(frame_id);
+          if (!cb) cb = std::make_shared<glk::PointCloudBuffer>(sm->frame->points, sm->frame->size());
           if (used_hd) {
-            // HD points already in world frame — no model_matrix
-            viewer->update_drawable(preview_name, cb, guik::FlatColor(r, g, b, 0.8f));
+            viewer->update_drawable("lc_preview_" + std::to_string(fid), cb, guik::FlatColor(r, g, b, 0.8f));
           } else {
-            // SD points in submap-local frame — need pose transform
-            viewer->update_drawable(preview_name, cb,
-              guik::FlatColor(r, g, b, 0.8f, submap_poses[frame_id].cast<float>()));
+            viewer->update_drawable("lc_preview_" + std::to_string(fid), cb,
+              guik::FlatColor(r, g, b, 0.8f, submap_poses[fid].cast<float>()));
           }
+          // Color sphere
+          const Eigen::Affine3f sp = submap_poses[fid].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
+          const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, sm->id);
+          viewer->update_drawable("sphere_" + std::to_string(sm->id), glk::Primitives::sphere(),
+            guik::FlatColor(r, g, b, 0.9f, sp).add("info_values", info).make_transparent());
+        };
 
-          // Color the sphere to match the preview
-          const Eigen::Affine3f sphere_pose = submap_poses[frame_id].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
-          const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submap->id);
-          viewer->update_drawable(
-            "sphere_" + std::to_string(submap->id),
-            glk::Primitives::sphere(),
-            guik::FlatColor(r, g, b, 0.9f, sphere_pose).add("info_values", info).make_transparent());
-
-          preview_counter++;
-        }
-        if (ImGui::MenuItem("Clear previews")) {
+        // Helper: clear all previews and reset sphere colors
+        auto clear_all_previews = [&]() {
           auto viewer = guik::LightViewer::instance();
-          // Remove all preview drawables and reset sphere colors
-          static const float session_colors[][3] = {
-            {1.0f, 0.0f, 0.0f}, {1.0f, 0.85f, 0.0f}, {0.0f, 0.8f, 0.2f},
-            {1.0f, 0.6f, 0.0f}, {0.8f, 0.0f, 0.8f}, {0.0f, 0.8f, 0.8f},
-          };
+          static const float sc[][3] = {{1,0,0},{1,0.85f,0},{0,0.8f,0.2f},{1,0.6f,0},{0.8f,0,0.8f},{0,0.8f,0.8f}};
           for (int pi = 0; pi < static_cast<int>(submaps.size()); pi++) {
             viewer->remove_drawable("lc_preview_" + std::to_string(pi));
             if (submaps[pi]) {
               const int ci = submaps[pi]->session_id % 6;
-              const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submaps[pi]->id);
+              const Eigen::Vector4i inf(static_cast<int>(PickType::FRAME), 0, 0, submaps[pi]->id);
               const Eigen::Affine3f sp = submap_poses[pi].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
-              viewer->update_drawable(
-                "sphere_" + std::to_string(submaps[pi]->id),
-                glk::Primitives::sphere(),
-                guik::FlatColor(session_colors[ci][0], session_colors[ci][1], session_colors[ci][2], 0.5f, sp)
-                  .add("info_values", info).make_transparent());
+              viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+                guik::FlatColor(sc[ci][0], sc[ci][1], sc[ci][2], 0.5f, sp).add("info_values", inf).make_transparent());
             }
           }
+        };
+
+        // Loop end: accumulate sources (green preview), or trigger single-frame ICP if target already set
+        {
+          const bool already_in_group = std::find(lc_source_group.begin(), lc_source_group.end(), frame_id) != lc_source_group.end();
+          // If target already set and no sources accumulated yet, show simple "Loop end" (single-frame mode)
+          const bool single_mode = (lc_target_frame_id >= 0 && lc_source_group.empty());
+          char end_label[64];
+          if (single_mode) {
+            std::snprintf(end_label, sizeof(end_label), "Loop end");
+          } else {
+            std::snprintf(end_label, sizeof(end_label), "Loop end (%zu selected)", lc_source_group.size());
+          }
+          if (ImGui::MenuItem(end_label, nullptr, already_in_group)) {
+            if (already_in_group) {
+              // Remove from group
+              lc_source_group.erase(std::remove(lc_source_group.begin(), lc_source_group.end(), frame_id), lc_source_group.end());
+              // Remove preview for this one
+              guik::LightViewer::instance()->remove_drawable("lc_preview_" + std::to_string(frame_id));
+            } else if (single_mode) {
+              // Target already set — trigger single-frame ICP immediately
+              lc_source_frame_id = frame_id;
+              show_preview(frame_id, 0.2f, 0.9f, 0.2f);  // green
+              manual_loop_close_modal->set_source(X(frame_id), submaps[frame_id]->frame, submap_poses[frame_id]);
+              manual_loop_close_modal->source_gps_sigma = (frame_id < static_cast<int>(submap_gps_sigma.size())) ? submap_gps_sigma[frame_id] : -1.0f;
+              // HD callback for single source
+              manual_loop_close_modal->load_hd_callback = [this]() -> std::pair<gtsam_points::PointCloudCPU::Ptr, gtsam_points::PointCloudCPU::Ptr> {
+                auto hd_t = (lc_target_frame_id >= 0) ? load_hd_for_submap(lc_target_frame_id, false) : nullptr;
+                auto hd_s = (lc_source_frame_id >= 0) ? load_hd_for_submap(lc_source_frame_id, false) : nullptr;
+                return {hd_t, hd_s};
+              };
+              if (session_hd_paths.empty()) manual_loop_close_modal->load_hd_callback = nullptr;
+            } else {
+              // Accumulate mode: first addition clears existing previews
+              if (lc_source_group.empty()) {
+                clear_all_previews();
+              }
+              lc_source_group.push_back(frame_id);
+              show_preview(frame_id, 0.2f, 0.9f, 0.2f);  // green
+            }
+          }
+        }
+
+        // Loop begin: set target (red) + trigger modal if sources exist
+        if (ImGui::MenuItem("Loop begin", nullptr, lc_target_frame_id == frame_id)) {
+          // Clear old target preview if any
+          if (lc_target_frame_id >= 0) {
+            guik::LightViewer::instance()->remove_drawable("lc_preview_" + std::to_string(lc_target_frame_id));
+          }
+          lc_target_frame_id = frame_id;
+          show_preview(frame_id, 1.0f, 0.3f, 0.3f);  // red
+
+          // Set target on modal
+          manual_loop_close_modal->set_target(X(frame_id), submaps[frame_id]->frame, submap_poses[frame_id]);
+          manual_loop_close_modal->target_gps_sigma = (frame_id < static_cast<int>(submap_gps_sigma.size())) ? submap_gps_sigma[frame_id] : -1.0f;
+
+          // If source group has entries, merge and trigger modal
+          if (!lc_source_group.empty()) {
+            // Use central source for the factor key and reference pose
+            lc_source_frame_id = lc_source_group[lc_source_group.size() / 2];
+            const Eigen::Isometry3d ref_pose = submap_poses[lc_source_frame_id];
+
+            // Collect all points from source group into ref_pose's local frame
+            std::vector<Eigen::Vector4d> all_points;
+            for (int si : lc_source_group) {
+              const auto& sm = submaps[si];
+              if (!sm || !sm->frame) continue;
+              // Transform: submap-local → world → ref-local
+              const Eigen::Isometry3d T_ref_submap = ref_pose.inverse() * submap_poses[si];
+              for (size_t pi = 0; pi < sm->frame->size(); pi++) {
+                const Eigen::Vector4d wp = sm->frame->points[pi];
+                const Eigen::Vector3d p_ref = T_ref_submap * wp.head<3>();
+                all_points.push_back(Eigen::Vector4d(p_ref.x(), p_ref.y(), p_ref.z(), 1.0));
+              }
+            }
+
+            // Build clean PointCloudCPU
+            auto merged = std::make_shared<gtsam_points::PointCloudCPU>();
+            merged->num_points = all_points.size();
+            merged->points_storage = std::move(all_points);
+            merged->points = merged->points_storage.data();
+
+            logger->info("[Loop] Merged {} source submaps: {} total points", lc_source_group.size(), merged->num_points);
+            manual_loop_close_modal->set_source(X(lc_source_frame_id), merged, ref_pose);
+            manual_loop_close_modal->source_gps_sigma = (lc_source_frame_id < static_cast<int>(submap_gps_sigma.size())) ? submap_gps_sigma[lc_source_frame_id] : -1.0f;
+
+            // HD callback
+            manual_loop_close_modal->load_hd_callback = [this]() -> std::pair<gtsam_points::PointCloudCPU::Ptr, gtsam_points::PointCloudCPU::Ptr> {
+              auto hd_t = (lc_target_frame_id >= 0) ? load_hd_for_submap(lc_target_frame_id, false) : nullptr;
+              // Merge HD for all source group submaps into ref_pose's local frame
+              const Eigen::Isometry3d ref_pose = submap_poses[lc_source_frame_id];
+              std::vector<Eigen::Vector4d> all_hd_points;
+              std::vector<double> all_hd_ints;
+              for (int si : lc_source_group) {
+                auto hd = load_hd_for_submap(si, false);
+                if (!hd) continue;
+                const Eigen::Isometry3d T_ref_submap = ref_pose.inverse() * submap_poses[si];
+                const bool has_int = hd->intensities != nullptr;
+                for (size_t pi = 0; pi < hd->size(); pi++) {
+                  const Eigen::Vector3d p_ref = T_ref_submap * hd->points[pi].head<3>();
+                  all_hd_points.push_back(Eigen::Vector4d(p_ref.x(), p_ref.y(), p_ref.z(), 1.0));
+                  all_hd_ints.push_back(has_int ? hd->intensities[pi] : 0.0);
+                }
+              }
+              if (all_hd_points.empty()) return {hd_t, nullptr};
+              auto hd_merged = std::make_shared<gtsam_points::PointCloudCPU>();
+              hd_merged->num_points = all_hd_points.size();
+              hd_merged->points_storage = std::move(all_hd_points);
+              hd_merged->points = hd_merged->points_storage.data();
+              hd_merged->intensities_storage = std::move(all_hd_ints);
+              hd_merged->intensities = hd_merged->intensities_storage.data();
+              logger->info("[Loop HD] Merged {} source submaps: {} HD points (covs deferred)", lc_source_group.size(), hd_merged->num_points);
+              return {hd_t, hd_merged};
+            };
+            if (session_hd_paths.empty()) manual_loop_close_modal->load_hd_callback = nullptr;
+          }
+        }
+
+        ImGui::Separator();
+        if (ImGui::MenuItem("Preview data")) {
+          static int preview_counter = 0;
+          const float hue = std::fmod(preview_counter * 0.618f, 1.0f);
+          const float r = std::abs(std::sin(hue * 6.28f)) * 0.7f + 0.3f;
+          const float g = std::abs(std::sin((hue + 0.33f) * 6.28f)) * 0.7f + 0.3f;
+          const float b = std::abs(std::sin((hue + 0.66f) * 6.28f)) * 0.7f + 0.3f;
+          show_preview(frame_id, r, g, b);
+          preview_counter++;
+        }
+        if (ImGui::MenuItem("Clear selection")) {
+          clear_all_previews();
+          lc_source_group.clear();
+          lc_target_frame_id = -1;
+          lc_source_frame_id = -1;
         }
       }
     }
@@ -1047,7 +1674,102 @@ void InteractiveViewer::context_menu() {
       if (ImGui::MenuItem("Bundle adjustment (Plane)")) {
         bundle_adjustment_modal->set_frames(submaps, submap_poses, right_clicked_pos.cast<double>());
       }
+      if (ImGui::MenuItem("Identify source")) {
+        // Find which submap has the nearest point to the clicked position
+        const Eigen::Vector3d click_pos = right_clicked_pos.cast<double>();
+        int best_submap = -1;
+        double best_dist2 = std::numeric_limits<double>::max();
+        for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+          if (!submaps[si] || !submaps[si]->frame) continue;
+          const auto& frame = submaps[si]->frame;
+          const Eigen::Isometry3d& pose = submap_poses[si];
+          // Check a subsample for speed
+          const size_t step = std::max<size_t>(1, frame->size() / 500);
+          for (size_t pi = 0; pi < frame->size(); pi += step) {
+            const Eigen::Vector3d wp = pose * frame->points[pi].head<3>();
+            const double d2 = (wp - click_pos).squaredNorm();
+            if (d2 < best_dist2) {
+              best_dist2 = d2;
+              best_submap = si;
+            }
+          }
+        }
+        if (best_submap >= 0) {
+          // Highlight the source sphere in yellow
+          auto viewer = guik::LightViewer::instance();
+          const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submaps[best_submap]->id);
+          const Eigen::Affine3f sp = submap_poses[best_submap].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
+          viewer->update_drawable("sphere_" + std::to_string(submaps[best_submap]->id), glk::Primitives::sphere(),
+            guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f, sp).add("info_values", info));
+          // Draw a line from click point to sphere
+          std::vector<Eigen::Vector3f> line_verts = {right_clicked_pos, submap_poses[best_submap].translation().cast<float>()};
+          viewer->update_drawable("identify_line", std::make_shared<glk::ThinLines>(line_verts, false),
+            guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f));
+          logger->info("[Identify] Nearest source: submap {} (dist={:.3f}m)", best_submap, std::sqrt(best_dist2));
+        }
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Find which submap owns the nearest point\nto this location. Highlights the sphere in yellow\nwith a connecting line.");
     }
+
+    ImGui::Separator();
+    {
+      std::lock_guard<std::mutex> lock(last_factor_mutex);
+      const bool has_undo = !last_factor_indices.empty();
+      if (!has_undo) ImGui::BeginDisabled();
+      char undo_label[64];
+      std::snprintf(undo_label, sizeof(undo_label), "Undo last factor (%zu)", last_factor_indices.size());
+      if (ImGui::MenuItem(undo_label)) {
+        request_undo_last = true;
+        GlobalMappingCallbacks::request_to_optimize();
+        logger->info("[Undo] Requested undo of {} factors", last_factor_indices.size());
+      }
+      if (!has_undo) {
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("No factors to undo.");
+        ImGui::EndDisabled();
+      } else {
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove the last set of loop closure factors\nand re-optimize the graph.");
+      }
+    }
+
+    ImGui::Separator();
+    if (ImGui::MenuItem("Source finder", nullptr, source_finder_active)) {
+      if (!source_finder_active) {
+        source_finder_active = true;
+        source_finder_pos = right_clicked_pos;
+        source_finder_pos.z() += source_finder_height * 0.5f;  // click point = base, offset up
+        // Initialize gizmo matrix (Rz * Ry)
+        const float yr = source_finder_yaw * static_cast<float>(M_PI) / 180.0f;
+        const float pr = source_finder_pitch * static_cast<float>(M_PI) / 180.0f;
+        Eigen::Matrix3f rot = (Eigen::AngleAxisf(yr, Eigen::Vector3f::UnitZ()) * Eigen::AngleAxisf(pr, Eigen::Vector3f::UnitY())).toRotationMatrix();
+        Eigen::Matrix4f gizmo_m = Eigen::Matrix4f::Identity();
+        gizmo_m.block<3, 3>(0, 0) = rot;
+        gizmo_m.block<3, 1>(0, 3) = source_finder_pos;
+        source_finder_gizmo->set_model_matrix(gizmo_m);
+        source_finder_update_cylinder();
+        source_finder_scan_fast();
+      } else {
+        source_finder_active = false;
+        source_finder_hits.clear();
+        auto viewer = guik::LightViewer::instance();
+        viewer->remove_drawable("source_finder_cylinder");
+      viewer->remove_drawable("team_lines");
+      viewer->remove_drawable("identify_line");
+        // Restore sphere colors
+        static const float sc[][3] = {
+          {1.0f, 0.0f, 0.0f}, {1.0f, 0.85f, 0.0f}, {0.0f, 0.8f, 0.2f},
+          {1.0f, 0.6f, 0.0f}, {0.8f, 0.0f, 0.8f}, {0.0f, 0.8f, 0.8f},
+        };
+        for (int pi = 0; pi < static_cast<int>(submaps.size()); pi++) {
+          if (!submaps[pi]) continue;
+          const int ci = submaps[pi]->session_id % 6;
+          const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submaps[pi]->id);
+          const Eigen::Affine3f sp = submap_poses[pi].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
+          viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+            guik::FlatColor(sc[ci][0], sc[ci][1], sc[ci][2], 0.5f, sp).add("info_values", info).make_transparent());
+        }
+      }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Place a cylinder probe to find which submaps\nhave points in this area. Useful for identifying\nsources of misaligned features.");
 
     ImGui::EndPopup();
   }
@@ -1059,11 +1781,94 @@ void InteractiveViewer::context_menu() {
 void InteractiveViewer::run_modals() {
   std::vector<gtsam::NonlinearFactor::shared_ptr> factors;
 
+  // Capture relaxation params before run() clears the modal
+  const bool do_relax = manual_loop_close_modal->relax_neighbors;
+  const int relax_rad = manual_loop_close_modal->relax_radius;
+  const float relax_sc = manual_loop_close_modal->relax_scale;
+  const bool relax_btw = manual_loop_close_modal->relax_between;
+  const bool relax_gps = manual_loop_close_modal->relax_gps;
+  const int relax_tgt = lc_target_frame_id;
+  const int relax_src = lc_source_frame_id;
+
   auto manual_loop_close_factor = manual_loop_close_modal->run();
   if (manual_loop_close_factor) {
     needs_session_merge = false;
+    // Clear data previews — they no longer reflect the state after factor creation
+    auto viewer = guik::LightViewer::instance();
+    for (int pi = 0; pi < static_cast<int>(submaps.size()); pi++) {
+      viewer->remove_drawable("lc_preview_" + std::to_string(pi));
+    }
+    // Reset sphere colors
+    static const float sc[][3] = {
+      {1.0f, 0.0f, 0.0f}, {1.0f, 0.85f, 0.0f}, {0.0f, 0.8f, 0.2f},
+      {1.0f, 0.6f, 0.0f}, {0.8f, 0.0f, 0.8f}, {0.0f, 0.8f, 0.8f},
+    };
+    for (int pi = 0; pi < static_cast<int>(submaps.size()); pi++) {
+      if (!submaps[pi]) continue;
+      const int ci = submaps[pi]->session_id % 6;
+      const Eigen::Vector4i info(static_cast<int>(PickType::FRAME), 0, 0, submaps[pi]->id);
+      const Eigen::Affine3f sp = submap_poses[pi].cast<float>() * Eigen::UniformScaling<float>(sphere_scale);
+      viewer->update_drawable("sphere_" + std::to_string(submaps[pi]->id), glk::Primitives::sphere(),
+        guik::FlatColor(sc[ci][0], sc[ci][1], sc[ci][2], 0.5f, sp).add("info_values", info).make_transparent());
+    }
+
+    // Queue relaxation if enabled
+    if (do_relax && relax_tgt >= 0 && relax_src >= 0) {
+      RelaxationRequest req;
+      req.center_key = relax_tgt;
+      req.radius = relax_rad;
+      req.scale = relax_sc;
+      req.relax_between = relax_btw;
+      req.relax_gps = relax_gps;
+      pending_relaxations.insert(std::vector<RelaxationRequest>{req});
+      // Also queue a second relaxation centered on source
+      if (relax_src != relax_tgt) {
+        RelaxationRequest req2;
+        req2.center_key = relax_src;
+        req2.radius = relax_rad;
+        req2.scale = relax_sc;
+        req2.relax_between = relax_btw;
+        req2.relax_gps = relax_gps;
+        pending_relaxations.insert(std::vector<RelaxationRequest>{req2});
+      }
+      logger->info("[Relax] Queued relaxation: radius={} scale={}x between={} gps={}", relax_rad, relax_sc, relax_btw, relax_gps);
+    }
   }
   factors.push_back(manual_loop_close_factor);
+
+  // For team alignment: create factors for ALL submaps in both teams
+  // The ICP transform is rigid for the whole team — each submap's correction is direct.
+  if (manual_loop_close_factor && !lc_target_group.empty() && !lc_source_group.empty()) {
+    auto* bf = dynamic_cast<gtsam::BetweenFactor<gtsam::Pose3>*>(manual_loop_close_factor.get());
+    if (bf) {
+      const Eigen::Isometry3d T_tgt_src(bf->measured().matrix());
+      const Eigen::Isometry3d T_tgt_ref = submap_poses[lc_target_frame_id];
+      const Eigen::Isometry3d T_src_ref = submap_poses[lc_source_frame_id];
+      auto noise = bf->noiseModel();
+
+      int extra_factors = 0;
+      // Connect each source submap to the target reference
+      for (int si : lc_source_group) {
+        if (si == lc_source_frame_id) continue;  // already has the main factor
+        const Eigen::Isometry3d T_tgt_ref_si = T_tgt_src * T_src_ref.inverse() * submap_poses[si];
+        factors.push_back(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+          X(lc_target_frame_id), X(si), gtsam::Pose3(T_tgt_ref_si.matrix()), noise));
+        extra_factors++;
+      }
+      // Connect each target submap to the source reference
+      for (int ti : lc_target_group) {
+        if (ti == lc_target_frame_id) continue;
+        const Eigen::Isometry3d T_ti_src_ref = submap_poses[ti].inverse() * T_tgt_ref * T_tgt_src;
+        factors.push_back(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+          X(ti), X(lc_source_frame_id), gtsam::Pose3(T_ti_src_ref.matrix()), noise));
+        extra_factors++;
+      }
+      logger->info("[Team align] Created {} extra factors for {} source + {} target submaps",
+                   extra_factors, lc_source_group.size() - 1, lc_target_group.size() - 1);
+    }
+    lc_target_group.clear();
+  }
+
   factors.push_back(bundle_adjustment_modal->run());
 
   factors.erase(std::remove(factors.begin(), factors.end(), nullptr), factors.end());
@@ -1072,6 +1877,29 @@ void InteractiveViewer::run_modals() {
     logger->info("optimizing...");
     new_factors.insert(factors);
     GlobalMappingCallbacks::request_to_optimize();
+
+    // Force full LOD refresh (same as "Unload all") so data re-renders at updated poses
+    if (lod_enabled) {
+      lod_load_full_sd = false;
+      lod_load_full_hd = false;
+      loaded_hd_points = 0;
+      total_gpu_bytes = 0;
+      auto vw = guik::LightViewer::instance();
+      for (int i = 0; i < static_cast<int>(render_states.size()); i++) {
+        auto& rs = render_states[i];
+        if (i < static_cast<int>(submaps.size()) && submaps[i]) {
+          const int sid = submaps[i]->id;
+          vw->remove_drawable("submap_" + std::to_string(sid));
+          vw->remove_drawable("bbox_" + std::to_string(sid));
+          vw->remove_drawable("coord_" + std::to_string(sid));
+          vw->remove_drawable("sphere_" + std::to_string(sid));
+        }
+        rs.gpu_bytes = 0;
+        rs.hd_points = 0;
+        rs.current_lod = SubmapLOD::UNLOADED;
+      }
+      logger->info("[LOD] Full unload for post-optimization refresh");
+    }
   }
 }
 
@@ -1947,6 +2775,28 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
 
     submap_poses.push_back(*pose);
     submaps.push_back(submap);
+
+    // Apply pending GPS sigma for this submap
+    const int si = static_cast<int>(submaps.size()) - 1;
+    float sigma = -1.0f;
+    const auto sig_it = pending_sigma_map.find(si);
+    if (sig_it != pending_sigma_map.end()) {
+      sigma = sig_it->second;
+      // Add as per-point aux_attribute for colormap rendering
+      if (submap->frame && submap->frame->size() > 0) {
+        const int n = submap->frame->size();
+        auto* sigma_data = new float[n];
+        std::fill(sigma_data, sigma_data + n, sigma);
+        const_cast<gtsam_points::PointCloud*>(submap->frame.get())->aux_attributes["gps_sigma"] =
+          std::make_pair(sizeof(float), static_cast<void*>(sigma_data));
+        // Register gps_sigma in aux names if first time
+        if (std::find(aux_attribute_names.begin(), aux_attribute_names.end(), "gps_sigma") == aux_attribute_names.end()) {
+          aux_attribute_names.push_back("gps_sigma");
+        }
+      }
+    }
+    submap_gps_sigma.push_back(sigma);
+
     update_viewer();
   });
 }
@@ -1970,6 +2820,17 @@ void InteractiveViewer::globalmap_on_update_submaps(const std::vector<SubMap::Pt
  * @brief Smoother update callback
  */
 void InteractiveViewer::globalmap_on_smoother_update(gtsam_points::ISAM2Ext& isam2, gtsam::NonlinearFactorGraph& new_factors, gtsam::Values& new_values) {
+  // Handle undo request
+  if (request_undo_last.exchange(false)) {
+    std::lock_guard<std::mutex> lock(last_factor_mutex);
+    if (!last_factor_indices.empty()) {
+      gtsam::FactorIndices remove_indices(last_factor_indices.begin(), last_factor_indices.end());
+      isam2.update(gtsam::NonlinearFactorGraph(), gtsam::Values(), remove_indices);
+      logger->info("[Undo] Removed {} factors from ISAM2", last_factor_indices.size());
+      last_factor_indices.clear();
+    }
+  }
+
   auto factors = this->new_factors.get_all_and_clear();
 
   // Explicitly move the poses of merged submaps to the coordinate system of the origin of the first session
@@ -2016,6 +2877,79 @@ void InteractiveViewer::globalmap_on_smoother_update(gtsam_points::ISAM2Ext& isa
 
   new_factors.add(factors);
 
+  // Record how many viewer factors we added (for undo tracking in smoother_update_result)
+  if (!factors.empty()) {
+    std::lock_guard<std::mutex> lock(last_factor_mutex);
+    last_factor_indices.clear();
+    // Store count as a sentinel — actual indices computed after ISAM2 update
+    last_factor_indices.resize(factors.size(), SIZE_MAX);
+    logger->info("[Undo] {} factors pending index assignment", factors.size());
+  }
+
+  // --- Factor relaxation ---
+  auto relax_requests = pending_relaxations.get_all_and_clear();
+  if (!relax_requests.empty()) {
+    // Build set of submap indices to relax
+    std::unordered_set<int> relax_keys;
+    bool do_between = false, do_gps = false;
+    float scale = 1.0f;
+    for (const auto& req : relax_requests) {
+      const int lo = std::max(0, req.center_key - req.radius);
+      const int hi = std::min(static_cast<int>(submaps.size()) - 1, req.center_key + req.radius);
+      for (int i = lo; i <= hi; i++) relax_keys.insert(i);
+      do_between |= req.relax_between;
+      do_gps |= req.relax_gps;
+      scale = std::max(scale, req.scale);
+    }
+
+    const auto& graph = isam2.getFactorsUnsafe();
+    gtsam::FactorIndices remove_indices;
+    gtsam::NonlinearFactorGraph relaxed_factors;
+
+    for (size_t fi = 0; fi < graph.size(); fi++) {
+      const auto& f = graph[fi];
+      if (!f) continue;
+
+      // Check if any key of this factor is in the relax set
+      bool involves_relaxed = false;
+      for (const auto& key : f->keys()) {
+        gtsam::Symbol sym(key);
+        if (sym.chr() == 'x' && relax_keys.count(static_cast<int>(sym.index()))) {
+          involves_relaxed = true;
+          break;
+        }
+      }
+      if (!involves_relaxed) continue;
+
+      try {
+        auto* bf = dynamic_cast<gtsam::BetweenFactor<gtsam::Pose3>*>(f.get());
+        auto* ptp = dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(f.get());
+
+        if (bf && do_between) {
+          auto gaussian = std::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(bf->noiseModel());
+          if (!gaussian) continue;
+          remove_indices.push_back(fi);
+          auto scaled_noise = gtsam::noiseModel::Diagonal::Sigmas(gaussian->sigmas() * static_cast<double>(scale));
+          relaxed_factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(bf->key1(), bf->key2(), bf->measured(), scaled_noise);
+        } else if (ptp && do_gps) {
+          auto gaussian = std::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(ptp->noiseModel());
+          if (!gaussian) continue;
+          remove_indices.push_back(fi);
+          auto scaled_noise = gtsam::noiseModel::Diagonal::Sigmas(gaussian->sigmas() * static_cast<double>(scale));
+          relaxed_factors.emplace_shared<gtsam::PoseTranslationPrior<gtsam::Pose3>>(ptp->keys()[0], ptp->measured(), scaled_noise);
+        }
+      } catch (...) {
+        logger->warn("[Relax] Skipped factor {} — unsupported noise model", fi);
+      }
+    }
+
+    if (!remove_indices.empty()) {
+      // Atomic: remove originals + add relaxed replacements in one ISAM2 update
+      isam2.update(relaxed_factors, gtsam::Values(), remove_indices);
+      logger->info("[Relax] Replaced {} factors with relaxed versions (scale {}x, {} submaps affected)", relaxed_factors.size(), scale, relax_keys.size());
+    }
+  }
+
   std::vector<std::tuple<FactorType, gtsam::Key, gtsam::Key>> inserted_factors;
 
   for (const auto& factor : new_factors) {
@@ -2035,7 +2969,35 @@ void InteractiveViewer::globalmap_on_smoother_update(gtsam_points::ISAM2Ext& isa
     }
   }
 
-  invoke([this, inserted_factors] { global_factors.insert(global_factors.end(), inserted_factors.begin(), inserted_factors.end()); });
+  // Extract per-submap GPS sigma from PoseTranslationPrior factors
+  std::unordered_map<int, float> sigma_map;  // submap_index → avg sigma
+  auto extract_sigma = [&](const gtsam::NonlinearFactorGraph& graph) {
+    for (const auto& factor : graph) {
+      auto* ptp = dynamic_cast<gtsam::PoseTranslationPrior<gtsam::Pose3>*>(factor.get());
+      if (!ptp) continue;
+      gtsam::Symbol sym(ptp->keys()[0]);
+      if (sym.chr() != 'x') continue;
+      const int idx = static_cast<int>(sym.index());
+      try {
+        const auto sigmas = ptp->noiseModel()->sigmas();
+        const float avg_sigma = static_cast<float>(sigmas.mean());
+        sigma_map[idx] = avg_sigma;
+      } catch (...) {}
+    }
+  };
+  extract_sigma(isam2.getFactorsUnsafe());
+  extract_sigma(new_factors);
+  logger->info("[GPS sigma] Extracted sigma for {} / {} submaps", sigma_map.size(), submaps.size());
+
+  invoke([this, inserted_factors, sigma_map] {
+    global_factors.insert(global_factors.end(), inserted_factors.begin(), inserted_factors.end());
+
+    // Store sigma values — will be applied when submaps are inserted
+    for (const auto& [idx, sigma] : sigma_map) {
+      pending_sigma_map[idx] = sigma;
+    }
+    logger->info("[GPS sigma] {} sigma values pending for submap assignment", pending_sigma_map.size());
+  });
 }
 
 /**
@@ -2044,6 +3006,22 @@ void InteractiveViewer::globalmap_on_smoother_update(gtsam_points::ISAM2Ext& isa
 void InteractiveViewer::globalmap_on_smoother_update_result(gtsam_points::ISAM2Ext& isam2, const gtsam_points::ISAM2ResultExt& result) {
   const std::string text = result.to_string();
   logger->info("--- smoother_updated ---\n{}", text);
+
+  // Assign actual ISAM2 indices to pending undo factors
+  // Our loop closure factors are BetweenFactors added at the end of the graph
+  std::lock_guard<std::mutex> lock(last_factor_mutex);
+  if (!last_factor_indices.empty() && last_factor_indices[0] == SIZE_MAX) {
+    const size_t count = last_factor_indices.size();
+    last_factor_indices.clear();
+    const auto& graph = isam2.getFactorsUnsafe();
+    // Scan backwards for the last `count` BetweenFactor<Pose3> entries
+    for (int fi = static_cast<int>(graph.size()) - 1; fi >= 0 && last_factor_indices.size() < count; fi--) {
+      if (graph[fi] && dynamic_cast<gtsam::BetweenFactor<gtsam::Pose3>*>(graph[fi].get())) {
+        last_factor_indices.push_back(fi);
+      }
+    }
+    logger->info("[Undo] Assigned {} BetweenFactor indices for undo (graph size={})", last_factor_indices.size(), graph.size());
+  }
 }
 
 bool InteractiveViewer::ok() const {

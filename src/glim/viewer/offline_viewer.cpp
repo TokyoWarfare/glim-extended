@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_set>
+#include <boost/format.hpp>
 #include <boost/filesystem.hpp>
 #include <nlohmann/json.hpp>
 #include <gtsam_points/config.hpp>
@@ -12,6 +13,9 @@
 #include <gtsam_points/cuda/nonlinear_factor_set_gpu_create.hpp>
 #include <glim/util/config.hpp>
 #include <glim/util/geodetic.hpp>
+#include <gtsam_points/types/point_cloud_cpu.hpp>
+#include <gtsam_points/ann/kdtree.hpp>
+#include <glim/common/cloud_covariance_estimation.hpp>
 
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/geometry/Pose3.h>
@@ -765,10 +769,13 @@ void OfflineViewer::setup_ui() {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Points within this range are ALWAYS kept.");
 
       ImGui::SliderFloat("Range delta (m)", &rf_range_delta, 1.0f, 50.0f, "%.0f");
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove points >delta further than closest in voxel\n(beyond safe range only).");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove points >delta further than closest safe-range\npoint in the voxel.");
+
+      ImGui::SliderFloat("Far delta (m)", &rf_far_delta, 5.0f, 100.0f, "%.0f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Secondary delta for voxels with NO safe-range points.\nRemoves points > (min_range + far_delta) in the voxel.\nCleans up distant noise where no close data exists.");
 
       ImGui::SliderInt("Min close points", &rf_min_close_pts, 1, 20);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum close-range points in a voxel before\ndistant points are removed. Prevents 1 near\npoint from wiping out many distant ones.");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum close-range points in a voxel before\nthe primary delta applies. Below this threshold,\nthe far delta is used instead.");
 
       // Range highlight: re-color cached preview data by range threshold
       // Uses intensity as base color, red tint beyond threshold
@@ -949,8 +956,17 @@ void OfflineViewer::setup_ui() {
               }
 
               if (close_count < rf_min_close_pts) {
-                // Not enough close points — keep all
-                for (const auto& e : entries) { kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++; }
+                // No safe-range anchor — apply secondary (far) delta from min range in voxel
+                float min_range = std::numeric_limits<float>::max();
+                for (const auto& e : entries) min_range = std::min(min_range, e.range);
+                const float far_threshold = min_range + rf_far_delta;
+                for (const auto& e : entries) {
+                  if (e.range <= far_threshold) {
+                    kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++;
+                  } else {
+                    removed_points.push_back(e.world_pos); removed_intensities.push_back(e.intensity); removed_ranges.push_back(e.range); preview_removed++;
+                  }
+                }
                 continue;
               }
 
@@ -1323,7 +1339,19 @@ void OfflineViewer::setup_ui() {
                     close_count++;
                   }
                 }
-                if (close_count < rf_min_close_pts) continue;
+                if (close_count < rf_min_close_pts) {
+                  // No safe-range anchor — apply secondary (far) delta
+                  float min_range = std::numeric_limits<float>::max();
+                  for (const auto& e : entries) min_range = std::min(min_range, e.range);
+                  const float far_threshold = min_range + rf_far_delta;
+                  for (const auto& e : entries) {
+                    if (e.range > far_threshold) {
+                      const auto& cf = chunk_frames[e.cf_idx];
+                      frame_removals[cf.dir].insert(cf.original_indices[e.pt_idx]);
+                    }
+                  }
+                  continue;
+                }
                 const float threshold = max_close_range + rf_range_delta;
                 for (const auto& e : entries) {
                   if (e.range <= rf_safe_range) continue;
@@ -1814,6 +1842,9 @@ void OfflineViewer::main_menu() {
         }
         ImGui::EndMenu();
       }
+      if (ImGui::MenuItem("Display Settings", nullptr, show_display_settings)) {
+        show_display_settings = !show_display_settings;
+      }
       if (ImGui::MenuItem("Memory Manager", nullptr, show_memory_manager)) {
         show_memory_manager = !show_memory_manager;
       }
@@ -1900,6 +1931,98 @@ void OfflineViewer::main_menu() {
           }
         }
 
+        ImGui::Separator();
+
+        // Regenerate SD from HD
+        if (!has_hd) ImGui::BeginDisabled();
+        if (ImGui::BeginMenu("Regenerate SD from HD")) {
+          static float regen_voxel_size = 0.20f;
+          ImGui::DragFloat("Voxel size (m)", &regen_voxel_size, 0.01f, 0.05f, 1.0f, "%.2f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Voxel grid resolution for downsampling.\nSmaller = denser SD, more memory.\n0.20m is a good default.");
+          if (ImGui::Button("Regenerate")) {
+            ImGui::CloseCurrentPopup();
+            if (pfd::message("Confirm SD Regeneration",
+                "This will overwrite all submap SD point data\n"
+                "by downsampling the current HD frames and\n"
+                "recomputing covariances.\n\n"
+                "Backup your map first!\n\nProceed?",
+                pfd::choice::ok_cancel, pfd::icon::warning).result() == pfd::button::ok) {
+              const double voxel_res = regen_voxel_size;
+              progress_modal->open<bool>("regen_sd", [this, voxel_res](guik::ProgressInterface& progress) -> bool {
+                progress.set_title("Regenerating SD from HD");
+                progress.set_maximum(submaps.size());
+                int regenerated = 0;
+                for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+                  progress.set_text("Submap " + std::to_string(si) + "/" + std::to_string(submaps.size()));
+                  progress.increment();
+                  if (!submaps[si]) continue;
+                  auto hd_cloud = load_hd_for_submap(si, false);  // points+intensity only, skip covs
+                  if (!hd_cloud || hd_cloud->size() == 0) continue;
+                  auto sd_cloud = gtsam_points::voxelgrid_sampling(hd_cloud, voxel_res, num_threads);
+                  if (!sd_cloud || sd_cloud->size() == 0) continue;
+                  // Compute normals + covariances on the downsampled cloud
+                  {
+                    const int k = 10;
+                    gtsam_points::KdTree tree(sd_cloud->points, sd_cloud->num_points);
+                    std::vector<int> neighbors(sd_cloud->num_points * k);
+                    for (size_t j = 0; j < sd_cloud->num_points; j++) {
+                      std::vector<size_t> k_indices(k, j);
+                      std::vector<double> k_sq_dists(k);
+                      tree.knn_search(sd_cloud->points[j].data(), k, k_indices.data(), k_sq_dists.data());
+                      std::copy(k_indices.begin(), k_indices.begin() + k, neighbors.begin() + j * k);
+                    }
+                    glim::CloudCovarianceEstimation cov_est(num_threads);
+                    std::vector<Eigen::Vector4d> normals;
+                    std::vector<Eigen::Matrix4d> covs;
+                    cov_est.estimate(sd_cloud->points_storage, neighbors, k, normals, covs);
+                    sd_cloud->add_normals(normals);
+                    sd_cloud->add_covs(covs);
+                  }
+                  // Add aux_attributes that the viewer needs for scalar field rendering
+                  {
+                    // intensity: copy from standard member to aux
+                    if (sd_cloud->intensities) {
+                      std::vector<float> aux_intensity(sd_cloud->num_points);
+                      for (size_t j = 0; j < sd_cloud->num_points; j++) {
+                        aux_intensity[j] = static_cast<float>(sd_cloud->intensities[j]);
+                      }
+                      sd_cloud->add_aux_attribute("intensity", aux_intensity);
+                    }
+                    // range: compute from point distance to origin (submap-local frame)
+                    std::vector<float> aux_range(sd_cloud->num_points);
+                    for (size_t j = 0; j < sd_cloud->num_points; j++) {
+                      aux_range[j] = static_cast<float>(sd_cloud->points[j].head<3>().norm());
+                    }
+                    sd_cloud->add_aux_attribute("range", aux_range);
+                    // gps_time: copy from standard times member to aux (double)
+                    if (sd_cloud->times) {
+                      std::vector<double> aux_gps_time(sd_cloud->num_points);
+                      for (size_t j = 0; j < sd_cloud->num_points; j++) {
+                        aux_gps_time[j] = sd_cloud->times[j];
+                      }
+                      sd_cloud->add_aux_attribute("gps_time", aux_gps_time);
+                    }
+                  }
+                  const std::string submap_path = (boost::format("%s/%06d") % loaded_map_path % si).str();
+                  sd_cloud->save_compact(submap_path);
+                  std::const_pointer_cast<SubMap>(submaps[si])->frame = sd_cloud;
+                  regenerated++;
+                  logger->info("[Regen SD] Submap {}: {} HD pts -> {} SD pts", si, hd_cloud->size(), sd_cloud->size());
+                }
+                logger->info("[Regen SD] Done: regenerated {}/{} submaps (voxel={:.2f}m)", regenerated, submaps.size(), voxel_res);
+                return true;
+              });
+            }
+          }
+          ImGui::EndMenu();
+        }
+        if (!has_hd) {
+          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("No HD frames available.\nHD frames are needed to regenerate SD data.");
+          }
+          ImGui::EndDisabled();
+        }
+
         ImGui::EndMenu();
       }
       ImGui::EndMenu();
@@ -1924,6 +2047,7 @@ void OfflineViewer::main_menu() {
     if (!map_path.empty()) {
       logger->debug("open map from {}", map_path);
       recent_files.push(map_path);
+      loaded_map_path = map_path;
 
       if (boost::filesystem::exists(map_path + "/config")) {
         logger->info("Use config from {}", map_path + "/config");
@@ -2116,6 +2240,13 @@ void OfflineViewer::main_menu() {
     }
   }
   auto export_result = progress_modal->run<bool>("export");
+
+  // --- Regenerate SD ---
+  auto regen_result = progress_modal->run<bool>("regen_sd");
+  if (regen_result) {
+    logger->info("[Regen SD] Regeneration complete, updating viewer");
+    update_viewer();
+  }
 
   // --- Close map ---
   if (start_close_map) {
@@ -2964,10 +3095,19 @@ std::pair<size_t, size_t> OfflineViewer::apply_range_filter_to_frame(const std::
       if (range[idx] <= rf_safe_range) close_count++;
     }
 
-    // Only filter if enough close points exist
-    if (close_count < rf_min_close_pts) continue;
+    if (close_count < rf_min_close_pts) {
+      // No safe-range anchor — apply secondary (far) delta from min range
+      const float far_threshold = min_range + rf_far_delta;
+      for (int idx : indices) {
+        if (range[idx] > far_threshold) {
+          keep[idx] = false;
+          removed++;
+        }
+      }
+      continue;
+    }
 
-    // Remove distant points
+    // Remove distant points beyond safe anchor + delta
     for (int idx : indices) {
       if (range[idx] <= rf_safe_range) continue;  // always keep safe-range points
       if (range[idx] - min_range > rf_range_delta) {
