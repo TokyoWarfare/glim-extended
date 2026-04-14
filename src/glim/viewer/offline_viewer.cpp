@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <queue>
 #include <sstream>
 #include <unordered_set>
 #include <boost/format.hpp>
@@ -13,6 +14,9 @@
 #include <gtsam_points/cuda/nonlinear_factor_set_gpu_create.hpp>
 #include <glim/util/config.hpp>
 #include <glim/util/geodetic.hpp>
+#include <glim/util/post_processing.hpp>
+#include <glim/util/map_cleaner.hpp>
+#include <gtsam_points/ann/kdtree.hpp>
 #include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <gtsam_points/ann/kdtree.hpp>
 #include <glim/common/cloud_covariance_estimation.hpp>
@@ -754,31 +758,437 @@ void OfflineViewer::setup_ui() {
     ImGui::End();
   });
 
-  // Range Filter tool window
-  viewer->register_ui_callback("range_filter_window", [this] {
-    if (!show_range_filter) return;
-    ImGui::SetNextWindowSize(ImVec2(350, 280), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Range Filter", &show_range_filter)) {
-      ImGui::Text("Remove distant noise when closer points exist");
+  // PatchWork++ config window
+  viewer->register_ui_callback("pw_config_window", [this] {
+    if (!show_pw_config) return;
+    ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("PatchWork++ Config", &show_pw_config)) {
+      auto& p = glim::MapCleanerFilter::getPatchWorkParams();
+      ImGui::Checkbox("Use intensity (RNR)", &p.enable_RNR);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reflected Noise Removal using intensity.\nRequires intensities.bin in HD frames.");
+      ImGui::Checkbox("Enable RVPF", &p.enable_RVPF);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Region-wise Vertical Plane Fitting.");
+      ImGui::Checkbox("Enable TGR", &p.enable_TGR);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Temporal Ground Revert.");
+      ImGui::Separator();
+      float sh = static_cast<float>(p.sensor_height);
+      if (ImGui::DragFloat("Sensor height (m)", &sh, 0.01f, 0.5f, 5.0f, "%.3f")) p.sensor_height = sh;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Height of LiDAR sensor above ground.");
+      float mr = static_cast<float>(p.max_range);
+      if (ImGui::DragFloat("Max range (m)", &mr, 1.0f, 10.0f, 200.0f, "%.0f")) p.max_range = mr;
+      float mnr = static_cast<float>(p.min_range);
+      if (ImGui::DragFloat("Min range (m)", &mnr, 0.1f, 0.5f, 10.0f, "%.1f")) p.min_range = mnr;
+      ImGui::Separator();
+      float ts = static_cast<float>(p.th_seeds);
+      if (ImGui::DragFloat("Seed threshold", &ts, 0.01f, 0.01f, 1.0f, "%.3f")) p.th_seeds = ts;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Threshold for initial seed selection.");
+      float td = static_cast<float>(p.th_dist);
+      if (ImGui::DragFloat("Ground thickness", &td, 0.01f, 0.01f, 1.0f, "%.3f")) p.th_dist = td;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max distance from plane to count as ground.");
+      float ut = static_cast<float>(p.uprightness_thr);
+      if (ImGui::DragFloat("Uprightness thr", &ut, 0.01f, 0.3f, 1.0f, "%.3f")) p.uprightness_thr = ut;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("How upright the surface must be (0.707 = 45 deg).");
+      ImGui::DragInt("Num iterations", &p.num_iter, 1, 1, 10);
+      ImGui::DragInt("Num LPR", &p.num_lpr, 1, 5, 50);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max lowest points for seed selection.");
+      ImGui::DragInt("Min points/patch", &p.num_min_pts, 1, 1, 50);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Min points to estimate ground in a patch.");
+    }
+    ImGui::End();
+  });
+
+  // Trail refinement config window
+  viewer->register_ui_callback("trail_config_window", [this] {
+    if (!show_trail_config) return;
+    ImGui::SetNextWindowSize(ImVec2(250, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Trail Refinement Config", &show_trail_config)) {
+      ImGui::DragFloat("Refine voxel (m)", &df_refine_voxel, 0.05f, 0.1f, 5.0f, "%.2f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Voxel size for clustering candidates.");
+      ImGui::DragFloat("Min length (m)", &df_trail_min_length, 1.0f, 2.0f, 100.0f, "%.0f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum trail extent in longest axis.");
+      ImGui::DragFloat("Min aspect ratio", &df_trail_min_aspect, 0.5f, 1.0f, 20.0f, "%.1f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum longest/shortest axis ratio.\nTrails are elongated (>3).");
+      ImGui::DragFloat("Min density (pts/m³)", &df_trail_min_density, 1.0f, 1.0f, 500.0f, "%.0f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum point density in occupied voxels.");
+    }
+    ImGui::End();
+  });
+
+  // Data Filter tool window
+  viewer->register_ui_callback("data_filter_window", [this] {
+    if (!show_data_filter) return;
+    ImGui::SetNextWindowSize(ImVec2(350, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Data Filter", &show_data_filter)) {
+      ImGui::Combo("Mode", &df_mode, "Range\0Dynamic\0SOR\0Scalar\0");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Range: remove distant noise when closer points exist.\nDynamic: remove objects that moved between passes.");
       ImGui::Separator();
 
-      ImGui::SliderFloat("Voxel size (m)", &rf_voxel_size, 0.05f, 5.0f, "%.2f");
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Spatial grid cell size for grouping points.");
+      // Shared parameter
+      if (df_mode == 0) {
+        // Range filter parameters
+        ImGui::Combo("Criteria", &rf_criteria, "Range\0GPS Time\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Range: remove distant points when closer exist.\nGPS Time: remove overlapping pass points when earlier/later exist.");
+        ImGui::SliderFloat("Voxel size (m)", &rf_voxel_size, 0.05f, 5.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Spatial grid cell size for grouping points.");
+        if (rf_criteria == 0) {
+          ImGui::SliderFloat("Safe range (m)", &rf_safe_range, 5.0f, 50.0f, "%.0f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Points within this range are ALWAYS kept.");
+          ImGui::SliderFloat("Range delta (m)", &rf_range_delta, 1.0f, 50.0f, "%.0f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove points >delta further than closest safe-range\npoint in the voxel.");
+          ImGui::SliderFloat("Far delta (m)", &rf_far_delta, 5.0f, 100.0f, "%.0f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Secondary delta for voxels with NO safe-range points.\nRemoves points > (min_range + far_delta) in the voxel.");
+          ImGui::SliderInt("Min close points", &rf_min_close_pts, 1, 20);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum close-range points in a voxel before\nthe primary delta applies.");
+        } else {
+          ImGui::Text("GPS Time: within each voxel, keep only\nthe temporal group with most points.");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overlapping passes contribute different GPS time clusters.\nThe dominant cluster is kept, others removed.");
+        }
+      } else if (df_mode == 1) {
+        // Dynamic filter parameters
+        ImGui::DragFloat("Voxel size (m)", &df_voxel_size, 0.01f, 0.1f, 5.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Spatial grid cell size for point grouping.");
+        ImGui::DragFloat("Range threshold (m)", &df_range_threshold, 0.1f, 0.1f, 50.0f, "%.1f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How close measured vs expected range must be\nto count as STATIC. Smaller = catches more dynamics.");
+        ImGui::DragFloat("Observation range (m)", &df_observation_range, 1.0f, 5.0f, 200.0f, "%.0f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max sensor-to-point distance for frame comparison.");
+        ImGui::SliderInt("Max compare frames", &df_min_observations, 5, 50);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Maximum frames to vote against per point.");
 
-      ImGui::SliderFloat("Safe range (m)", &rf_safe_range, 5.0f, 50.0f, "%.0f");
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Points within this range are ALWAYS kept.");
+        // Ground exclusion
+        ImGui::Separator();
+        if (ImGui::Checkbox("Exclude ground (normals)", &df_exclude_ground)) {
+          if (df_exclude_ground) df_exclude_ground_pw = false;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip ground using normal Z threshold.");
+        if (df_exclude_ground) {
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(80);
+          ImGui::DragFloat("Z thr", &df_ground_normal_z, 0.05f, 0.3f, 0.95f, "%.2f");
+          ImGui::SameLine();
+          if (ImGui::Button("Show##normals")) {
+            rf_status = "Classifying ground (normals)...";
+            std::thread([this] {
+              auto vw = guik::LightViewer::instance();
+              const Eigen::Matrix4f vm = vw->view_matrix();
+              const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
+              std::vector<Eigen::Vector3f> ground_pts, nonground_pts;
+              for (const auto& submap : submaps) {
+                if (!submap) continue;
+                if ((submap->T_world_origin.translation().cast<float>() - cam_pos).norm() > lod_hd_range) continue;
+                std::string shd = hd_frames_path;
+                for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+                const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+                for (const auto& fr : submap->frames) {
+                  char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                  std::string fd = shd + "/" + dn;
+                  std::vector<Eigen::Vector3f> pts, nrm; std::vector<float> rng;
+                  std::ifstream mf(fd + "/frame_meta.json"); auto meta = nlohmann::json::parse(mf, nullptr, false);
+                  if (meta.is_discarded()) continue; const int n = meta.value("num_points", 0);
+                  if (!glim::load_bin(fd + "/points.bin", pts, n) || !glim::load_bin(fd + "/range.bin", rng, n)) continue;
+                  glim::load_bin(fd + "/normals.bin", nrm, n);
+                  const auto T = glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu);
+                  const Eigen::Matrix3f R = T.rotation().cast<float>(); const Eigen::Vector3f t = T.translation().cast<float>();
+                  for (int i = 0; i < n; i++) {
+                    if (rng[i] < 1.5f) continue;
+                    const Eigen::Vector3f wp = R * pts[i] + t;
+                    bool gnd = (i < static_cast<int>(nrm.size())) && std::abs((R * nrm[i]).normalized().z()) > df_ground_normal_z;
+                    if (gnd) ground_pts.push_back(wp); else nonground_pts.push_back(wp);
+                  }
+                }
+              }
+              vw->invoke([this, ground_pts, nonground_pts] {
+                auto v = guik::LightViewer::instance(); lod_hide_all_submaps = true; rf_preview_active = true;
+                if (!ground_pts.empty()) v->update_drawable("rf_preview_kept", std::make_shared<glk::PointCloudBuffer>(ground_pts[0].data(), sizeof(Eigen::Vector3f), ground_pts.size()), guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f));
+                if (!nonground_pts.empty()) v->update_drawable("rf_preview_removed", std::make_shared<glk::PointCloudBuffer>(nonground_pts[0].data(), sizeof(Eigen::Vector3f), nonground_pts.size()), guik::FlatColor(0.2f, 0.9f, 0.2f, 1.0f));
+              });
+              rf_status = "Normals: " + std::to_string(ground_pts.size()) + " ground (yellow), " + std::to_string(nonground_pts.size()) + " non-ground (green)";
+            }).detach();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Visualize ground (yellow) vs non-ground (green).");
+        }
+        if (ImGui::Checkbox("Exclude ground (PatchWork++)", &df_exclude_ground_pw)) {
+          if (df_exclude_ground_pw) df_exclude_ground = false;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip ground using PatchWork++ plane fitting.");
+        if (df_exclude_ground_pw) {
+          ImGui::SameLine();
+          if (ImGui::Button("Config##pw")) { show_pw_config = !show_pw_config; }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open PatchWork++ configuration window.");
+          ImGui::SameLine();
+          if (ImGui::Button("Show##pw")) {
+            rf_status = "Classifying ground (PatchWork++)...";
+            std::thread([this] {
+              auto vw = guik::LightViewer::instance();
+              const Eigen::Matrix4f vm = vw->view_matrix();
+              const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
+              std::vector<Eigen::Vector3f> ground_pts, nonground_pts;
+              for (const auto& submap : submaps) {
+                if (!submap) continue;
+                if ((submap->T_world_origin.translation().cast<float>() - cam_pos).norm() > lod_hd_range) continue;
+                std::string shd = hd_frames_path;
+                for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+                const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+                for (const auto& fr : submap->frames) {
+                  char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                  std::string fd = shd + "/" + dn;
+                  std::vector<Eigen::Vector3f> pts; std::vector<float> rng;
+                  std::ifstream mf(fd + "/frame_meta.json"); auto meta = nlohmann::json::parse(mf, nullptr, false);
+                  if (meta.is_discarded()) continue; const int n = meta.value("num_points", 0);
+                  if (!glim::load_bin(fd + "/points.bin", pts, n) || !glim::load_bin(fd + "/range.bin", rng, n)) continue;
+                  std::vector<float> ints; glim::load_bin(fd + "/intensities.bin", ints, n);
+                  auto pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, n, 1.7f, ints);
+                  const auto T = glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu);
+                  const Eigen::Matrix3f R = T.rotation().cast<float>(); const Eigen::Vector3f t = T.translation().cast<float>();
+                  for (int i = 0; i < n; i++) {
+                    if (rng[i] < 1.5f) continue;
+                    const Eigen::Vector3f wp = R * pts[i] + t;
+                    if (!pw_gnd.empty() && pw_gnd[i]) ground_pts.push_back(wp); else nonground_pts.push_back(wp);
+                  }
+                }
+              }
+              vw->invoke([this, ground_pts, nonground_pts] {
+                auto v = guik::LightViewer::instance(); lod_hide_all_submaps = true; rf_preview_active = true;
+                if (!ground_pts.empty()) v->update_drawable("rf_preview_kept", std::make_shared<glk::PointCloudBuffer>(ground_pts[0].data(), sizeof(Eigen::Vector3f), ground_pts.size()), guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f));
+                if (!nonground_pts.empty()) v->update_drawable("rf_preview_removed", std::make_shared<glk::PointCloudBuffer>(nonground_pts[0].data(), sizeof(Eigen::Vector3f), nonground_pts.size()), guik::FlatColor(0.2f, 0.9f, 0.2f, 1.0f));
+              });
+              rf_status = "PatchWork++: " + std::to_string(ground_pts.size()) + " ground (yellow), " + std::to_string(nonground_pts.size()) + " non-ground (green)";
+            }).detach();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Visualize ground (yellow) vs non-ground (green).");
+        }
+        ImGui::Checkbox("Refine ground (Z column)", &df_refine_ground);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Revoke false ground labels for points above\nthe lowest Z in each XY column.");
+        if (ImGui::Button("Save ground to HD")) {
+          rf_processing = true;
+          rf_status = "Saving ground classification...";
+          std::thread([this] {
+            int frames_written = 0;
+            for (const auto& submap : submaps) {
+              if (!submap) continue;
+              if (hidden_sessions.count(submap->session_id)) continue;
+              std::string shd = hd_frames_path;
+              for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+              const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+              for (const auto& fr : submap->frames) {
+                char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                const std::string fd = shd + "/" + dn;
+                std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints;
+                std::ifstream mf(fd + "/frame_meta.json");
+                auto meta = nlohmann::json::parse(mf, nullptr, false); mf.close();
+                if (meta.is_discarded()) continue;
+                const int n = meta.value("num_points", 0);
+                if (!glim::load_bin(fd + "/points.bin", pts, n)) continue;
+                glim::load_bin(fd + "/range.bin", rng, n);
+                glim::load_bin(fd + "/intensities.bin", ints, n);
+                std::vector<Eigen::Vector3f> nrm(n, Eigen::Vector3f::Zero());
+                glim::load_bin(fd + "/normals.bin", nrm, n);
 
-      ImGui::SliderFloat("Range delta (m)", &rf_range_delta, 1.0f, 50.0f, "%.0f");
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove points >delta further than closest safe-range\npoint in the voxel.");
+                // Classify ground
+                std::vector<float> ground_values(n, 0.0f);
+                if (df_exclude_ground_pw) {
+                  auto pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, n, 1.7f, ints);
+                  for (int i = 0; i < n; i++) { if (!pw_gnd.empty() && pw_gnd[i]) ground_values[i] = 1.0f; }
+                } else if (df_exclude_ground) {
+                  const auto T = glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu);
+                  const Eigen::Matrix3f R = T.rotation().cast<float>();
+                  for (int i = 0; i < n; i++) {
+                    const Eigen::Vector3f wn = (R * nrm[i]).normalized();
+                    if (std::abs(wn.z()) > df_ground_normal_z) ground_values[i] = 1.0f;
+                  }
+                }
 
-      ImGui::SliderFloat("Far delta (m)", &rf_far_delta, 5.0f, 100.0f, "%.0f");
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Secondary delta for voxels with NO safe-range points.\nRemoves points > (min_range + far_delta) in the voxel.\nCleans up distant noise where no close data exists.");
+                // Write aux_ground.bin
+                { std::ofstream f(fd + "/aux_ground.bin", std::ios::binary);
+                  f.write(reinterpret_cast<const char*>(ground_values.data()), sizeof(float) * n); }
+                frames_written++;
+                if (frames_written % 100 == 0) {
+                  rf_status = "Ground: " + std::to_string(frames_written) + " frames...";
+                }
+              }
+            }
+            rf_status = "Ground saved: " + std::to_string(frames_written) + " frames";
+            logger->info("[Ground] Saved classification to {} frames", frames_written);
+            rf_processing = false;
+          }).detach();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run ground classification on all HD frames\nand save as aux_ground.bin scalar field.\nAppears in Scalar mode and color mode dropdown.");
+        ImGui::Separator();
 
-      ImGui::SliderInt("Min close points", &rf_min_close_pts, 1, 20);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum close-range points in a voxel before\nthe primary delta applies. Below this threshold,\nthe far delta is used instead.");
+        // Trail refinement
+        ImGui::Checkbox("Refine trails", &df_refine_trails);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cluster candidates into elongated trails.\nRejects isolated false positives, fills gaps.");
+        if (df_refine_trails) {
+          ImGui::SameLine();
+          if (ImGui::Button("Config##trail")) { show_trail_config = !show_trail_config; }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open trail refinement configuration.");
+        }
+      } else if (df_mode == 2) {
+        // SOR filter parameters
+        ImGui::DragFloat("Search radius (m)", &sor_radius, 0.01f, 0.05f, 5.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Radius for neighbor search.\nPoints with fewer neighbors than threshold are removed.");
+        ImGui::DragInt("Min neighbors", &sor_min_neighbors, 1, 1, 50);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum number of neighbors within radius.\nPoints below this are considered outliers.");
+        ImGui::DragFloat("Chunk size (m)", &sor_chunk_size, 10.0f, 20.0f, 500.0f, "%.0f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of spatial processing cube.\nLarger = more context, more memory.");
+      } else if (df_mode == 3) {
+        // Scalar visibility — same pattern as range highlight but for any scalar field
+        if (!aux_attribute_names.empty()) {
+          std::vector<const char*> field_ptrs;
+          for (const auto& n : aux_attribute_names) field_ptrs.push_back(n.c_str());
+          if (sv_field_idx >= static_cast<int>(field_ptrs.size())) sv_field_idx = 0;
 
-      // Range highlight: re-color cached preview data by range threshold
-      // Uses intensity as base color, red tint beyond threshold
+          bool field_changed = ImGui::Combo("Scalar field", &sv_field_idx, field_ptrs.data(), field_ptrs.size());
+
+          // When field changes, switch the main viewer to that colormap
+          if (field_changed) {
+            color_mode = 3 + sv_field_idx;
+            aux_attr_samples.clear();
+            aux_cmap_range = Eigen::Vector2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest());
+            update_viewer();
+            sv_threshold = 0.0f;
+          }
+
+          // Use the viewer's computed percentile range for slider bounds
+          const float field_min = aux_cmap_range.x();
+          const float field_max = aux_cmap_range.y();
+
+          if (ImGui::SliderFloat("Highlight", &sv_threshold, field_min, field_max, "%.3f")) {
+            // Same as range highlight: switch to colormap view, tint above threshold yellow
+            auto viewer = guik::LightViewer::instance();
+            const auto& attr_name = aux_attribute_names[sv_field_idx];
+            const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
+
+            // Set cmap range to [field_min, threshold] so points above threshold saturate
+            viewer->shader_setting().add<Eigen::Vector2f>("cmap_range", Eigen::Vector2f(field_min, sv_threshold));
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Points above this value are highlighted.\nSame as range highlight but for the selected scalar.");
+
+          ImGui::Checkbox("Hide below", &sv_hide_below);
+          ImGui::SameLine();
+          ImGui::Checkbox("Hide above", &sv_hide_above);
+
+          if (ImGui::Button("Update view")) {
+            rf_processing = true;
+            rf_preview_active = true;
+            lod_hide_all_submaps = true;
+            rf_status = "Loading scalar data...";
+            std::thread([this] {
+              auto vw = guik::LightViewer::instance();
+              const Eigen::Matrix4f vm = vw->view_matrix();
+              const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
+              const auto& attr_name = aux_attribute_names[sv_field_idx];
+              const double base = (attr_name == "gps_time") ? gps_time_base : 0.0;
+
+              std::vector<Eigen::Vector3f> below_pts, above_pts;
+              std::vector<float> below_int, above_int;
+
+              for (const auto& submap : submaps) {
+                if (!submap) continue;
+                if ((submap->T_world_origin.translation().cast<float>() - cam_pos).norm() > lod_hd_range) continue;
+                std::string shd = hd_frames_path;
+                for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+                const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+                for (const auto& fr : submap->frames) {
+                  char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                  const std::string fd = shd + "/" + dn;
+                  std::ifstream mf(fd + "/frame_meta.json");
+                  auto meta = nlohmann::json::parse(mf, nullptr, false);
+                  if (meta.is_discarded()) continue;
+                  const int n = meta.value("num_points", 0);
+                  if (n == 0) continue;
+                  std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints;
+                  if (!glim::load_bin(fd + "/points.bin", pts, n)) continue;
+                  glim::load_bin(fd + "/range.bin", rng, n);
+                  glim::load_bin(fd + "/intensities.bin", ints, n);
+                  // Load the selected scalar field
+                  std::vector<float> scalar(n, 0.0f);
+                  if (attr_name == "intensity") { scalar = ints; }
+                  else if (attr_name == "range") { scalar = rng; }
+                  else {
+                    // Try loading aux_<name>.bin
+                    std::vector<float> aux_f;
+                    if (glim::load_bin(fd + "/aux_" + attr_name + ".bin", aux_f, n)) {
+                      scalar = aux_f;
+                    } else {
+                      // Try as double
+                      std::vector<double> aux_d;
+                      if (glim::load_bin(fd + "/aux_" + attr_name + ".bin", aux_d, n)) {
+                        for (int i = 0; i < n; i++) scalar[i] = static_cast<float>(aux_d[i] - base);
+                      }
+                    }
+                  }
+
+                  const auto T = glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu);
+                  const Eigen::Matrix3f R = T.rotation().cast<float>();
+                  const Eigen::Vector3f t = T.translation().cast<float>();
+                  for (int i = 0; i < n; i++) {
+                    if (rng.size() > 0 && rng[i] < 1.5f) continue;
+                    const Eigen::Vector3f wp = R * pts[i] + t;
+                    const float sv = (attr_name == "intensity" || attr_name == "range") ? scalar[i] : scalar[i];
+                    if (sv < sv_threshold) {
+                      below_pts.push_back(wp); below_int.push_back(ints.empty() ? 0.0f : ints[i]);
+                    } else {
+                      above_pts.push_back(wp); above_int.push_back(ints.empty() ? 0.0f : ints[i]);
+                    }
+                  }
+                }
+              }
+
+              // Render: show both sides, skip hidden
+              vw->invoke([this, below_pts, above_pts, below_int, above_int] {
+                auto v = guik::LightViewer::instance();
+                v->remove_drawable("rf_preview_kept");
+                v->remove_drawable("rf_preview_removed");
+                // Above threshold = green (kept)
+                if (!above_pts.empty() && !sv_hide_above) {
+                  const int n = above_pts.size();
+                  std::vector<Eigen::Vector4d> p4(n);
+                  for (int i = 0; i < n; i++) p4[i] = Eigen::Vector4d(above_pts[i].x(), above_pts[i].y(), above_pts[i].z(), 1.0);
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), n);
+                  cb->add_buffer("intensity", above_int);
+                  cb->set_colormap_buffer("intensity");
+                  v->update_drawable("rf_preview_kept", cb, guik::FlatColor(0.0f, 0.8f, 0.2f, 1.0f));
+                }
+                // Below threshold = red (removed)
+                if (!below_pts.empty() && !sv_hide_below) {
+                  const int n = below_pts.size();
+                  std::vector<Eigen::Vector4d> p4(n);
+                  for (int i = 0; i < n; i++) p4[i] = Eigen::Vector4d(below_pts[i].x(), below_pts[i].y(), below_pts[i].z(), 1.0);
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), n);
+                  v->update_drawable("rf_preview_removed", cb, guik::FlatColor(1.0f, 0.0f, 0.0f, 0.5f).make_transparent());
+                }
+              });
+
+              rf_status = "Scalar: " + std::to_string(above_pts.size()) + " above, " + std::to_string(below_pts.size()) + " below";
+              rf_processing = false;
+            }).detach();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Load visible HD data and split by threshold.\nGreen = above, Red = below.\nHide toggles control which side is shown.");
+        } else {
+          ImGui::Text("No scalar fields available.\nLoad a map with aux attributes.");
+        }
+      }
+
+      // Reset defaults button
+      if (ImGui::Button("Reset defaults")) {
+        if (df_mode == 0) {
+          rf_voxel_size = 1.0f; rf_safe_range = 30.0f; rf_range_delta = 10.0f;
+          rf_far_delta = 30.0f; rf_min_close_pts = 3;
+        } else if (df_mode == 1) {
+          df_voxel_size = 0.64f; df_range_threshold = 0.8f; df_observation_range = 30.0f;
+          df_min_observations = 15; df_refine_ground = true; df_refine_trails = true;
+          df_trail_min_length = 7.0f; df_trail_min_aspect = 9.0f; df_trail_min_density = 11.0f;
+          df_refine_voxel = 0.48f; df_chunk_size = 120.0f; df_chunk_spacing = 60.0f;
+        } else if (df_mode == 2) {
+          sor_radius = 0.3f; sor_min_neighbors = 5; sor_chunk_size = 100.0f;
+        } else {
+          sv_threshold = 0.5f; sv_hide_below = false; sv_hide_above = false;
+        }
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset current mode parameters to defaults.");
+
+      // Range highlight (only for Range/Dynamic modes)
+      if (df_mode == 0 || df_mode == 1) {
       ImGui::Separator();
       ImGui::Text("Range highlight");
       if (!rf_preview_data.empty()) {
@@ -831,6 +1241,7 @@ void OfflineViewer::setup_ui() {
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Run Preview first to enable range highlighting.");
       }
+      } // end Range highlight (df_mode 0 or 1)
 
       ImGui::Separator();
 
@@ -839,7 +1250,7 @@ void OfflineViewer::setup_ui() {
       if (rf_processing) {
         ImGui::Text("%s", rf_status.c_str());
       } else {
-        // Preview: cross-frame voxel filtering in visible area
+        // Preview buttons
         if (ImGui::Button("Preview (visible area)")) {
           rf_processing = true;
           rf_preview_active = true;
@@ -856,11 +1267,15 @@ void OfflineViewer::setup_ui() {
               Eigen::Vector3f world_pos;
               float range;
               float intensity;
+              float normal_z;
+              float gps_time;
+              bool ground_pw;
               int frame_idx;
               int point_idx;
             };
 
-            const float inv_voxel = 1.0f / rf_voxel_size;
+            const float active_voxel_size = (df_mode == 1) ? df_voxel_size : rf_voxel_size;
+            const float inv_voxel = 1.0f / active_voxel_size;
             std::unordered_map<uint64_t, std::vector<PointEntry>> voxels;
             int frame_count = 0;
 
@@ -903,22 +1318,39 @@ void OfflineViewer::setup_ui() {
                 std::vector<float> intensity(num_pts, 0.0f);
                 { std::ifstream f(frame_dir + "/intensities.bin", std::ios::binary);
                   if (f) f.read(reinterpret_cast<char*>(intensity.data()), sizeof(float) * num_pts); }
+                std::vector<Eigen::Vector3f> normals(num_pts, Eigen::Vector3f::Zero());
+                { std::ifstream f(frame_dir + "/normals.bin", std::ios::binary);
+                  if (f) f.read(reinterpret_cast<char*>(normals.data()), sizeof(Eigen::Vector3f) * num_pts); }
+                std::vector<float> frame_times(num_pts, 0.0f);
+                { std::ifstream f(frame_dir + "/times.bin", std::ios::binary);
+                  if (f) f.read(reinterpret_cast<char*>(frame_times.data()), sizeof(float) * num_pts); }
+                const double frame_stamp = frame->stamp;
 
                 const Eigen::Isometry3d T_w_imu = T_ep * T_odom0.inverse() * frame->T_world_imu;
                 const Eigen::Isometry3d T_w_lidar = T_w_imu * frame->T_lidar_imu.inverse();
                 const Eigen::Matrix3f R = T_w_lidar.rotation().cast<float>();
                 const Eigen::Vector3f t_vec = T_w_lidar.translation().cast<float>();
 
+                // PatchWork++ ground classification for this frame (cached)
+                std::vector<bool> pw_ground;
+                if (df_mode == 1 && df_exclude_ground_pw) {
+                  auto cache_it = pw_ground_cache.find(frame_dir);
+                  if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == num_pts) {
+                    pw_ground = cache_it->second;
+                  } else {
+                    pw_ground = glim::MapCleanerFilter::classify_ground_patchwork(pts, num_pts, 1.7f, intensity);
+                    pw_ground_cache[frame_dir] = pw_ground;
+                  }
+                }
+
                 for (int i = 0; i < num_pts; i++) {
-                  if (range[i] < 1.5f) continue;  // skip near-sensor noise
+                  if (range[i] < 1.5f) continue;
                   const Eigen::Vector3f wp = R * pts[i] + t_vec;
-                  const int vx = static_cast<int>(std::floor(wp.x() * inv_voxel));
-                  const int vy = static_cast<int>(std::floor(wp.y() * inv_voxel));
-                  const int vz = static_cast<int>(std::floor(wp.z() * inv_voxel));
-                  const uint64_t key = (static_cast<uint64_t>(vx + 1048576) << 42) |
-                                       (static_cast<uint64_t>(vy + 1048576) << 21) |
-                                       static_cast<uint64_t>(vz + 1048576);
-                  voxels[key].push_back({wp, range[i], intensity[i], frame_count, i});
+                  const Eigen::Vector3f wn = (R * normals[i]).normalized();
+                  const bool gpw = !pw_ground.empty() && pw_ground[i];
+                  const uint64_t key = glim::voxel_key(wp, inv_voxel);
+                  const float gps_t = static_cast<float>(frame_stamp - gps_time_base) + frame_times[i];
+                  voxels[key].push_back({wp, range[i], intensity[i], std::abs(wn.z()), gps_t, gpw, frame_count, i});
                 }
                 frame_count++;
               }
@@ -936,53 +1368,224 @@ void OfflineViewer::setup_ui() {
             }
             rf_status = "Filtering " + std::to_string(voxels.size()) + " voxels...";
 
-            // Cross-frame filter: within each world-space voxel, find close points
-            // and remove distant ones from other frames
+            // Filter: per-voxel criterion based on mode
             std::vector<Eigen::Vector3f> kept_points, removed_points;
             std::vector<float> kept_intensities, kept_ranges;
-            std::vector<Eigen::Vector3f> removed_positions;
             std::vector<float> removed_ranges, removed_intensities;
             size_t preview_kept = 0, preview_removed = 0;
 
-            for (const auto& [key, entries] : voxels) {
-              // Find max range among close points (within safe_range)
-              float max_close_range = 0.0f;
-              int close_count = 0;
-              for (const auto& e : entries) {
-                if (e.range <= rf_safe_range) {
-                  max_close_range = std::max(max_close_range, e.range);
-                  close_count++;
-                }
-              }
-
-              if (close_count < rf_min_close_pts) {
-                // No safe-range anchor — apply secondary (far) delta from min range in voxel
-                float min_range = std::numeric_limits<float>::max();
-                for (const auto& e : entries) min_range = std::min(min_range, e.range);
-                const float far_threshold = min_range + rf_far_delta;
+            if (df_mode == 0 && rf_criteria == 0) {
+              // --- RANGE MODE (range criteria) ---
+              for (const auto& [key, entries] : voxels) {
+                float max_close_range = 0.0f;
+                int close_count = 0;
                 for (const auto& e : entries) {
-                  if (e.range <= far_threshold) {
+                  if (e.range <= rf_safe_range) {
+                    max_close_range = std::max(max_close_range, e.range);
+                    close_count++;
+                  }
+                }
+
+                if (close_count < rf_min_close_pts) {
+                  float min_range = std::numeric_limits<float>::max();
+                  for (const auto& e : entries) min_range = std::min(min_range, e.range);
+                  const float far_threshold = min_range + rf_far_delta;
+                  for (const auto& e : entries) {
+                    if (e.range <= far_threshold) {
+                      kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++;
+                    } else {
+                      removed_points.push_back(e.world_pos); removed_intensities.push_back(e.intensity); removed_ranges.push_back(e.range); preview_removed++;
+                    }
+                  }
+                  continue;
+                }
+
+                const float threshold = max_close_range + rf_range_delta;
+                for (const auto& e : entries) {
+                  if (e.range <= rf_safe_range || e.range <= threshold) {
                     kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++;
                   } else {
                     removed_points.push_back(e.world_pos); removed_intensities.push_back(e.intensity); removed_ranges.push_back(e.range); preview_removed++;
                   }
                 }
-                continue;
+              }
+            } else if (df_mode == 0 && rf_criteria == 1) {
+              // --- RANGE MODE (GPS time criteria) ---
+              // Per voxel: cluster points by GPS time, keep the dominant cluster
+              const float time_gap = 5.0f;  // seconds — points within this gap are same cluster
+              for (const auto& [key, entries] : voxels) {
+                if (entries.size() <= 1) {
+                  for (const auto& e : entries) { kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++; }
+                  continue;
+                }
+                // Sort by GPS time
+                std::vector<int> sorted_idx(entries.size());
+                std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
+                std::sort(sorted_idx.begin(), sorted_idx.end(), [&](int a, int b) { return entries[a].gps_time < entries[b].gps_time; });
+
+                // Cluster by time gap
+                std::vector<std::vector<int>> clusters;
+                clusters.push_back({sorted_idx[0]});
+                for (size_t i = 1; i < sorted_idx.size(); i++) {
+                  if (entries[sorted_idx[i]].gps_time - entries[sorted_idx[i - 1]].gps_time > time_gap) {
+                    clusters.push_back({});
+                  }
+                  clusters.back().push_back(sorted_idx[i]);
+                }
+
+                if (clusters.size() <= 1) {
+                  // Only one cluster — keep all
+                  for (const auto& e : entries) { kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++; }
+                  continue;
+                }
+
+                // Find dominant cluster (most points)
+                int best_cluster = 0;
+                for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) {
+                  if (clusters[ci].size() > clusters[best_cluster].size()) best_cluster = ci;
+                }
+
+                // Keep dominant, remove others
+                std::unordered_set<int> keep_set(clusters[best_cluster].begin(), clusters[best_cluster].end());
+                for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
+                  if (keep_set.count(ei)) {
+                    kept_points.push_back(entries[ei].world_pos); kept_intensities.push_back(entries[ei].intensity); kept_ranges.push_back(entries[ei].range); preview_kept++;
+                  } else {
+                    removed_points.push_back(entries[ei].world_pos); removed_intensities.push_back(entries[ei].intensity); removed_ranges.push_back(entries[ei].range); preview_removed++;
+                  }
+                }
+              }
+            } else if (df_mode == 1) {
+              // --- DYNAMIC MODE (MapCleaner algorithm) ---
+              rf_status = "Collecting frames...";
+
+              // Collect frame metadata for nearby HD frames
+              std::vector<glim::MapCleanerFilter::FrameData> mc_frames;
+              for (const auto& submap : submaps) {
+                if (!submap) continue;
+                const float sdist = (submap->T_world_origin.translation().cast<float>() - cam_pos).norm();
+                if (sdist > lod_hd_range + 20.0f) continue;
+                std::string session_hd = hd_frames_path;
+                for (const auto& sess : sessions) {
+                  if (sess.id == submap->session_id && !sess.hd_frames_path.empty()) {
+                    session_hd = sess.hd_frames_path; break;
+                  }
+                }
+                const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
+                for (const auto& frame : submap->frames) {
+                  char dir_name[16];
+                  std::snprintf(dir_name, sizeof(dir_name), "%08ld", frame->id);
+                  const std::string frame_dir = session_hd + "/" + dir_name;
+                  if (!boost::filesystem::exists(frame_dir + "/frame_meta.json")) continue;
+                  std::ifstream mf(frame_dir + "/frame_meta.json");
+                  const auto meta = nlohmann::json::parse(mf, nullptr, false);
+                  if (meta.is_discarded()) continue;
+                  const int npts = meta.value("num_points", 0);
+                  if (npts == 0) continue;
+                  const Eigen::Isometry3d T_w_lidar = glim::compute_frame_world_pose(
+                    submap->T_world_origin, submap->T_origin_endpoint_L, T_odom0, frame->T_world_imu, frame->T_lidar_imu);
+                  mc_frames.push_back({frame_dir, T_w_lidar, npts});
+                }
               }
 
-              // Remove points beyond max_close_range + delta
-              const float threshold = max_close_range + rf_range_delta;
-              for (const auto& e : entries) {
-                if (e.range <= rf_safe_range || e.range <= threshold) {
-                  kept_points.push_back(e.world_pos);
-                  kept_intensities.push_back(e.intensity);
-                  kept_ranges.push_back(e.range);
-                  preview_kept++;
+              // Flatten voxel points for MapCleaner + compute ground flags
+              std::vector<Eigen::Vector3f> mc_points;
+              std::vector<float> mc_ranges;
+              std::vector<bool> mc_ground;
+              std::vector<std::pair<uint64_t, int>> mc_refs;
+              for (const auto& [key, entries] : voxels) {
+                for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
+                  mc_points.push_back(entries[ei].world_pos);
+                  mc_ranges.push_back(entries[ei].range);
+                  const bool is_gnd = (df_exclude_ground && entries[ei].normal_z > df_ground_normal_z) || (df_exclude_ground_pw && entries[ei].ground_pw);
+                  mc_ground.push_back(is_gnd);
+                  mc_refs.push_back({key, ei});
+                }
+              }
+
+              // Configure and run
+              rf_status = "Running MapCleaner (" + std::to_string(mc_frames.size()) + " frames, " + std::to_string(mc_points.size()) + " points)...";
+              glim::MapCleanerFilter::Params mc_params;
+              mc_params.range_threshold = df_range_threshold;
+              mc_params.lidar_range = df_observation_range;
+              mc_params.voxel_size = df_voxel_size;
+              mc_params.frame_skip = (mc_frames.size() > 150) ? static_cast<int>(mc_frames.size() / 150) : 0;
+              mc_params.exclude_ground = df_exclude_ground;
+              mc_params.ground_normal_z = df_ground_normal_z;
+              mc_params.exclude_ground_pw = df_exclude_ground_pw;
+
+              glim::MapCleanerFilter filter(mc_params);
+              auto mc_result = filter.compute(mc_frames, mc_points, mc_ranges, mc_ground);
+              logger->info("[Dynamic] MapCleaner: {} static, {} dynamic ({} frames)",
+                mc_result.num_static, mc_result.num_dynamic, mc_frames.size());
+
+              for (size_t i = 0; i < mc_points.size(); i++) {
+                const auto& e = voxels.at(mc_refs[i].first)[mc_refs[i].second];
+                if (mc_result.is_dynamic[i]) {
+                  removed_points.push_back(e.world_pos); removed_intensities.push_back(e.intensity); removed_ranges.push_back(e.range); preview_removed++;
                 } else {
-                  removed_points.push_back(e.world_pos);
-                  removed_intensities.push_back(e.intensity);
-                  removed_ranges.push_back(e.range);
-                  preview_removed++;
+                  kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++;
+                }
+              }
+            } else if (df_mode == 2) {
+              // --- SOR MODE ---
+              // Flatten all voxel points for KD-tree
+              std::vector<Eigen::Vector3f> all_pts;
+              std::vector<float> all_ints, all_rngs;
+              for (const auto& [key, entries] : voxels) {
+                for (const auto& e : entries) {
+                  all_pts.push_back(e.world_pos);
+                  all_ints.push_back(e.intensity);
+                  all_rngs.push_back(e.range);
+                }
+              }
+              // Build KD-tree for neighbor search using gtsam_points::KdTree (Vector4d)
+              std::vector<Eigen::Vector4d> pts4(all_pts.size());
+              for (size_t i = 0; i < all_pts.size(); i++) pts4[i] = Eigen::Vector4d(all_pts[i].x(), all_pts[i].y(), all_pts[i].z(), 1.0);
+              gtsam_points::KdTree kdt(pts4.data(), pts4.size());
+              const float r2 = sor_radius * sor_radius;
+
+              rf_status = "SOR: checking " + std::to_string(all_pts.size()) + " points...";
+              for (size_t i = 0; i < all_pts.size(); i++) {
+                // Count neighbors within radius
+                std::vector<size_t> k_indices(sor_min_neighbors + 1);
+                std::vector<double> k_sq_dists(sor_min_neighbors + 1);
+                const int found = kdt.knn_search(pts4[i].data(), sor_min_neighbors + 1, k_indices.data(), k_sq_dists.data());
+                // Check if the Nth nearest neighbor (excluding self) is within radius
+                int nn = 0;
+                for (int j = 0; j < found; j++) {
+                  if (k_indices[j] == i) continue;  // skip self
+                  if (k_sq_dists[j] <= static_cast<double>(r2)) nn++;
+                }
+                if (nn >= sor_min_neighbors) {
+                  kept_points.push_back(all_pts[i]); kept_intensities.push_back(all_ints[i]); kept_ranges.push_back(all_rngs[i]); preview_kept++;
+                } else {
+                  removed_points.push_back(all_pts[i]); removed_intensities.push_back(all_ints[i]); removed_ranges.push_back(all_rngs[i]); preview_removed++;
+                }
+              }
+            } else if (df_mode == 3) {
+              // --- SCALAR VISIBILITY MODE ---
+              // Split all points by the selected scalar field threshold
+              const std::string field_name = (sv_field_idx < static_cast<int>(aux_attribute_names.size()))
+                ? aux_attribute_names[sv_field_idx] : "ground";
+
+              for (const auto& [key, entries] : voxels) {
+                for (const auto& e : entries) {
+                  // Get scalar value — use aux attribute from the submap frame
+                  // For preview, we approximate using intensity/range/normal_z/ground_pw
+                  float scalar_val = 0.0f;
+                  if (field_name == "intensity") scalar_val = e.intensity;
+                  else if (field_name == "range") scalar_val = e.range;
+                  else if (field_name == "ground") scalar_val = ((df_exclude_ground && e.normal_z > df_ground_normal_z) || (df_exclude_ground_pw && e.ground_pw)) ? 1.0f : 0.0f;
+                  else scalar_val = e.range;  // fallback
+
+                  const bool below = scalar_val < sv_threshold;
+                  const bool hidden = (below && sv_hide_below) || (!below && sv_hide_above);
+                  if (!hidden) {
+                    kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++;
+                  } else {
+                    removed_points.push_back(e.world_pos); removed_intensities.push_back(e.intensity); removed_ranges.push_back(e.range); preview_removed++;
+                  }
                 }
               }
             }
@@ -991,19 +1594,23 @@ void OfflineViewer::setup_ui() {
             rf_preview_data.clear();
             rf_preview_data.reserve(preview_kept + preview_removed);
             for (size_t pi = 0; pi < kept_points.size(); pi++) {
-              rf_preview_data.push_back({kept_points[pi], kept_ranges[pi], kept_intensities[pi], true});
+              rf_preview_data.push_back({kept_points[pi], kept_ranges[pi], kept_intensities[pi], 0.0f, false, true});
             }
             for (size_t pi = 0; pi < removed_points.size(); pi++) {
-              rf_preview_data.push_back({removed_points[pi], removed_ranges[pi], removed_intensities[pi], false});
+              rf_preview_data.push_back({removed_points[pi], removed_ranges[pi], removed_intensities[pi], 0.0f, false, false});
             }
 
             auto kept_buf = std::make_shared<std::vector<Eigen::Vector3f>>(std::move(kept_points));
             auto kept_int = std::make_shared<std::vector<float>>(std::move(kept_intensities));
             auto removed_buf = std::make_shared<std::vector<Eigen::Vector3f>>(std::move(removed_points));
 
-            vw->invoke([this, kept_buf, kept_int, removed_buf, preview_kept, preview_removed] {
+            const bool hide_b = sv_hide_below && (df_mode == 3);
+            const bool hide_a = sv_hide_above && (df_mode == 3);
+            vw->invoke([this, kept_buf, kept_int, removed_buf, preview_kept, preview_removed, hide_b, hide_a] {
               auto viewer = guik::LightViewer::instance();
-              if (!kept_buf->empty()) {
+              // In scalar mode: "kept" = above threshold, "removed" = below threshold
+              // hide_above hides "kept", hide_below hides "removed"
+              if (!kept_buf->empty() && !hide_a) {
                 const int n = kept_buf->size();
                 std::vector<Eigen::Vector4d> pts4(n);
                 for (int i = 0; i < n; i++) pts4[i] = Eigen::Vector4d((*kept_buf)[i].x(), (*kept_buf)[i].y(), (*kept_buf)[i].z(), 1.0);
@@ -1013,13 +1620,17 @@ void OfflineViewer::setup_ui() {
                   cb->set_colormap_buffer("intensity");
                 }
                 viewer->update_drawable("rf_preview_kept", cb, guik::FlatColor(0.0f, 0.8f, 0.2f, 1.0f));
+              } else {
+                viewer->remove_drawable("rf_preview_kept");
               }
-              if (!removed_buf->empty()) {
+              if (!removed_buf->empty() && !hide_b) {
                 const int n = removed_buf->size();
                 std::vector<Eigen::Vector4d> pts4(n);
                 for (int i = 0; i < n; i++) pts4[i] = Eigen::Vector4d((*removed_buf)[i].x(), (*removed_buf)[i].y(), (*removed_buf)[i].z(), 1.0);
                 auto cb = std::make_shared<glk::PointCloudBuffer>(pts4.data(), n);
                 viewer->update_drawable("rf_preview_removed", cb, guik::FlatColor(1.0f, 0.0f, 0.0f, 0.5f).make_transparent());
+              } else {
+                viewer->remove_drawable("rf_preview_removed");
               }
             });
 
@@ -1035,6 +1646,342 @@ void OfflineViewer::setup_ui() {
         }
         if (ImGui::IsItemHovered()) {
           ImGui::SetTooltip("Cross-frame filter in view area (no disk writes).\nGreen = kept, Red = would be removed.\nVoxels span multiple frames to detect redundancy.");
+        }
+
+        if (df_mode == 1) {
+          ImGui::SameLine();
+          if (ImGui::Button("Process chunk")) {
+            rf_processing = true;
+            rf_preview_active = true;
+            lod_hide_all_submaps = true;
+            rf_intensity_mode = false;
+            rf_status = "Processing chunk with overlap...";
+            std::thread([this] {
+              if (!trajectory_built) build_trajectory();
+              auto vw = guik::LightViewer::instance();
+              const Eigen::Matrix4f vm = vw->view_matrix();
+              const Eigen::Vector3f cam_pos = source_finder_active ? source_finder_pos
+                : Eigen::Vector3f(-(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3)));
+
+              // Find nearest trajectory point to camera
+              double min_dist_traj = std::numeric_limits<double>::max();
+              double chunk_dist = 0.0;
+              for (const auto& tp : trajectory_data) {
+                const double d = (tp.pose.translation().cast<float>() - cam_pos).cast<double>().norm();
+                if (d < min_dist_traj) { min_dist_traj = d; chunk_dist = tp.cumulative_dist; }
+              }
+
+              // Build one chunk centered here with overlap
+              const double overlap = df_chunk_size * 0.5;
+              const double chunk_total = rf_chunk_size + 2.0 * overlap;
+              auto chunks = glim::build_chunks(trajectory_data, trajectory_total_dist, trajectory_total_dist + 1.0, chunk_total * 0.5);
+              // Override: build a single chunk at the found position
+              glim::Chunk chunk;
+              {
+                size_t idx = 0;
+                for (size_t k = 1; k < trajectory_data.size(); k++) {
+                  if (trajectory_data[k].cumulative_dist >= chunk_dist) { idx = k; break; }
+                }
+                const Eigen::Vector3d c = trajectory_data[idx].pose.translation();
+                const size_t next = std::min(idx + 1, trajectory_data.size() - 1);
+                Eigen::Vector3d fwd = trajectory_data[next].pose.translation() - trajectory_data[idx].pose.translation();
+                fwd.z() = 0.0;
+                if (fwd.norm() < 0.01) fwd = Eigen::Vector3d::UnitX(); else fwd.normalize();
+                const Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
+                const Eigen::Vector3d right = fwd.cross(up).normalized();
+                Eigen::Matrix3d R; R.col(0) = fwd; R.col(1) = right; R.col(2) = up;
+                chunk = {c, R, R.transpose(), chunk_total * 0.5, 50.0};
+              }
+              glim::Chunk core_chunk = chunk;
+              core_chunk.half_size = df_chunk_size * 0.5;
+
+              // Index all frames
+              rf_status = "Indexing frames...";
+              std::vector<glim::MapCleanerFilter::FrameData> all_mc_frames;
+              for (const auto& submap : submaps) {
+                if (!submap) continue;
+                if (hidden_sessions.count(submap->session_id)) continue;
+                std::string session_hd = hd_frames_path;
+                for (const auto& sess : sessions) {
+                  if (sess.id == submap->session_id && !sess.hd_frames_path.empty()) {
+                    session_hd = sess.hd_frames_path; break;
+                  }
+                }
+                const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
+                for (const auto& frame : submap->frames) {
+                  char dir_name[16];
+                  std::snprintf(dir_name, sizeof(dir_name), "%08ld", frame->id);
+                  const std::string frame_dir = session_hd + "/" + dir_name;
+                  auto fi = glim::frame_info_from_meta(frame_dir,
+                    glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T_odom0, frame->T_world_imu, frame->T_lidar_imu));
+                  if (fi.num_points > 0) {
+                    // Quick distance check
+                    if ((fi.T_world_lidar.translation().cast<float>() - chunk.center.cast<float>()).norm() < chunk_total + df_observation_range) {
+                      all_mc_frames.push_back({fi.dir, fi.T_world_lidar, fi.num_points});
+                    }
+                  }
+                }
+              }
+
+              // Load points within chunk
+              rf_status = "Loading chunk points...";
+              std::vector<Eigen::Vector3f> chunk_pts;
+              std::vector<float> chunk_ranges, chunk_intensities;
+              std::vector<bool> chunk_ground;
+              std::vector<float> chunk_normal_z;
+              std::vector<bool> chunk_ground_pw;
+              const auto chunk_aabb = chunk.world_aabb();
+
+              for (const auto& fd : all_mc_frames) {
+                std::vector<Eigen::Vector3f> pts;
+                std::vector<float> rng, ints(fd.num_points, 0.0f);
+                if (!glim::load_bin(fd.dir + "/points.bin", pts, fd.num_points)) continue;
+                if (!glim::load_bin(fd.dir + "/range.bin", rng, fd.num_points)) continue;
+                glim::load_bin(fd.dir + "/intensities.bin", ints, fd.num_points);
+                std::vector<Eigen::Vector3f> nrm(fd.num_points, Eigen::Vector3f::Zero());
+                if (df_exclude_ground || df_exclude_ground_pw) glim::load_bin(fd.dir + "/normals.bin", nrm, fd.num_points);
+                std::vector<bool> pw_gnd;
+                if (df_exclude_ground_pw) {
+                  auto cache_it = pw_ground_cache.find(fd.dir);
+                  if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == fd.num_points) {
+                    pw_gnd = cache_it->second;
+                  } else {
+                    pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, fd.num_points, 1.7f, ints);
+                    pw_ground_cache[fd.dir] = pw_gnd;
+                  }
+                }
+
+                const Eigen::Matrix3f R = fd.T_world_lidar.rotation().cast<float>();
+                const Eigen::Vector3f t = fd.T_world_lidar.translation().cast<float>();
+                for (int i = 0; i < fd.num_points; i++) {
+                  if (rng[i] < 1.5f) continue;
+                  const Eigen::Vector3f wp = R * pts[i] + t;
+                  if (!chunk.contains(wp)) continue;
+                  chunk_pts.push_back(wp);
+                  chunk_ranges.push_back(rng[i]);
+                  chunk_intensities.push_back(ints[i]);
+                  const Eigen::Vector3f wn = (R * nrm[i]).normalized();
+                  const float nz = std::abs(wn.z());
+                  const bool gpw = !pw_gnd.empty() && pw_gnd[i];
+                  chunk_normal_z.push_back(nz);
+                  chunk_ground_pw.push_back(gpw);
+                  chunk_ground.push_back((df_exclude_ground && nz > df_ground_normal_z) || (df_exclude_ground_pw && gpw));
+                }
+              }
+
+              // Pre-MapCleaner ground refinement: revoke false ground labels
+              if (df_refine_ground && (df_exclude_ground || df_exclude_ground_pw)) {
+                const float col_res = 1.0f, col_inv = 1.0f / col_res, ground_z_tol = 0.5f;
+                // Find min Z per XY column
+                std::unordered_map<uint64_t, float> col_min_z;
+                for (size_t i = 0; i < chunk_pts.size(); i++) {
+                  const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].x() * col_inv)) + 1048576) << 21)
+                                    | static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].y() * col_inv)) + 1048576);
+                  auto it = col_min_z.find(ck);
+                  if (it == col_min_z.end() || chunk_pts[i].z() < it->second) col_min_z[ck] = chunk_pts[i].z();
+                }
+                // Revoke ground for points above column min + tolerance
+                int revoked = 0;
+                for (size_t i = 0; i < chunk_pts.size(); i++) {
+                  if (!chunk_ground[i]) continue;
+                  const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].x() * col_inv)) + 1048576) << 21)
+                                    | static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].y() * col_inv)) + 1048576);
+                  if (chunk_pts[i].z() > col_min_z[ck] + ground_z_tol) {
+                    chunk_ground[i] = false;  // revoke for MapCleaner voting only
+                    // DO NOT clear chunk_normal_z or chunk_ground_pw — gap-fill needs them for protection
+                    revoked++;
+                  }
+                }
+                // Also revoke ground for high-intensity points (reflective plates, signs)
+                if (!chunk_intensities.empty()) {
+                  // Compute intensity percentile for ground points
+                  std::vector<float> gnd_ints;
+                  for (size_t i = 0; i < chunk_pts.size(); i++) {
+                    if (chunk_ground[i]) gnd_ints.push_back(chunk_intensities[i]);
+                  }
+                  if (!gnd_ints.empty()) {
+                    std::sort(gnd_ints.begin(), gnd_ints.end());
+                    const float int_p95 = gnd_ints[static_cast<size_t>(gnd_ints.size() * 0.95)];
+                    const float int_threshold = int_p95 * 2.0f;  // points with 2x the 95th percentile ground intensity = not ground
+                    int int_revoked = 0;
+                    for (size_t i = 0; i < chunk_pts.size(); i++) {
+                      if (!chunk_ground[i]) continue;
+                      if (chunk_intensities[i] > int_threshold) {
+                        chunk_ground[i] = false;  // revoke for MapCleaner only
+                        int_revoked++;
+                      }
+                    }
+                    if (int_revoked > 0) logger->info("[Refine] Revoked {} ground by intensity (threshold={:.0f})", int_revoked, int_threshold);
+                  }
+                }
+                if (revoked > 0) logger->info("[Refine] Revoked {} ground by Z column", revoked);
+              }
+
+              rf_status = "Running MapCleaner (" + std::to_string(chunk_pts.size()) + " pts, " + std::to_string(all_mc_frames.size()) + " frames)...";
+              glim::MapCleanerFilter::Params mc_params;
+              mc_params.range_threshold = df_range_threshold;
+              mc_params.lidar_range = df_observation_range;
+              mc_params.voxel_size = df_voxel_size;
+              mc_params.frame_skip = (all_mc_frames.size() > 200) ? static_cast<int>(all_mc_frames.size() / 200) : 0;
+              mc_params.exclude_ground = df_exclude_ground;
+              mc_params.ground_normal_z = df_ground_normal_z;
+              mc_params.exclude_ground_pw = df_exclude_ground_pw;
+
+              glim::MapCleanerFilter filter(mc_params);
+              auto result = filter.compute(all_mc_frames, chunk_pts, chunk_ranges, chunk_ground);
+              logger->info("[Dynamic chunk] {} static, {} dynamic", result.num_static, result.num_dynamic);
+
+              // Render result as preview (only core area)
+              std::vector<Eigen::Vector3f> kept_points, removed_points;
+              std::vector<float> kept_ints, removed_ints, kept_ranges, removed_ranges;
+              rf_preview_data.clear();
+              for (size_t i = 0; i < chunk_pts.size(); i++) {
+                if (!core_chunk.contains(chunk_pts[i])) continue;  // only show core area
+                const float nz = (i < static_cast<int>(chunk_normal_z.size())) ? chunk_normal_z[i] : 0.0f;
+                const bool gpw = (i < static_cast<int>(chunk_ground_pw.size())) && chunk_ground_pw[i];
+                if (result.is_dynamic[i]) {
+                  removed_points.push_back(chunk_pts[i]);
+                  removed_ints.push_back(chunk_intensities[i]);
+                  removed_ranges.push_back(chunk_ranges[i]);
+                  rf_preview_data.push_back({chunk_pts[i], chunk_ranges[i], chunk_intensities[i], nz, gpw, false});
+                } else {
+                  kept_points.push_back(chunk_pts[i]);
+                  kept_ints.push_back(chunk_intensities[i]);
+                  kept_ranges.push_back(chunk_ranges[i]);
+                  rf_preview_data.push_back({chunk_pts[i], chunk_ranges[i], chunk_intensities[i], nz, gpw, true});
+                }
+              }
+
+              // (Ground Z refinement already applied before MapCleaner)
+
+              // Trail clustering refinement
+              if (df_refine_trails) {
+                const float rv = df_refine_voxel, inv_rv = 1.0f / rv, voxel_vol = rv * rv * rv;
+                std::unordered_map<uint64_t, std::vector<int>> cand_vox, all_vox;
+                for (int i = 0; i < static_cast<int>(rf_preview_data.size()); i++) {
+                  const auto& pp = rf_preview_data[i];
+                  const uint64_t k = glim::voxel_key(pp.pos, inv_rv);
+                  all_vox[k].push_back(i);
+                  // Only add as candidate if NOT ground (ground should never be a trail candidate)
+                  if (!pp.kept) {
+                    const bool is_gnd = (df_exclude_ground && pp.normal_z > df_ground_normal_z) || (df_exclude_ground_pw && pp.ground_pw);
+                    if (!is_gnd) cand_vox[k].push_back(i);
+                    else { rf_preview_data[i].kept = true; }  // force ground back to kept
+                  }
+                }
+                // BFS clustering
+                std::unordered_map<uint64_t, int> vox_cluster;
+                std::vector<std::vector<uint64_t>> clusters;
+                int nc = 0;
+                for (const auto& [k, _] : cand_vox) {
+                  if (vox_cluster.count(k)) continue;
+                  std::vector<uint64_t> ck; std::queue<uint64_t> q;
+                  q.push(k); vox_cluster[k] = nc;
+                  while (!q.empty()) {
+                    const uint64_t c = q.front(); q.pop(); ck.push_back(c);
+                    const int cx = static_cast<int>((c >> 42) & 0x1FFFFF) - 1048576;
+                    const int cy = static_cast<int>((c >> 21) & 0x1FFFFF) - 1048576;
+                    const int cz = static_cast<int>(c & 0x1FFFFF) - 1048576;
+                    for (int dz=-1;dz<=1;dz++) for (int dy=-1;dy<=1;dy++) for (int dx=-1;dx<=1;dx++) {
+                      if (!dx && !dy && !dz) continue;
+                      const uint64_t nk = glim::voxel_key(cx+dx, cy+dy, cz+dz);
+                      if (cand_vox.count(nk) && !vox_cluster.count(nk)) { vox_cluster[nk] = nc; q.push(nk); }
+                    }
+                  }
+                  clusters.push_back(std::move(ck)); nc++;
+                }
+                // Evaluate clusters
+                std::unordered_set<uint64_t> trail_voxels;
+                for (int ci = 0; ci < nc; ci++) {
+                  Eigen::Vector3f bmin = Eigen::Vector3f::Constant(1e9f), bmax = Eigen::Vector3f::Constant(-1e9f);
+                  int tp = 0;
+                  for (const auto& vk : clusters[ci]) {
+                    auto it = cand_vox.find(vk);
+                    if (it == cand_vox.end()) continue;
+                    for (int idx : it->second) { bmin = bmin.cwiseMin(rf_preview_data[idx].pos); bmax = bmax.cwiseMax(rf_preview_data[idx].pos); tp++; }
+                  }
+                  const Eigen::Vector3f ext = bmax - bmin;
+                  const float longest = ext.maxCoeff(), shortest = std::max(0.01f, ext.minCoeff());
+                  const float density = tp / std::max(0.001f, static_cast<float>(clusters[ci].size()) * voxel_vol);
+                  if (longest >= df_trail_min_length && longest/shortest >= df_trail_min_aspect && density >= df_trail_min_density) {
+                    for (const auto& vk : clusters[ci]) trail_voxels.insert(vk);
+                    logger->info("[Refine] Trail: {:.1f}x{:.1f}x{:.1f}m, density={:.0f}, {} pts", ext.x(), ext.y(), ext.z(), density, tp);
+                  }
+                }
+                // Reject non-trail candidates, fill gaps (excluding ground)
+                int rejected = 0, filled = 0;
+                for (const auto& [vk, indices] : cand_vox) {
+                  if (!trail_voxels.count(vk)) { for (int idx : indices) { rf_preview_data[idx].kept = true; rejected++; } }
+                }
+                // Gap fill: only fill kept points that are ABOVE the trail's dynamic points in the same voxel
+                // This prevents road surface below the trail from being swept up
+                for (const auto& vk : trail_voxels) {
+                  // Find the Z range of existing dynamic points in this voxel
+                  auto cit = cand_vox.find(vk);
+                  if (cit == cand_vox.end()) continue;
+                  float trail_min_z = std::numeric_limits<float>::max();
+                  float trail_max_z = std::numeric_limits<float>::lowest();
+                  for (int idx : cit->second) {
+                    trail_min_z = std::min(trail_min_z, rf_preview_data[idx].pos.z());
+                    trail_max_z = std::max(trail_max_z, rf_preview_data[idx].pos.z());
+                  }
+                  // Only fill kept points within the trail's Z range (not below)
+                  auto ait = all_vox.find(vk);
+                  if (ait == all_vox.end()) continue;
+                  for (int idx : ait->second) {
+                    if (!rf_preview_data[idx].kept) continue;
+                    const auto& pp = rf_preview_data[idx];
+                    // Skip ground
+                    if ((df_exclude_ground && pp.normal_z > df_ground_normal_z) || (df_exclude_ground_pw && pp.ground_pw)) continue;
+                    // Only fill if clearly above ground (at or above trail min Z)
+                    if (pp.pos.z() < trail_min_z) continue;
+                    rf_preview_data[idx].kept = false; filled++;
+                  }
+                }
+                logger->info("[Refine] {} rejected, {} gaps filled, {} trail voxels", rejected, filled, trail_voxels.size());
+              }
+
+              // Rebuild kept/removed from refined preview data
+              kept_points.clear(); removed_points.clear(); kept_ints.clear();
+              for (const auto& p : rf_preview_data) {
+                if (p.kept) { kept_points.push_back(p.pos); kept_ints.push_back(p.intensity); }
+                else removed_points.push_back(p.pos);
+              }
+
+              // Render (same pattern as regular preview — with intensity buffer)
+              auto kept_buf2 = std::make_shared<std::vector<Eigen::Vector3f>>(std::move(kept_points));
+              auto kept_int2 = std::make_shared<std::vector<float>>(std::move(kept_ints));
+              auto removed_buf2 = std::make_shared<std::vector<Eigen::Vector3f>>(std::move(removed_points));
+              vw->invoke([this, kept_buf2, kept_int2, removed_buf2] {
+                auto vw = guik::LightViewer::instance();
+                if (!kept_buf2->empty()) {
+                  const int n = kept_buf2->size();
+                  std::vector<Eigen::Vector4d> pts4(n);
+                  for (int i = 0; i < n; i++) pts4[i] = Eigen::Vector4d((*kept_buf2)[i].x(), (*kept_buf2)[i].y(), (*kept_buf2)[i].z(), 1.0);
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(pts4.data(), n);
+                  if (kept_int2->size() == static_cast<size_t>(n)) {
+                    cb->add_buffer("intensity", *kept_int2);
+                    cb->set_colormap_buffer("intensity");
+                  }
+                  vw->update_drawable("rf_preview_kept", cb, guik::FlatColor(0.0f, 0.8f, 0.2f, 1.0f));
+                }
+                if (!removed_buf2->empty()) {
+                  const int n = removed_buf2->size();
+                  std::vector<Eigen::Vector4d> pts4(n);
+                  for (int i = 0; i < n; i++) pts4[i] = Eigen::Vector4d((*removed_buf2)[i].x(), (*removed_buf2)[i].y(), (*removed_buf2)[i].z(), 1.0);
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(pts4.data(), n);
+                  vw->update_drawable("rf_preview_removed", cb, guik::FlatColor(1.0f, 0.0f, 0.0f, 0.5f).make_transparent());
+                }
+              });
+
+              char buf[256];
+              std::snprintf(buf, sizeof(buf), "Chunk: %zu kept, %zu dynamic, %zu total",
+                kept_points.size(), removed_points.size(), chunk_pts.size());
+              rf_status = buf;
+              rf_processing = false;
+            }).detach();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Process one chunk with full overlap at current position.\nShows exact apply-quality result for this area.");
         }
 
         ImGui::SameLine();
@@ -1079,7 +2026,6 @@ void OfflineViewer::setup_ui() {
           }
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle between flat green and intensity coloring\non the kept preview points.");
-
 
         ImGui::Separator();
 
@@ -1129,12 +2075,276 @@ void OfflineViewer::setup_ui() {
           }
         }
 
-        ImGui::SliderFloat("Chunk size (m)", &rf_chunk_size, 20.0f, 200.0f, "%.0f");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of each processing chunk (width x height).\nLarger = more cross-frame context but more memory.");
-        ImGui::SliderFloat("Chunk spacing (m)", &rf_chunk_spacing, 10.0f, 100.0f, "%.0f");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Distance between chunk centers along trajectory.\nSmaller = more overlap, better coverage.");
+        if (df_mode == 0) {
+          ImGui::SliderFloat("Chunk size (m)", &rf_chunk_size, 20.0f, 200.0f, "%.0f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of each processing chunk.");
+          ImGui::SliderFloat("Chunk spacing (m)", &rf_chunk_spacing, 10.0f, 100.0f, "%.0f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Distance between chunk centers.");
+        } else {
+          ImGui::SliderFloat("Chunk size (m)", &df_chunk_size, 40.0f, 500.0f, "%.0f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of each processing chunk.\nLarger = more trail context.");
+          ImGui::SliderFloat("Chunk spacing (m)", &df_chunk_spacing, 20.0f, 250.0f, "%.0f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Distance between chunk centers.");
+        }
 
-        if (ImGui::Button("Apply to HD frames (chunked)")) {
+        if (df_mode == 1 && ImGui::Button("Apply dynamic filter to HD")) {
+          rf_processing = true;
+          rf_status = "Starting dynamic filter...";
+          std::thread([this] {
+            if (!trajectory_built) build_trajectory();
+            const auto start_time = std::chrono::steady_clock::now();
+
+            // Build chunks along trajectory
+            const double overlap = df_chunk_size * 0.5;  // 50% overlap on each side
+            const double chunk_total = df_chunk_size + 2.0 * overlap;
+            auto chunks = glim::build_chunks(trajectory_data, trajectory_total_dist, df_chunk_spacing, chunk_total * 0.5);
+            logger->info("[Dynamic apply] {} chunks (size={:.0f}m + {:.0f}m overlap each side)", chunks.size(), df_chunk_size, overlap);
+
+            // Index ALL frames with metadata
+            rf_status = "Indexing HD frames...";
+            struct FrameEntry {
+              glim::MapCleanerFilter::FrameData fd;
+              Eigen::Vector3f sensor_pos;
+            };
+            std::vector<FrameEntry> all_frame_entries;
+            for (const auto& submap : submaps) {
+              if (!submap) continue;
+              if (hidden_sessions.count(submap->session_id)) continue;
+              std::string session_hd = hd_frames_path;
+              for (const auto& sess : sessions) {
+                if (sess.id == submap->session_id && !sess.hd_frames_path.empty()) {
+                  session_hd = sess.hd_frames_path; break;
+                }
+              }
+              const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
+              for (const auto& frame : submap->frames) {
+                char dir_name[16];
+                std::snprintf(dir_name, sizeof(dir_name), "%08ld", frame->id);
+                const std::string frame_dir = session_hd + "/" + dir_name;
+                auto fi = glim::frame_info_from_meta(frame_dir,
+                  glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T_odom0, frame->T_world_imu, frame->T_lidar_imu),
+                  submap->id, submap->session_id);
+                if (fi.num_points > 0) {
+                  all_frame_entries.push_back({{fi.dir, fi.T_world_lidar, fi.num_points}, fi.T_world_lidar.translation().cast<float>()});
+                }
+              }
+            }
+            logger->info("[Dynamic apply] {} total frames indexed", all_frame_entries.size());
+
+            // Accumulated removals across all chunks
+            std::unordered_map<std::string, std::unordered_set<int>> frame_removals;
+
+            // Process each chunk
+            glim::MapCleanerFilter::Params mc_params;
+            mc_params.range_threshold = df_range_threshold;
+            mc_params.lidar_range = df_observation_range;
+            mc_params.voxel_size = df_voxel_size;
+            mc_params.exclude_ground = df_exclude_ground;
+            mc_params.ground_normal_z = df_ground_normal_z;
+            mc_params.exclude_ground_pw = df_exclude_ground_pw;
+
+            for (size_t ci = 0; ci < chunks.size(); ci++) {
+              const auto& chunk = chunks[ci];
+              const auto chunk_aabb = chunk.world_aabb();
+
+              // Core area (for writing removals — no overlap)
+              glim::Chunk core_chunk = chunk;
+              core_chunk.half_size = df_chunk_size * 0.5;
+
+              char buf[256];
+              std::snprintf(buf, sizeof(buf), "Chunk %zu/%zu: loading...", ci + 1, chunks.size());
+              rf_status = buf;
+
+              // Find frames overlapping this chunk (including overlap area)
+              std::vector<glim::MapCleanerFilter::FrameData> chunk_mc_frames;
+              for (const auto& fe : all_frame_entries) {
+                // Quick distance check
+                if ((fe.sensor_pos - chunk.center.cast<float>()).norm() > chunk_total + mc_params.lidar_range) continue;
+                chunk_mc_frames.push_back(fe.fd);
+              }
+              if (chunk_mc_frames.empty()) continue;
+
+              // Auto frame skip for this chunk
+              mc_params.frame_skip = (chunk_mc_frames.size() > 200) ? static_cast<int>(chunk_mc_frames.size() / 200) : 0;
+
+              // Load points from chunk frames into world space
+              std::vector<Eigen::Vector3f> chunk_pts;
+              std::vector<float> chunk_ranges;
+              std::vector<bool> chunk_ground;
+              struct ChunkPtSource { int frame_idx; int point_idx; bool in_core; };
+              std::vector<ChunkPtSource> chunk_sources;
+
+              for (int fi = 0; fi < static_cast<int>(chunk_mc_frames.size()); fi++) {
+                const auto& fd = chunk_mc_frames[fi];
+                std::vector<Eigen::Vector3f> pts;
+                std::vector<float> rng, ints(fd.num_points, 0.0f);
+                if (!glim::load_bin(fd.dir + "/points.bin", pts, fd.num_points)) continue;
+                if (!glim::load_bin(fd.dir + "/range.bin", rng, fd.num_points)) continue;
+                glim::load_bin(fd.dir + "/intensities.bin", ints, fd.num_points);
+                std::vector<Eigen::Vector3f> nrm(fd.num_points, Eigen::Vector3f::Zero());
+                if (df_exclude_ground || df_exclude_ground_pw) glim::load_bin(fd.dir + "/normals.bin", nrm, fd.num_points);
+                // PatchWork++ ground classification (cached)
+                std::vector<bool> pw_gnd;
+                if (df_exclude_ground_pw) {
+                  auto cache_it = pw_ground_cache.find(fd.dir);
+                  if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == fd.num_points) {
+                    pw_gnd = cache_it->second;
+                  } else {
+                    pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, fd.num_points, 1.7f, ints);
+                    pw_ground_cache[fd.dir] = pw_gnd;
+                  }
+                }
+
+                const Eigen::Matrix3f R = fd.T_world_lidar.rotation().cast<float>();
+                const Eigen::Vector3f t = fd.T_world_lidar.translation().cast<float>();
+                for (int i = 0; i < fd.num_points; i++) {
+                  if (rng[i] < 1.5f) continue;
+                  const Eigen::Vector3f wp = R * pts[i] + t;
+                  if (!chunk.contains(wp)) continue;
+                  chunk_pts.push_back(wp);
+                  chunk_ranges.push_back(rng[i]);
+                  const Eigen::Vector3f wn = (R * nrm[i]).normalized();
+                  const bool gpw = !pw_gnd.empty() && pw_gnd[i];
+                  chunk_ground.push_back((df_exclude_ground && std::abs(wn.z()) > df_ground_normal_z) || (df_exclude_ground_pw && gpw));
+                  chunk_sources.push_back({fi, i, core_chunk.contains(wp)});
+                }
+              }
+
+              if (chunk_pts.empty()) continue;
+
+              // Pre-MapCleaner ground refinement (same as process chunk)
+              if (df_refine_ground && (df_exclude_ground || df_exclude_ground_pw)) {
+                const float col_res = 1.0f, col_inv = 1.0f / col_res, ground_z_tol = 0.5f;
+                std::unordered_map<uint64_t, float> col_min_z;
+                for (size_t i = 0; i < chunk_pts.size(); i++) {
+                  const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].x() * col_inv)) + 1048576) << 21)
+                                    | static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].y() * col_inv)) + 1048576);
+                  auto it = col_min_z.find(ck);
+                  if (it == col_min_z.end() || chunk_pts[i].z() < it->second) col_min_z[ck] = chunk_pts[i].z();
+                }
+                for (size_t i = 0; i < chunk_pts.size(); i++) {
+                  if (!chunk_ground[i]) continue;
+                  const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].x() * col_inv)) + 1048576) << 21)
+                                    | static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].y() * col_inv)) + 1048576);
+                  if (chunk_pts[i].z() > col_min_z[ck] + ground_z_tol) {
+                    chunk_ground[i] = false;
+                  }
+                }
+              }
+
+              std::snprintf(buf, sizeof(buf), "Chunk %zu/%zu: MapCleaner (%zu pts, %zu frames)...",
+                ci + 1, chunks.size(), chunk_pts.size(), chunk_mc_frames.size());
+              rf_status = buf;
+
+              // Run MapCleaner on this chunk
+              glim::MapCleanerFilter filter(mc_params);
+              auto result = filter.compute(chunk_mc_frames, chunk_pts, chunk_ranges, chunk_ground);
+
+              // Only mark removals for points in the CORE area, NEVER ground
+              for (size_t i = 0; i < chunk_pts.size(); i++) {
+                if (result.is_dynamic[i] && chunk_sources[i].in_core && !chunk_ground[i]) {
+                  const auto& fd = chunk_mc_frames[chunk_sources[i].frame_idx];
+                  frame_removals[fd.dir].insert(chunk_sources[i].point_idx);
+                }
+              }
+
+              logger->info("[Dynamic apply] Chunk {}/{}: {} dynamic in core area",
+                ci + 1, chunks.size(), result.num_dynamic);
+            }
+
+            // Write filtered frames — with final ground safety check
+            rf_status = "Writing filtered frames (ground safety check)...";
+            size_t total_removed = 0, total_kept = 0, ground_saved = 0;
+            int frames_modified = 0;
+            for (auto& [frame_dir, remove_set] : frame_removals) {
+              const std::string meta_path = frame_dir + "/frame_meta.json";
+              std::ifstream meta_ifs(meta_path);
+              const auto meta = nlohmann::json::parse(meta_ifs, nullptr, false);
+              meta_ifs.close();
+              if (meta.is_discarded()) continue;
+              const int num_pts = meta.value("num_points", 0);
+              if (num_pts == 0) continue;
+
+              // FINAL SAFETY: load normals + run PatchWork++ to protect ground
+              if (df_exclude_ground || df_exclude_ground_pw) {
+                std::vector<Eigen::Vector3f> pts, nrm;
+                std::vector<float> ints;
+                glim::load_bin(frame_dir + "/points.bin", pts, num_pts);
+                glim::load_bin(frame_dir + "/normals.bin", nrm, num_pts);
+                glim::load_bin(frame_dir + "/intensities.bin", ints, num_pts);
+
+                std::vector<bool> is_ground(num_pts, false);
+                if (df_exclude_ground_pw && !pts.empty()) {
+                  auto cache_it = pw_ground_cache.find(frame_dir);
+                  if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == num_pts) {
+                    is_ground = cache_it->second;
+                  } else {
+                    is_ground = glim::MapCleanerFilter::classify_ground_patchwork(pts, num_pts, 1.7f, ints);
+                  }
+                } else if (df_exclude_ground) {
+                  // Use normals — but we need world-frame normals, and we don't have the pose here
+                  // Approximate: check raw normal Z (sensor frame) — ground in sensor frame also has high |Z|
+                  for (int i = 0; i < num_pts && i < static_cast<int>(nrm.size()); i++) {
+                    if (std::abs(nrm[i].z()) > df_ground_normal_z) is_ground[i] = true;
+                  }
+                }
+
+                // Remove ground points from removal set
+                size_t before = remove_set.size();
+                for (int i = 0; i < num_pts; i++) {
+                  if (is_ground[i]) remove_set.erase(i);
+                }
+                ground_saved += before - remove_set.size();
+              }
+
+              if (remove_set.empty()) continue;
+
+              std::vector<int> kept_indices;
+              kept_indices.reserve(num_pts - remove_set.size());
+              for (int i = 0; i < num_pts; i++) {
+                if (!remove_set.count(i)) kept_indices.push_back(i);
+              }
+              const int new_count = static_cast<int>(kept_indices.size());
+              total_removed += remove_set.size();
+              total_kept += new_count;
+
+              glim::filter_bin_file(frame_dir + "/points.bin", sizeof(Eigen::Vector3f), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/normals.bin", sizeof(Eigen::Vector3f), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/intensities.bin", sizeof(float), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), num_pts, kept_indices, new_count);
+
+              {
+                std::ofstream ofs(meta_path);
+                ofs << std::setprecision(15) << std::fixed;
+                ofs << "{\n";
+                ofs << "  \"frame_id\": " << meta.value("frame_id", 0) << ",\n";
+                ofs << "  \"stamp\": " << meta.value("stamp", 0.0) << ",\n";
+                ofs << "  \"scan_end_time\": " << meta.value("scan_end_time", 0.0) << ",\n";
+                ofs << "  \"num_points\": " << new_count << ",\n";
+                if (meta.contains("T_world_lidar")) ofs << "  \"T_world_lidar\": " << meta["T_world_lidar"].dump() << ",\n";
+                if (meta.contains("bbox_world_min")) ofs << "  \"bbox_world_min\": " << meta["bbox_world_min"].dump() << ",\n";
+                if (meta.contains("bbox_world_max")) ofs << "  \"bbox_world_max\": " << meta["bbox_world_max"].dump() << "\n";
+                ofs << "}\n";
+              }
+              frames_modified++;
+            }
+
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+            char final_buf[256];
+            std::snprintf(final_buf, sizeof(final_buf), "Done: %zu removed, %zu kept, %zu ground saved, %d frames (%.1f sec)",
+              total_removed, total_kept, ground_saved, frames_modified, elapsed);
+            rf_status = final_buf;
+            logger->info("[Dynamic apply] {}", rf_status);
+            rf_processing = false;
+          }).detach();
+        }
+        if (df_mode == 1 && ImGui::IsItemHovered()) {
+          ImGui::SetTooltip("DESTRUCTIVE: runs MapCleaner chunk-by-chunk along trajectory.\nBackup first with Tools > Utils > Backup HD frames.");
+        }
+
+        if (df_mode == 0 && ImGui::Button("Apply to HD frames (chunked)")) {
           rf_processing = true;
           rf_status = "Building trajectory...";
           std::thread([this] {
@@ -1142,47 +2352,11 @@ void OfflineViewer::setup_ui() {
             const auto start_time = std::chrono::steady_clock::now();
 
             // Step 1: Place path-aligned chunk centers along trajectory
-            struct Chunk {
-              Eigen::Vector3d center;
-              Eigen::Matrix3d R_world_chunk;  // chunk-local to world rotation
-              Eigen::Matrix3d R_chunk_world;  // world to chunk-local rotation
-              double half_size;
-              double half_height;
-            };
-            std::vector<Chunk> chunks;
-            const double hs = rf_chunk_size * 0.5;
-            const double hh = 50.0;  // ±50m height (only occupies voxels where points exist)
-            for (double d = 0.0; d < trajectory_total_dist; d += rf_chunk_spacing) {
-              size_t idx = 0;
-              for (size_t k = 1; k < trajectory_data.size(); k++) {
-                if (trajectory_data[k].cumulative_dist >= d) { idx = k; break; }
-              }
-              const Eigen::Vector3d c = trajectory_data[idx].pose.translation();
-              // Get heading from trajectory tangent
-              const size_t next = std::min(idx + 1, trajectory_data.size() - 1);
-              Eigen::Vector3d fwd = trajectory_data[next].pose.translation() - trajectory_data[idx].pose.translation();
-              fwd.z() = 0.0;  // project to XY plane
-              if (fwd.norm() < 0.01) fwd = Eigen::Vector3d::UnitX();
-              else fwd.normalize();
-              // Build local frame: forward, right, up
-              const Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
-              const Eigen::Vector3d right = fwd.cross(up).normalized();
-              Eigen::Matrix3d R;
-              R.col(0) = fwd;    // local X = forward along path
-              R.col(1) = right;  // local Y = right of path
-              R.col(2) = up;     // local Z = up
-              chunks.push_back({c, R, R.transpose(), hs, hh});
-            }
-            logger->info("[RangeFilter] {} chunks along {:.0f} m trajectory", chunks.size(), trajectory_total_dist);
+            auto chunks = glim::build_chunks(trajectory_data, trajectory_total_dist, rf_chunk_spacing, rf_chunk_size * 0.5);
+            logger->info("[DataFilter] {} chunks along {:.0f} m trajectory", chunks.size(), trajectory_total_dist);
 
-            // Step 2: Build frame index with world-space bounding boxes from frame_meta.json
-            struct FrameInfo {
-              std::string dir;
-              Eigen::Isometry3d T_world_lidar;
-              Eigen::AlignedBox3d world_bbox;  // from frame_meta.json, transformed by optimized pose
-              int num_points;
-            };
-            std::vector<FrameInfo> all_frames;
+            // Step 2: Build frame index with world-space bounding boxes
+            std::vector<glim::FrameInfo> all_frames;
             rf_status = "Indexing HD frames...";
             for (const auto& submap : submaps) {
               if (!submap) continue;
@@ -1193,53 +2367,18 @@ void OfflineViewer::setup_ui() {
                   session_hd = sess.hd_frames_path; break;
                 }
               }
-              const Eigen::Isometry3d T_ep = submap->T_world_origin * submap->T_origin_endpoint_L;
               const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
               for (const auto& frame : submap->frames) {
                 char dir_name[16];
                 std::snprintf(dir_name, sizeof(dir_name), "%08ld", frame->id);
                 const std::string frame_dir = session_hd + "/" + dir_name;
-                const std::string meta_path = frame_dir + "/frame_meta.json";
-                if (!boost::filesystem::exists(meta_path)) continue;
-
-                std::ifstream meta_ifs(meta_path);
-                const auto meta = nlohmann::json::parse(meta_ifs, nullptr, false);
-                if (meta.is_discarded()) continue;
-
-                const Eigen::Isometry3d T_w_imu = T_ep * T_odom0.inverse() * frame->T_world_imu;
-                const Eigen::Isometry3d T_w_lidar = T_w_imu * frame->T_lidar_imu.inverse();
-
-                // Compute world bbox from frame_meta's local bbox + optimized pose
-                Eigen::AlignedBox3d wbox;
-                if (meta.contains("bbox_world_min") && meta.contains("bbox_world_max")) {
-                  // bbox in frame_meta is from odometry pose — recompute with optimized pose
-                  const auto& bmin_j = meta["bbox_world_min"];
-                  const auto& bmax_j = meta["bbox_world_max"];
-                  const Eigen::Vector3d local_min(bmin_j[0].get<double>() - meta["T_world_lidar"][3].get<double>(),
-                                                   bmin_j[1].get<double>() - meta["T_world_lidar"][7].get<double>(),
-                                                   bmin_j[2].get<double>() - meta["T_world_lidar"][11].get<double>());
-                  const Eigen::Vector3d local_max(bmax_j[0].get<double>() - meta["T_world_lidar"][3].get<double>(),
-                                                   bmax_j[1].get<double>() - meta["T_world_lidar"][7].get<double>(),
-                                                   bmax_j[2].get<double>() - meta["T_world_lidar"][11].get<double>());
-                  // Transform 8 corners by optimized pose
-                  for (int ci = 0; ci < 8; ci++) {
-                    Eigen::Vector3d corner(
-                      (ci & 1) ? local_max.x() : local_min.x(),
-                      (ci & 2) ? local_max.y() : local_min.y(),
-                      (ci & 4) ? local_max.z() : local_min.z());
-                    wbox.extend(T_w_lidar * corner);
-                  }
-                } else {
-                  // Fallback: sensor position ± 200m
-                  const Eigen::Vector3d pos = T_w_lidar.translation();
-                  wbox.extend(pos - Eigen::Vector3d::Constant(200.0));
-                  wbox.extend(pos + Eigen::Vector3d::Constant(200.0));
-                }
-
-                all_frames.push_back({frame_dir, T_w_lidar, wbox, meta.value("num_points", 0)});
+                const Eigen::Isometry3d T_w_lidar = glim::compute_frame_world_pose(
+                  submap->T_world_origin, submap->T_origin_endpoint_L, T_odom0, frame->T_world_imu, frame->T_lidar_imu);
+                auto fi = glim::frame_info_from_meta(frame_dir, T_w_lidar, submap->id, submap->session_id);
+                if (fi.num_points > 0) all_frames.push_back(std::move(fi));
               }
             }
-            logger->info("[RangeFilter] Indexed {} HD frames", all_frames.size());
+            logger->info("[DataFilter] Indexed {} HD frames", all_frames.size());
 
             // Step 3: Per-frame removal indices (accumulated across chunks)
             std::unordered_map<std::string, std::unordered_set<int>> frame_removals;  // frame_dir → set of point indices to remove
@@ -1260,52 +2399,35 @@ void OfflineViewer::setup_ui() {
                 std::string dir;
                 std::vector<Eigen::Vector3f> world_points;
                 std::vector<float> ranges;
-                std::vector<int> original_indices;  // index in the frame's points.bin
+                std::vector<float> gps_times;
+                std::vector<int> original_indices;
               };
               std::vector<ChunkFrameData> chunk_frames;
 
+              const auto chunk_aabb = chunk.world_aabb();
               for (const auto& fi : all_frames) {
                 if (fi.num_points == 0) continue;
-                // Bbox ∩ chunk test: check if frame's world bbox overlaps the chunk
-                // Transform chunk bounds to world-aligned AABB for fast box-box test
-                const Eigen::Vector3d chunk_world_half(chunk.half_size, chunk.half_size, chunk.half_height);
-                Eigen::AlignedBox3d chunk_aabb;
-                for (int ci = 0; ci < 8; ci++) {
-                  Eigen::Vector3d local(
-                    (ci & 1) ? chunk_world_half.x() : -chunk_world_half.x(),
-                    (ci & 2) ? chunk_world_half.y() : -chunk_world_half.y(),
-                    (ci & 4) ? chunk_world_half.z() : -chunk_world_half.z());
-                  chunk_aabb.extend(chunk.center + chunk.R_world_chunk * local);
-                }
                 if (!chunk_aabb.intersects(fi.world_bbox)) continue;
 
-                // Load frame point data
-                const int num_pts = fi.num_points;
-
-                std::vector<Eigen::Vector3f> pts(num_pts);
-                std::vector<float> range(num_pts);
-                { std::ifstream f(fi.dir + "/points.bin", std::ios::binary);
-                  if (!f) continue;
-                  f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * num_pts); }
-                { std::ifstream f(fi.dir + "/range.bin", std::ios::binary);
-                  if (!f) continue;
-                  f.read(reinterpret_cast<char*>(range.data()), sizeof(float) * num_pts); }
+                std::vector<Eigen::Vector3f> pts;
+                std::vector<float> range;
+                if (!glim::load_bin(fi.dir + "/points.bin", pts, fi.num_points)) continue;
+                if (!glim::load_bin(fi.dir + "/range.bin", range, fi.num_points)) continue;
+                std::vector<float> ftimes(fi.num_points, 0.0f);
+                if (rf_criteria == 1) glim::load_bin(fi.dir + "/times.bin", ftimes, fi.num_points);
 
                 const Eigen::Matrix3f R = fi.T_world_lidar.rotation().cast<float>();
                 const Eigen::Vector3f t = fi.T_world_lidar.translation().cast<float>();
 
                 ChunkFrameData cfd;
                 cfd.dir = fi.dir;
-                for (int i = 0; i < num_pts; i++) {
+                for (int i = 0; i < fi.num_points; i++) {
                   if (range[i] < 1.5f) continue;
                   const Eigen::Vector3f wp = R * pts[i] + t;
-                  // Point-in-chunk test in chunk-local coordinates
-                  const Eigen::Vector3d local_pt = chunk.R_chunk_world * (wp.cast<double>() - chunk.center);
-                  if (std::abs(local_pt.x()) <= chunk.half_size &&
-                      std::abs(local_pt.y()) <= chunk.half_size &&
-                      std::abs(local_pt.z()) <= chunk.half_height) {
+                  if (chunk.contains(wp)) {
                     cfd.world_points.push_back(wp);
                     cfd.ranges.push_back(range[i]);
+                    cfd.gps_times.push_back(static_cast<float>(fi.stamp - gps_time_base) + ftimes[i]);
                     cfd.original_indices.push_back(i);
                   }
                 }
@@ -1313,52 +2435,60 @@ void OfflineViewer::setup_ui() {
               }
 
               // Build cross-frame voxel grid for this chunk
-              struct VoxelEntry { int cf_idx; int pt_idx; float range; };
+              struct VoxelEntry { int cf_idx; int pt_idx; float range; float gps_time; };
               std::unordered_map<uint64_t, std::vector<VoxelEntry>> voxels;
               for (int cfi = 0; cfi < static_cast<int>(chunk_frames.size()); cfi++) {
                 const auto& cf = chunk_frames[cfi];
                 for (int pi = 0; pi < static_cast<int>(cf.world_points.size()); pi++) {
-                  const auto& wp = cf.world_points[pi];
-                  const int vx = static_cast<int>(std::floor(wp.x() * inv_voxel));
-                  const int vy = static_cast<int>(std::floor(wp.y() * inv_voxel));
-                  const int vz = static_cast<int>(std::floor(wp.z() * inv_voxel));
-                  const uint64_t key = (static_cast<uint64_t>(vx + 1048576) << 42) |
-                                       (static_cast<uint64_t>(vy + 1048576) << 21) |
-                                       static_cast<uint64_t>(vz + 1048576);
-                  voxels[key].push_back({cfi, pi, cf.ranges[pi]});
+                  const uint64_t key = glim::voxel_key(cf.world_points[pi], inv_voxel);
+                  const float gt = (pi < static_cast<int>(cf.gps_times.size())) ? cf.gps_times[pi] : 0.0f;
+                  voxels[key].push_back({cfi, pi, cf.ranges[pi], gt});
                 }
               }
 
-              // Filter: cross-frame range discrimination
-              for (const auto& [key, entries] : voxels) {
-                float max_close_range = 0.0f;
-                int close_count = 0;
-                for (const auto& e : entries) {
-                  if (e.range <= rf_safe_range) {
-                    max_close_range = std::max(max_close_range, e.range);
-                    close_count++;
-                  }
-                }
-                if (close_count < rf_min_close_pts) {
-                  // No safe-range anchor — apply secondary (far) delta
-                  float min_range = std::numeric_limits<float>::max();
-                  for (const auto& e : entries) min_range = std::min(min_range, e.range);
-                  const float far_threshold = min_range + rf_far_delta;
+              // Filter: per-voxel discrimination
+              if (rf_criteria == 0) {
+                // Range criteria
+                for (const auto& [key, entries] : voxels) {
+                  float max_close_range = 0.0f;
+                  int close_count = 0;
                   for (const auto& e : entries) {
-                    if (e.range > far_threshold) {
-                      const auto& cf = chunk_frames[e.cf_idx];
-                      frame_removals[cf.dir].insert(cf.original_indices[e.pt_idx]);
-                    }
+                    if (e.range <= rf_safe_range) { max_close_range = std::max(max_close_range, e.range); close_count++; }
                   }
-                  continue;
+                  if (close_count < rf_min_close_pts) {
+                    float min_range = std::numeric_limits<float>::max();
+                    for (const auto& e : entries) min_range = std::min(min_range, e.range);
+                    const float far_threshold = min_range + rf_far_delta;
+                    for (const auto& e : entries) {
+                      if (e.range > far_threshold) { frame_removals[chunk_frames[e.cf_idx].dir].insert(chunk_frames[e.cf_idx].original_indices[e.pt_idx]); }
+                    }
+                    continue;
+                  }
+                  const float threshold = max_close_range + rf_range_delta;
+                  for (const auto& e : entries) {
+                    if (e.range <= rf_safe_range) continue;
+                    if (e.range > threshold) { frame_removals[chunk_frames[e.cf_idx].dir].insert(chunk_frames[e.cf_idx].original_indices[e.pt_idx]); }
+                  }
                 }
-                const float threshold = max_close_range + rf_range_delta;
-                for (const auto& e : entries) {
-                  if (e.range <= rf_safe_range) continue;
-                  if (e.range > threshold) {
-                    // Mark for removal
-                    const auto& cf = chunk_frames[e.cf_idx];
-                    frame_removals[cf.dir].insert(cf.original_indices[e.pt_idx]);
+              } else {
+                // GPS time criteria — keep dominant temporal cluster per voxel
+                const float time_gap = 5.0f;
+                for (const auto& [key, entries] : voxels) {
+                  if (entries.size() <= 1) continue;
+                  std::vector<int> si(entries.size()); std::iota(si.begin(), si.end(), 0);
+                  std::sort(si.begin(), si.end(), [&](int a, int b) { return entries[a].gps_time < entries[b].gps_time; });
+                  std::vector<std::vector<int>> clusters;
+                  clusters.push_back({si[0]});
+                  for (size_t i = 1; i < si.size(); i++) {
+                    if (entries[si[i]].gps_time - entries[si[i-1]].gps_time > time_gap) clusters.push_back({});
+                    clusters.back().push_back(si[i]);
+                  }
+                  if (clusters.size() <= 1) continue;
+                  int best = 0;
+                  for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) { if (clusters[ci].size() > clusters[best].size()) best = ci; }
+                  std::unordered_set<int> keep_set(clusters[best].begin(), clusters[best].end());
+                  for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
+                    if (!keep_set.count(ei)) { frame_removals[chunk_frames[entries[ei].cf_idx].dir].insert(chunk_frames[entries[ei].cf_idx].original_indices[entries[ei].pt_idx]); }
                   }
                 }
               }
@@ -1388,24 +2518,12 @@ void OfflineViewer::setup_ui() {
               total_kept += new_count;
 
               // Rewrite binary files
-              auto filter_file = [&](const std::string& filename, size_t elem_size) {
-                const std::string path = frame_dir + "/" + filename;
-                if (!boost::filesystem::exists(path)) return;
-                std::vector<char> src(num_pts * elem_size);
-                { std::ifstream f(path, std::ios::binary); f.read(src.data(), src.size()); }
-                std::vector<char> dst(new_count * elem_size);
-                for (int j = 0; j < new_count; j++) {
-                  std::memcpy(dst.data() + j * elem_size, src.data() + kept_indices[j] * elem_size, elem_size);
-                }
-                { std::ofstream f(path, std::ios::binary); f.write(dst.data(), dst.size()); }
-              };
-
-              filter_file("points.bin", sizeof(Eigen::Vector3f));
-              filter_file("normals.bin", sizeof(Eigen::Vector3f));
-              filter_file("intensities.bin", sizeof(float));
-              filter_file("times.bin", sizeof(float));
-              filter_file("range.bin", sizeof(float));
-              filter_file("rings.bin", sizeof(uint16_t));
+              glim::filter_bin_file(frame_dir + "/points.bin", sizeof(Eigen::Vector3f), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/normals.bin", sizeof(Eigen::Vector3f), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/intensities.bin", sizeof(float), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), num_pts, kept_indices, new_count);
 
               // Update frame_meta.json
               {
@@ -1446,11 +2564,146 @@ void OfflineViewer::setup_ui() {
             rf_status = buf;
             rf_processing = false;
             total_hd_points = total_kept;
-            logger->info("[RangeFilter] {}", rf_status);
+            logger->info("[DataFilter] {}", rf_status);
           }).detach();
         }
         if (ImGui::IsItemHovered()) {
-          ImGui::SetTooltip("DESTRUCTIVE: cross-frame filtering along trajectory.\nBackup first with Tools > Utils > Backup HD frames.");
+          ImGui::SetTooltip("DESTRUCTIVE: applies range filter along the\nfull trajectory. Backup first with Tools > Utils > Backup HD frames.");
+        }
+
+        if (df_mode == 2 && ImGui::Button("Apply SOR to HD frames")) {
+          rf_processing = true;
+          rf_status = "Starting SOR filter...";
+          std::thread([this] {
+            const auto start_time = std::chrono::steady_clock::now();
+
+            // Index all frames with bboxes
+            rf_status = "Indexing frames...";
+            std::vector<glim::FrameInfo> all_frames;
+            Eigen::AlignedBox3d global_bbox;
+            for (const auto& submap : submaps) {
+              if (!submap) continue;
+              if (hidden_sessions.count(submap->session_id)) continue;
+              std::string shd = hd_frames_path;
+              for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+              const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+              for (const auto& fr : submap->frames) {
+                char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                auto fi = glim::frame_info_from_meta(shd + "/" + dn,
+                  glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu));
+                if (fi.num_points > 0) {
+                  global_bbox.extend(fi.world_bbox);
+                  all_frames.push_back(std::move(fi));
+                }
+              }
+            }
+            logger->info("[SOR apply] {} frames, bbox [{:.0f},{:.0f},{:.0f}]-[{:.0f},{:.0f},{:.0f}]",
+              all_frames.size(), global_bbox.min().x(), global_bbox.min().y(), global_bbox.min().z(),
+              global_bbox.max().x(), global_bbox.max().y(), global_bbox.max().z());
+
+            // Build spatial grid (axis-aligned cubes)
+            const double cs = sor_chunk_size;
+            const Eigen::Vector3d gmin = global_bbox.min(), gmax = global_bbox.max();
+            const int nx = std::max(1, static_cast<int>(std::ceil((gmax.x() - gmin.x()) / cs)));
+            const int ny = std::max(1, static_cast<int>(std::ceil((gmax.y() - gmin.y()) / cs)));
+            const int total_chunks = nx * ny;
+            logger->info("[SOR apply] {} x {} = {} spatial chunks ({}m)", nx, ny, total_chunks, cs);
+
+            std::unordered_map<std::string, std::unordered_set<int>> frame_removals;
+            const float r2 = sor_radius * sor_radius;
+            int chunks_done = 0;
+
+            for (int iy = 0; iy < ny; iy++) {
+              for (int ix = 0; ix < nx; ix++) {
+                chunks_done++;
+                if (chunks_done % 5 == 0) {
+                  char buf[256]; std::snprintf(buf, sizeof(buf), "SOR chunk %d/%d...", chunks_done, total_chunks);
+                  rf_status = buf;
+                }
+
+                // Chunk AABB
+                Eigen::AlignedBox3d chunk_aabb;
+                chunk_aabb.min() = Eigen::Vector3d(gmin.x() + ix * cs, gmin.y() + iy * cs, gmin.z());
+                chunk_aabb.max() = Eigen::Vector3d(gmin.x() + (ix + 1) * cs, gmin.y() + (iy + 1) * cs, gmax.z());
+
+                // Load points
+                struct SorPt { Eigen::Vector3f wp; std::string dir; int orig_idx; };
+                std::vector<SorPt> pts;
+                for (const auto& fi : all_frames) {
+                  if (fi.num_points == 0 || !chunk_aabb.intersects(fi.world_bbox)) continue;
+                  std::vector<Eigen::Vector3f> fpts; std::vector<float> frng;
+                  if (!glim::load_bin(fi.dir + "/points.bin", fpts, fi.num_points)) continue;
+                  if (!glim::load_bin(fi.dir + "/range.bin", frng, fi.num_points)) continue;
+                  const Eigen::Matrix3f R = fi.T_world_lidar.rotation().cast<float>();
+                  const Eigen::Vector3f t = fi.T_world_lidar.translation().cast<float>();
+                  for (int i = 0; i < fi.num_points; i++) {
+                    if (frng[i] < 1.5f) continue;
+                    const Eigen::Vector3f wp = R * fpts[i] + t;
+                    if (wp.x() >= chunk_aabb.min().x() && wp.x() < chunk_aabb.max().x() &&
+                        wp.y() >= chunk_aabb.min().y() && wp.y() < chunk_aabb.max().y()) {
+                      pts.push_back({wp, fi.dir, i});
+                    }
+                  }
+                }
+                if (pts.empty()) continue;
+
+                // KD-tree + SOR
+                std::vector<Eigen::Vector4d> pts4(pts.size());
+                for (size_t i = 0; i < pts.size(); i++) pts4[i] = Eigen::Vector4d(pts[i].wp.x(), pts[i].wp.y(), pts[i].wp.z(), 1.0);
+                gtsam_points::KdTree kdt(pts4.data(), pts4.size());
+                for (size_t i = 0; i < pts.size(); i++) {
+                  std::vector<size_t> ki(sor_min_neighbors + 1);
+                  std::vector<double> kd(sor_min_neighbors + 1);
+                  kdt.knn_search(pts4[i].data(), sor_min_neighbors + 1, ki.data(), kd.data());
+                  int nn = 0;
+                  for (int j = 0; j < sor_min_neighbors + 1; j++) {
+                    if (ki[j] == i) continue;
+                    if (kd[j] <= static_cast<double>(r2)) nn++;
+                  }
+                  if (nn < sor_min_neighbors) {
+                    frame_removals[pts[i].dir].insert(pts[i].orig_idx);
+                  }
+                }
+              }
+            }
+
+            // Write
+            rf_status = "Writing filtered frames...";
+            size_t total_removed = 0; int frames_modified = 0;
+            for (const auto& [frame_dir, remove_set] : frame_removals) {
+              const std::string mp = frame_dir + "/frame_meta.json";
+              std::ifstream mf(mp); auto meta = nlohmann::json::parse(mf, nullptr, false); mf.close();
+              if (meta.is_discarded()) continue;
+              const int np = meta.value("num_points", 0);
+              std::vector<int> kept; kept.reserve(np);
+              for (int i = 0; i < np; i++) { if (!remove_set.count(i)) kept.push_back(i); }
+              const int nc = static_cast<int>(kept.size());
+              total_removed += remove_set.size();
+              glim::filter_bin_file(frame_dir + "/points.bin", sizeof(Eigen::Vector3f), np, kept, nc);
+              glim::filter_bin_file(frame_dir + "/normals.bin", sizeof(Eigen::Vector3f), np, kept, nc);
+              glim::filter_bin_file(frame_dir + "/intensities.bin", sizeof(float), np, kept, nc);
+              glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), np, kept, nc);
+              glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), np, kept, nc);
+              glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), np, kept, nc);
+              { std::ofstream ofs(mp); ofs << std::setprecision(15) << std::fixed;
+                ofs << "{\n  \"frame_id\": " << meta.value("frame_id", 0) << ",\n";
+                ofs << "  \"stamp\": " << meta.value("stamp", 0.0) << ",\n";
+                ofs << "  \"scan_end_time\": " << meta.value("scan_end_time", 0.0) << ",\n";
+                ofs << "  \"num_points\": " << nc << ",\n";
+                if (meta.contains("T_world_lidar")) ofs << "  \"T_world_lidar\": " << meta["T_world_lidar"].dump() << ",\n";
+                if (meta.contains("bbox_world_min")) ofs << "  \"bbox_world_min\": " << meta["bbox_world_min"].dump() << ",\n";
+                if (meta.contains("bbox_world_max")) ofs << "  \"bbox_world_max\": " << meta["bbox_world_max"].dump() << "\n";
+                ofs << "}\n"; }
+              frames_modified++;
+            }
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+            char fb[256]; std::snprintf(fb, sizeof(fb), "SOR done: %zu removed, %d frames (%.1f sec)", total_removed, frames_modified, elapsed);
+            rf_status = fb; logger->info("[SOR apply] {}", rf_status);
+            rf_processing = false;
+          }).detach();
+        }
+        if (df_mode == 2 && ImGui::IsItemHovered()) {
+          ImGui::SetTooltip("DESTRUCTIVE: removes outlier points from HD frames.\nUses spatial grid (no trajectory needed).\nBackup first.");
         }
       }
 
@@ -1848,8 +3101,8 @@ void OfflineViewer::main_menu() {
       if (ImGui::MenuItem("Memory Manager", nullptr, show_memory_manager)) {
         show_memory_manager = !show_memory_manager;
       }
-      if (ImGui::MenuItem("Range Filter", nullptr, show_range_filter)) {
-        show_range_filter = !show_range_filter;
+      if (ImGui::MenuItem("Data Filter", nullptr, show_data_filter)) {
+        show_data_filter = !show_data_filter;
       }
       if (ImGui::BeginMenu("Utils")) {
         const bool has_hd = hd_available && !hd_frames_path.empty();
@@ -3071,15 +4324,7 @@ std::pair<size_t, size_t> OfflineViewer::apply_range_filter_to_frame(const std::
   const float inv_voxel = 1.0f / rf_voxel_size;
   std::unordered_map<uint64_t, std::vector<int>> voxels;
   for (int i = 0; i < num_pts; i++) {
-    const auto& p = points[i];
-    const int vx = static_cast<int>(std::floor(p.x() * inv_voxel));
-    const int vy = static_cast<int>(std::floor(p.y() * inv_voxel));
-    const int vz = static_cast<int>(std::floor(p.z() * inv_voxel));
-    // Pack 3 ints into uint64 (21 bits each, handles ±1M voxels)
-    const uint64_t key = (static_cast<uint64_t>(vx + 1048576) << 42) |
-                         (static_cast<uint64_t>(vy + 1048576) << 21) |
-                         static_cast<uint64_t>(vz + 1048576);
-    voxels[key].push_back(i);
+    voxels[glim::voxel_key(points[i], inv_voxel)].push_back(i);
   }
 
   // Determine which points to keep
@@ -3127,26 +4372,13 @@ std::pair<size_t, size_t> OfflineViewer::apply_range_filter_to_frame(const std::
   }
   const int new_count = static_cast<int>(kept_indices.size());
 
-  // Helper: filter and rewrite a binary file
-  auto filter_file = [&](const std::string& filename, size_t elem_size) {
-    const std::string path = frame_dir + "/" + filename;
-    if (!boost::filesystem::exists(path)) return;
-    std::vector<char> src(num_pts * elem_size);
-    { std::ifstream f(path, std::ios::binary); f.read(src.data(), src.size()); }
-    std::vector<char> dst(new_count * elem_size);
-    for (int j = 0; j < new_count; j++) {
-      std::memcpy(dst.data() + j * elem_size, src.data() + kept_indices[j] * elem_size, elem_size);
-    }
-    { std::ofstream f(path, std::ios::binary); f.write(dst.data(), dst.size()); }
-  };
-
   // Rewrite all per-point binary files
-  filter_file("points.bin", sizeof(Eigen::Vector3f));    // 12 bytes
-  filter_file("normals.bin", sizeof(Eigen::Vector3f));   // 12 bytes
-  filter_file("intensities.bin", sizeof(float));          // 4 bytes
-  filter_file("times.bin", sizeof(float));                // 4 bytes
-  filter_file("range.bin", sizeof(float));                // 4 bytes
-  filter_file("rings.bin", sizeof(uint16_t));             // 2 bytes
+  glim::filter_bin_file(frame_dir + "/points.bin", sizeof(Eigen::Vector3f), num_pts, kept_indices, new_count);
+  glim::filter_bin_file(frame_dir + "/normals.bin", sizeof(Eigen::Vector3f), num_pts, kept_indices, new_count);
+  glim::filter_bin_file(frame_dir + "/intensities.bin", sizeof(float), num_pts, kept_indices, new_count);
+  glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), num_pts, kept_indices, new_count);
+  glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), num_pts, kept_indices, new_count);
+  glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), num_pts, kept_indices, new_count);
 
   // Update frame_meta.json with new point count
   {

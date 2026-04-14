@@ -168,6 +168,8 @@ if(BUILD_WITH_VIEWER)
     src/glim/viewer/interactive/manual_loop_close_modal.cpp
     src/glim/viewer/interactive/bundle_adjustment_modal.cpp
     src/glim/viewer/offline_viewer.cpp
+    src/glim/util/map_cleaner.cpp
+    src/glim/util/patchworkpp.cpp
   )
   target_link_libraries(interactive_viewer
     glim

@@ -138,10 +138,18 @@ private:
   float follow_smooth_pitch = 0.0f;
   bool follow_smooth_init = false;
 
-  // Range filter tool
-  bool show_range_filter = false;
-  float rf_voxel_size = 1.0f;        // metres
-  float rf_safe_range = 30.0f;      // metres — points within this always kept
+  // Data filter tool (range + dynamic modes)
+  bool show_data_filter = false;
+  int  df_mode = 0;                  // 0=Range, 1=Dynamic, 2=SOR, 3=Scalar
+
+  // Scalar visibility tool
+  int   sv_field_idx = 0;             // selected scalar field index
+  float sv_threshold = 0.5f;          // split threshold
+  bool  sv_hide_below = false;        // hide points below threshold
+  bool  sv_hide_above = false;        // hide points above threshold
+  int   rf_criteria = 0;              // 0=Range, 1=GPS Time
+  float rf_voxel_size = 1.0f;        // metres (range mode default)
+  float rf_safe_range = 30.0f;      // metres — points within this always kept (range mode)
   float rf_range_delta = 10.0f;     // metres — remove if >delta further than closest in voxel
   float rf_far_delta = 30.0f;       // metres — in voxels with no safe-range points, remove if > min_range + far_delta
   int   rf_min_close_pts = 3;       // min close points to trigger removal of distant ones
@@ -149,11 +157,38 @@ private:
   bool rf_preview_active = false;  // preview overlay is showing — hide other LOD data
   bool rf_intensity_mode = false;  // toggle intensity display on preview
 
+  // Dynamic filter params
+  float df_voxel_size = 0.64f;         // voxel size for dynamic mode (separate from rf_voxel_size)
+  float df_range_threshold = 0.8f;
+  float df_observation_range = 30.0f;
+  int   df_min_observations = 15;
+  bool  df_exclude_ground = false;
+  float df_ground_normal_z = 0.7f;
+  bool  df_exclude_ground_pw = true;
+  bool  show_pw_config = false;
+  bool  show_trail_config = false;
+  std::unordered_map<std::string, std::vector<bool>> pw_ground_cache;  // frame_dir → cached ground flags
+  float df_chunk_size = 120.0f;        // chunk size for dynamic filter (larger = more trail context)
+  float df_chunk_spacing = 60.0f;      // chunk spacing for dynamic filter
+  bool  df_refine_ground = true;       // refine ground labels using Z + intensity
+  bool  df_refine_trails = true;       // cluster candidates into trails, reject noise
+  float df_trail_min_length = 7.0f;
+  float df_trail_min_aspect = 9.0f;
+  float df_trail_min_density = 11.0f;
+  float df_refine_voxel = 0.48f;
+
+  // SOR filter params
+  float sor_radius = 0.3f;             // search radius (metres)
+  int   sor_min_neighbors = 5;         // minimum neighbors within radius to keep
+  float sor_chunk_size = 100.0f;       // spatial chunk size (metres, axis-aligned cube)
+
   // Cached preview data (kept in CPU memory for range highlight re-coloring)
   struct PreviewPoint {
     Eigen::Vector3f pos;
     float range;
     float intensity;
+    float normal_z;
+    bool ground_pw;
     bool kept;  // true = kept by filter, false = removed
   };
   std::vector<PreviewPoint> rf_preview_data;

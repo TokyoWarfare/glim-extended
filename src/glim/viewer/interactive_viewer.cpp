@@ -1,4 +1,5 @@
 #include <glim/viewer/interactive_viewer.hpp>
+#include <glim/util/post_processing.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -305,19 +306,8 @@ void InteractiveViewer::viewer_loop() {
       ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "%zu submaps found", source_finder_hits.size());
 
       // Group hits by sequence continuity
-      std::vector<std::vector<int>> teams;
-      if (!source_finder_hits.empty()) {
-        std::vector<int> sorted_ids(source_finder_hits.begin(), source_finder_hits.end());
-        std::sort(sorted_ids.begin(), sorted_ids.end());
-        teams.push_back({sorted_ids[0]});
-        for (size_t i = 1; i < sorted_ids.size(); i++) {
-          if (sorted_ids[i] - sorted_ids[i - 1] > 2) {
-            teams.push_back({});  // gap > 2 = new team
-          }
-          teams.back().push_back(sorted_ids[i]);
-        }
-        // Sort teams by size descending
-        std::sort(teams.begin(), teams.end(), [](const auto& a, const auto& b) { return a.size() > b.size(); });
+      auto teams = glim::group_by_continuity(source_finder_hits);
+      if (!teams.empty()) {
 
         // Apply swap: determine target/source indices
         const int tgt_idx = source_finder_teams_swapped ? 1 : 0;
@@ -1285,16 +1275,7 @@ void InteractiveViewer::source_finder_color_hits() {
     guik::LightViewer::instance()->remove_drawable("team_lines");
     return;
   }
-  // Group by sequence continuity
-  std::vector<int> sorted_ids(source_finder_hits.begin(), source_finder_hits.end());
-  std::sort(sorted_ids.begin(), sorted_ids.end());
-  std::vector<std::vector<int>> teams;
-  teams.push_back({sorted_ids[0]});
-  for (size_t i = 1; i < sorted_ids.size(); i++) {
-    if (sorted_ids[i] - sorted_ids[i - 1] > 2) teams.push_back({});
-    teams.back().push_back(sorted_ids[i]);
-  }
-  std::sort(teams.begin(), teams.end(), [](const auto& a, const auto& b) { return a.size() > b.size(); });
+  auto teams = glim::group_by_continuity(source_finder_hits);
 
   const int tgt_idx = source_finder_teams_swapped ? 1 : 0;
   const int src_idx = source_finder_teams_swapped ? 0 : 1;
