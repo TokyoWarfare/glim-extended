@@ -761,7 +761,7 @@ void OfflineViewer::setup_ui() {
   // PatchWork++ config window
   viewer->register_ui_callback("pw_config_window", [this] {
     if (!show_pw_config) return;
-    ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 500), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("PatchWork++ Config", &show_pw_config)) {
       auto& p = glim::MapCleanerFilter::getPatchWorkParams();
       ImGui::Checkbox("Use intensity (RNR)", &p.enable_RNR);
@@ -776,8 +776,10 @@ void OfflineViewer::setup_ui() {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Height of LiDAR sensor above ground.");
       float mr = static_cast<float>(p.max_range);
       if (ImGui::DragFloat("Max range (m)", &mr, 1.0f, 10.0f, 200.0f, "%.0f")) p.max_range = mr;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Points beyond this range are ignored.");
       float mnr = static_cast<float>(p.min_range);
       if (ImGui::DragFloat("Min range (m)", &mnr, 0.1f, 0.5f, 10.0f, "%.1f")) p.min_range = mnr;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Points closer than this range are ignored.");
       ImGui::Separator();
       float ts = static_cast<float>(p.th_seeds);
       if (ImGui::DragFloat("Seed threshold", &ts, 0.01f, 0.01f, 1.0f, "%.3f")) p.th_seeds = ts;
@@ -789,15 +791,489 @@ void OfflineViewer::setup_ui() {
       if (ImGui::DragFloat("Uprightness thr", &ut, 0.01f, 0.3f, 1.0f, "%.3f")) p.uprightness_thr = ut;
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("How upright the surface must be (0.707 = 45 deg).");
       ImGui::DragInt("Num iterations", &p.num_iter, 1, 1, 10);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ground plane fitting iterations per patch.");
       ImGui::DragInt("Num LPR", &p.num_lpr, 1, 5, 50);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max lowest points for seed selection.");
       ImGui::DragInt("Min points/patch", &p.num_min_pts, 1, 1, 50);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Min points to estimate ground in a patch.");
+      ImGui::Separator();
+      if (ImGui::Button("Reset defaults##pw")) {
+        p.enable_RNR = false;
+        p.enable_RVPF = true;
+        p.enable_TGR = true;
+        p.sensor_height = 1.723;
+        p.max_range = 80.0;
+        p.min_range = 2.0;
+        p.th_seeds = 0.125;
+        p.th_dist = 0.125;
+        p.uprightness_thr = 0.707;
+        p.num_iter = 3;
+        p.num_lpr = 20;
+        p.num_min_pts = 10;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Restore all PatchWork++ parameters to defaults.");
+      ImGui::Separator();
+      ImGui::Checkbox("Frame accumulation", &pw_accumulate);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Accumulate neighboring frames before running PatchWork++.\nGives much denser input for better ground classification.\nPoints from neighbors are transformed to current frame's sensor-local coords.");
+      if (pw_accumulate) {
+        ImGui::DragInt("Prior/next frames", &pw_accumulate_count, 1, 1, 50);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Number of neighboring frames to include.\nAt the start of the dataset, uses next frames instead.");
+      }
     }
     ImGui::End();
   });
 
   // Trail refinement config window
+  // Voxelize HD tool window
+  viewer->register_ui_callback("voxelize_tool", [this] {
+    if (!show_voxelize_tool) return;
+    ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Voxelize HD Data", &show_voxelize_tool)) {
+      ImGui::DragFloat("Voxel size (m)", &vox_size, 0.005f, 0.005f, 0.5f, "%.3f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of each voxel cell.\n0.01-0.03m for 3DGS, 0.05-0.10m for visualization.");
+      ImGui::Combo("Placement", &vox_mode, "Voxel center\0Weighted\0XY grid + Z weighted\0");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Voxel center: regular 3D grid (staircase on slopes).\nWeighted: centroid of points (smooth, irregular).\nXY grid + Z weighted: regular XY, smooth Z (best for 3DGS).");
+      vox_use_center = (vox_mode == 0);
+
+      // Ground-only mode: check if aux_ground.bin exists for at least one frame
+      bool has_ground_bin = false;
+      if (!hd_frames_path.empty()) {
+        // Quick check: test first frame dir that exists
+        for (const auto& submap : submaps) {
+          if (!submap || submap->frames.empty()) continue;
+          std::string shd = hd_frames_path;
+          for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+          char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", submap->frames.front()->id);
+          if (boost::filesystem::exists(shd + "/" + dn + "/aux_ground.bin")) { has_ground_bin = true; break; }
+        }
+      }
+      if (!has_ground_bin) {
+        ImGui::BeginDisabled();
+        vox_ground_only = false;
+      }
+      ImGui::Checkbox("Ground only (1 pt/XY)", &vox_ground_only);
+      if (!has_ground_bin) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Requires aux_ground.bin per frame.\nGenerate with Data Filter > Dynamic > Classify ground to scalar.");
+      } else {
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Keep only ground-classified points.\nOne point per XY column — removes ground noise.\nRequires aux_ground.bin from Dynamic filter.");
+      }
+      if (vox_ground_only) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(forces XY+Z weighted)");
+      }
+
+      ImGui::DragFloat("Chunk size (m)", &vox_chunk_size, 5.0f, 20.0f, 200.0f, "%.0f");
+      ImGui::DragFloat("Chunk spacing (m)", &vox_chunk_spacing, 5.0f, 10.0f, 100.0f, "%.0f");
+      ImGui::Separator();
+
+      if (vox_processing) {
+        ImGui::Text("%s", vox_status.c_str());
+      } else {
+        // Preview: voxelize one chunk at camera position
+        if (ImGui::Button("Preview")) {
+          vox_processing = true;
+          vox_status = "Loading...";
+          std::thread([this] {
+            auto vw = guik::LightViewer::instance();
+            const Eigen::Matrix4f vm = vw->view_matrix();
+            const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
+
+            if (!trajectory_built) build_trajectory();
+            // Find nearest trajectory point
+            double min_d = 1e9;
+            size_t best_idx = 0;
+            for (size_t k = 0; k < trajectory_data.size(); k++) {
+              const double d = (trajectory_data[k].pose.translation().cast<float>() - cam_pos).cast<double>().norm();
+              if (d < min_d) { min_d = d; best_idx = k; }
+            }
+            // Build one chunk
+            const Eigen::Vector3d c = trajectory_data[best_idx].pose.translation();
+            const size_t next = std::min(best_idx + 1, trajectory_data.size() - 1);
+            Eigen::Vector3d fwd = trajectory_data[next].pose.translation() - c;
+            fwd.z() = 0; if (fwd.norm() < 0.01) fwd = Eigen::Vector3d::UnitX(); else fwd.normalize();
+            const Eigen::Vector3d up = Eigen::Vector3d::UnitZ(), right = fwd.cross(up).normalized();
+            Eigen::Matrix3d R; R.col(0) = fwd; R.col(1) = right; R.col(2) = up;
+            glim::Chunk chunk{c, R, R.transpose(), vox_chunk_size * 0.5, 50.0};
+            const auto chunk_aabb = chunk.world_aabb();
+
+            // Load all frames overlapping chunk
+            vox_status = "Loading frames...";
+            const float inv_vox = 1.0f / vox_size;
+            std::unordered_map<uint64_t, std::vector<std::pair<Eigen::Vector3f, float>>> voxel_data;  // key → (pos, intensity)
+            int total_input = 0;
+
+            const bool ground_only = vox_ground_only;
+            for (const auto& submap : submaps) {
+              if (!submap) continue;
+              if (hidden_sessions.count(submap->session_id)) continue;
+              std::string shd = hd_frames_path;
+              for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+              const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+              for (const auto& fr : submap->frames) {
+                char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                const std::string fd = shd + "/" + dn;
+                auto fi = glim::frame_info_from_meta(fd,
+                  glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu));
+                if (fi.num_points == 0 || !chunk_aabb.intersects(fi.world_bbox)) continue;
+                std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints(fi.num_points, 0.0f);
+                if (!glim::load_bin(fd + "/points.bin", pts, fi.num_points)) continue;
+                glim::load_bin(fd + "/range.bin", rng, fi.num_points);
+                glim::load_bin(fd + "/intensities.bin", ints, fi.num_points);
+                // Load ground mask if ground-only mode
+                std::vector<float> ground;
+                if (ground_only) glim::load_bin(fd + "/aux_ground.bin", ground, fi.num_points);
+                const Eigen::Matrix3f Rf = fi.T_world_lidar.rotation().cast<float>();
+                const Eigen::Vector3f t = fi.T_world_lidar.translation().cast<float>();
+                for (int i = 0; i < fi.num_points; i++) {
+                  if (!rng.empty() && rng[i] < 1.5f) continue;
+                  if (ground_only && (ground.empty() || ground[i] < 0.5f)) continue;
+                  const Eigen::Vector3f wp = Rf * pts[i] + t;
+                  if (!chunk.contains(wp)) continue;
+                  // Ground-only: XY-only key (one point per column); normal: full 3D key
+                  const uint64_t key = ground_only ? glim::voxel_key(
+                    static_cast<int>(std::floor(wp.x() * inv_vox)),
+                    static_cast<int>(std::floor(wp.y() * inv_vox)), 0)
+                    : glim::voxel_key(wp, inv_vox);
+                  voxel_data[key].push_back({wp, ints[i]});
+                  total_input++;
+                }
+              }
+            }
+
+            logger->info("[Voxelize preview] {} input points → {} voxels (size={:.3f}m, ground_only={})", total_input, voxel_data.size(), vox_size, ground_only);
+            vox_status = "Voxelizing " + std::to_string(voxel_data.size()) + " voxels from " + std::to_string(total_input) + " points...";
+
+            // Build voxelized output
+            std::vector<Eigen::Vector3f> out_pts;
+            std::vector<float> out_ints;
+            for (const auto& [key, pts_in_voxel] : voxel_data) {
+              Eigen::Vector3f pos;
+              if (ground_only) {
+                // Ground-only: XY grid center + Z weighted (always, regardless of vox_mode)
+                const int vx = static_cast<int>((key >> 42) & 0x1FFFFF) - 1048576;
+                const int vy = static_cast<int>((key >> 21) & 0x1FFFFF) - 1048576;
+                float avg_z = 0.0f;
+                for (const auto& p : pts_in_voxel) avg_z += p.first.z();
+                avg_z /= static_cast<float>(pts_in_voxel.size());
+                pos = Eigen::Vector3f((vx + 0.5f) * vox_size, (vy + 0.5f) * vox_size, avg_z);
+              } else if (vox_mode == 0) {
+                // Full voxel center
+                const int vx = static_cast<int>((key >> 42) & 0x1FFFFF) - 1048576;
+                const int vy = static_cast<int>((key >> 21) & 0x1FFFFF) - 1048576;
+                const int vz = static_cast<int>(key & 0x1FFFFF) - 1048576;
+                pos = Eigen::Vector3f((vx + 0.5f) * vox_size, (vy + 0.5f) * vox_size, (vz + 0.5f) * vox_size);
+              } else if (vox_mode == 1) {
+                // Full weighted centroid
+                pos = Eigen::Vector3f::Zero();
+                for (const auto& p : pts_in_voxel) pos += p.first;
+                pos /= static_cast<float>(pts_in_voxel.size());
+              } else {
+                // XY grid center + Z weighted
+                const int vx = static_cast<int>((key >> 42) & 0x1FFFFF) - 1048576;
+                const int vy = static_cast<int>((key >> 21) & 0x1FFFFF) - 1048576;
+                float avg_z = 0.0f;
+                for (const auto& p : pts_in_voxel) avg_z += p.first.z();
+                avg_z /= static_cast<float>(pts_in_voxel.size());
+                pos = Eigen::Vector3f((vx + 0.5f) * vox_size, (vy + 0.5f) * vox_size, avg_z);
+              }
+              // Average intensity
+              float avg_int = 0.0f;
+              for (const auto& p : pts_in_voxel) avg_int += p.second;
+              avg_int /= static_cast<float>(pts_in_voxel.size());
+              out_pts.push_back(pos);
+              out_ints.push_back(avg_int);
+            }
+
+            // Render preview
+            vw->invoke([this, out_pts, out_ints] {
+              auto v = guik::LightViewer::instance();
+              lod_hide_all_submaps = true;
+              v->remove_drawable("rf_preview_kept");
+              v->remove_drawable("rf_preview_removed");
+              if (!out_pts.empty()) {
+                const int n = out_pts.size();
+                std::vector<Eigen::Vector4d> p4(n);
+                for (int i = 0; i < n; i++) p4[i] = Eigen::Vector4d(out_pts[i].x(), out_pts[i].y(), out_pts[i].z(), 1.0);
+                auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), n);
+                cb->add_buffer("intensity", out_ints);
+                cb->set_colormap_buffer("intensity");
+                v->update_drawable("rf_preview_kept", cb, guik::FlatColor(0.0f, 0.8f, 0.2f, 1.0f));
+              }
+            });
+
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "Preview: %zu voxels from %d input points (%.1fx reduction)",
+              out_pts.size(), total_input, total_input > 0 ? static_cast<double>(total_input) / out_pts.size() : 0.0);
+            vox_status = buf;
+            logger->info("[Voxelize] {}", vox_status);
+            vox_processing = false;
+          }).detach();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Preview voxelization at current camera position.\nShows one chunk of voxelized data.");
+
+        ImGui::SameLine();
+        if (ImGui::Button("Intensity##vox")) {
+          auto vw = guik::LightViewer::instance();
+          auto drawable = vw->find_drawable("rf_preview_kept");
+          if (drawable.first) {
+            static bool vox_intensity_mode = false;
+            vox_intensity_mode = !vox_intensity_mode;
+            if (vox_intensity_mode) {
+              drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+            } else {
+              drawable.first->set_color_mode(guik::ColorMode::FLAT_COLOR);
+            }
+          }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle intensity colormap on preview.");
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+          auto v = guik::LightViewer::instance();
+          v->remove_drawable("rf_preview_kept");
+          v->remove_drawable("rf_preview_removed");
+          lod_hide_all_submaps = false;
+          vox_status.clear();
+        }
+
+        ImGui::Separator();
+
+        // Apply to full dataset
+        if (ImGui::Button("Apply to all HD")) {
+          vox_processing = true;
+          vox_status = "Starting voxelization...";
+          std::thread([this] {
+            if (!trajectory_built) build_trajectory();
+            const auto start_time = std::chrono::steady_clock::now();
+            const bool ground_only = vox_ground_only;
+            auto chunks = glim::build_chunks(trajectory_data, trajectory_total_dist, vox_chunk_spacing, vox_chunk_size * 0.5);
+            logger->info("[Voxelize] {} chunks along {:.0f}m trajectory (ground_only={})", chunks.size(), trajectory_total_dist, ground_only);
+
+            // Index all frames
+            std::vector<glim::FrameInfo> all_frames;
+            for (const auto& submap : submaps) {
+              if (!submap) continue;
+              if (hidden_sessions.count(submap->session_id)) continue;
+              std::string shd = hd_frames_path;
+              for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+              const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+              for (const auto& fr : submap->frames) {
+                char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                auto fi = glim::frame_info_from_meta(shd + "/" + dn,
+                  glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu),
+                  submap->id, submap->session_id);
+                if (fi.num_points > 0) all_frames.push_back(std::move(fi));
+              }
+            }
+
+            // Create output directory
+            const std::string vox_dir = hd_frames_path + (ground_only ? "_ground" : "_voxelized");
+            boost::filesystem::create_directories(vox_dir);
+
+            // Per-frame output buffers: accumulate voxelized points assigned to each frame
+            struct FrameOutput {
+              std::vector<Eigen::Vector3f> points;
+              std::vector<float> intensities;
+              std::vector<float> ranges;
+            };
+            std::unordered_map<std::string, FrameOutput> frame_outputs;  // frame_dir → output
+            // Initialize empty outputs for all frames
+            for (const auto& fi : all_frames) frame_outputs[fi.dir] = {};
+
+            const float inv_vox = 1.0f / vox_size;
+            size_t total_voxels = 0;
+
+            // Frame cache: loaded world-space points per frame (sliding window)
+            struct CachedFrame {
+              std::vector<Eigen::Vector3f> world_pts;
+              std::vector<float> intensities;
+              std::vector<float> ranges;
+              std::string dir;
+            };
+            std::unordered_map<std::string, std::shared_ptr<CachedFrame>> frame_cache;
+
+            for (size_t ci = 0; ci < chunks.size(); ci++) {
+              const auto& chunk = chunks[ci];
+              const auto chunk_aabb = chunk.world_aabb();
+              glim::Chunk core = chunk;
+              core.half_size = vox_chunk_size * 0.5;
+
+              if (ci % 5 == 0) {
+                char buf[256]; std::snprintf(buf, sizeof(buf), "Chunk %zu/%zu (cache: %zu frames)...", ci + 1, chunks.size(), frame_cache.size());
+                vox_status = buf;
+              }
+
+              // Determine which frames overlap this chunk
+              std::vector<const glim::FrameInfo*> chunk_frame_infos;
+              std::unordered_set<std::string> needed_dirs;
+              for (const auto& fi : all_frames) {
+                if (fi.num_points == 0 || !chunk_aabb.intersects(fi.world_bbox)) continue;
+                chunk_frame_infos.push_back(&fi);
+                needed_dirs.insert(fi.dir);
+              }
+
+              // Evict frames no longer needed
+              std::vector<std::string> evict_keys;
+              for (const auto& [dir, _] : frame_cache) {
+                if (!needed_dirs.count(dir)) evict_keys.push_back(dir);
+              }
+              for (const auto& k : evict_keys) frame_cache.erase(k);
+
+              // Load missing frames into cache
+              for (const auto* fi : chunk_frame_infos) {
+                if (frame_cache.count(fi->dir)) continue;
+                std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints(fi->num_points, 0.0f);
+                if (!glim::load_bin(fi->dir + "/points.bin", pts, fi->num_points)) continue;
+                glim::load_bin(fi->dir + "/range.bin", rng, fi->num_points);
+                glim::load_bin(fi->dir + "/intensities.bin", ints, fi->num_points);
+                // Load ground mask if ground-only mode
+                std::vector<float> ground;
+                if (ground_only) glim::load_bin(fi->dir + "/aux_ground.bin", ground, fi->num_points);
+                const Eigen::Matrix3f R = fi->T_world_lidar.rotation().cast<float>();
+                const Eigen::Vector3f t = fi->T_world_lidar.translation().cast<float>();
+                auto cf = std::make_shared<CachedFrame>();
+                cf->dir = fi->dir;
+                for (int i = 0; i < fi->num_points; i++) {
+                  if (!rng.empty() && rng[i] < 1.5f) continue;
+                  if (ground_only && (ground.empty() || ground[i] < 0.5f)) continue;
+                  cf->world_pts.push_back(R * pts[i] + t);
+                  cf->intensities.push_back(ints[i]);
+                  cf->ranges.push_back(rng.empty() ? 0.0f : rng[i]);
+                }
+                frame_cache[fi->dir] = cf;
+              }
+
+              // Build voxel grid from cached frames
+              struct VoxPt { Eigen::Vector3f wp; float intensity; float range; std::string dir; };
+              std::unordered_map<uint64_t, std::vector<VoxPt>> voxels;
+              for (const auto* fi : chunk_frame_infos) {
+                auto it = frame_cache.find(fi->dir);
+                if (it == frame_cache.end()) continue;
+                const auto& cf = it->second;
+                for (size_t i = 0; i < cf->world_pts.size(); i++) {
+                  if (!chunk.contains(cf->world_pts[i])) continue;
+                  const uint64_t key = ground_only ? glim::voxel_key(
+                    static_cast<int>(std::floor(cf->world_pts[i].x() * inv_vox)),
+                    static_cast<int>(std::floor(cf->world_pts[i].y() * inv_vox)), 0)
+                    : glim::voxel_key(cf->world_pts[i], inv_vox);
+                  voxels[key].push_back({cf->world_pts[i], cf->intensities[i], cf->ranges[i], cf->dir});
+                }
+              }
+
+              // Process only core area voxels — assign to frames round-robin
+              int voxel_idx = 0;
+              // Collect contributing frame dirs for round-robin
+              std::vector<std::string> contributing_dirs;
+              for (const auto& fi : all_frames) {
+                if (fi.num_points > 0 && chunk_aabb.intersects(fi.world_bbox)) {
+                  contributing_dirs.push_back(fi.dir);
+                }
+              }
+
+              for (const auto& [key, pts_in_voxel] : voxels) {
+                // Compute voxel position
+                Eigen::Vector3f pos;
+                if (ground_only) {
+                  // Ground-only: XY grid center + Z weighted average
+                  const int vx = static_cast<int>((key >> 42) & 0x1FFFFF) - 1048576;
+                  const int vy = static_cast<int>((key >> 21) & 0x1FFFFF) - 1048576;
+                  float avg_z = 0.0f;
+                  for (const auto& p : pts_in_voxel) avg_z += p.wp.z();
+                  avg_z /= static_cast<float>(pts_in_voxel.size());
+                  pos = Eigen::Vector3f((vx + 0.5f) * vox_size, (vy + 0.5f) * vox_size, avg_z);
+                } else if (vox_mode == 0) {
+                  const int vx = static_cast<int>((key >> 42) & 0x1FFFFF) - 1048576;
+                  const int vy = static_cast<int>((key >> 21) & 0x1FFFFF) - 1048576;
+                  const int vz = static_cast<int>(key & 0x1FFFFF) - 1048576;
+                  pos = Eigen::Vector3f((vx + 0.5f) * vox_size, (vy + 0.5f) * vox_size, (vz + 0.5f) * vox_size);
+                } else if (vox_mode == 1) {
+                  pos = Eigen::Vector3f::Zero();
+                  for (const auto& p : pts_in_voxel) pos += p.wp;
+                  pos /= static_cast<float>(pts_in_voxel.size());
+                } else {
+                  const int vx = static_cast<int>((key >> 42) & 0x1FFFFF) - 1048576;
+                  const int vy = static_cast<int>((key >> 21) & 0x1FFFFF) - 1048576;
+                  float avg_z = 0.0f;
+                  for (const auto& p : pts_in_voxel) avg_z += p.wp.z();
+                  avg_z /= static_cast<float>(pts_in_voxel.size());
+                  pos = Eigen::Vector3f((vx + 0.5f) * vox_size, (vy + 0.5f) * vox_size, avg_z);
+                }
+
+                // Only include core area voxels
+                if (!core.contains(pos)) continue;
+
+                // Average attributes
+                float avg_int = 0.0f, avg_rng = 0.0f;
+                for (const auto& p : pts_in_voxel) { avg_int += p.intensity; avg_rng += p.range; }
+                avg_int /= pts_in_voxel.size(); avg_rng /= pts_in_voxel.size();
+
+                // Assign to a frame — round-robin across contributing frames
+                const std::string& target_dir = contributing_dirs[voxel_idx % contributing_dirs.size()];
+                frame_outputs[target_dir].points.push_back(pos);
+                frame_outputs[target_dir].intensities.push_back(avg_int);
+                frame_outputs[target_dir].ranges.push_back(avg_rng);
+                voxel_idx++;
+                total_voxels++;
+              }
+            }
+
+            // Write output frames
+            vox_status = "Writing voxelized frames...";
+            int frames_written = 0;
+            for (const auto& [src_dir, output] : frame_outputs) {
+              if (output.points.empty()) continue;
+              // Derive output dir from source dir
+              const std::string dirname = boost::filesystem::path(src_dir).filename().string();
+              const std::string out_dir = vox_dir + "/" + dirname;
+              boost::filesystem::create_directories(out_dir);
+
+              const int n = output.points.size();
+              // Write points as sensor-local (identity transform — points are already in world space)
+              // For the frame structure, store world-space points directly
+              { std::ofstream f(out_dir + "/points.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(output.points.data()), sizeof(Eigen::Vector3f) * n); }
+              { std::ofstream f(out_dir + "/range.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(output.ranges.data()), sizeof(float) * n); }
+              { std::ofstream f(out_dir + "/intensities.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(output.intensities.data()), sizeof(float) * n); }
+
+              // Write frame_meta.json with identity transform (points are world-space)
+              { std::ofstream ofs(out_dir + "/frame_meta.json");
+                ofs << std::setprecision(15) << std::fixed;
+                ofs << "{\n  \"num_points\": " << n << ",\n";
+                ofs << "  \"stamp\": 0.0,\n";
+                ofs << "  \"scan_end_time\": 0.0,\n";
+                // Identity T_world_lidar (points already in world frame)
+                ofs << "  \"T_world_lidar\": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],\n";
+                // Compute bbox
+                Eigen::Vector3f bmin = output.points[0], bmax = output.points[0];
+                for (const auto& p : output.points) { bmin = bmin.cwiseMin(p); bmax = bmax.cwiseMax(p); }
+                ofs << "  \"bbox_world_min\": [" << bmin.x() << "," << bmin.y() << "," << bmin.z() << "],\n";
+                ofs << "  \"bbox_world_max\": [" << bmax.x() << "," << bmax.y() << "," << bmax.z() << "]\n";
+                ofs << "}\n";
+              }
+              frames_written++;
+            }
+
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "Done: %zu voxels, %d frames written to %s (%.1f sec)",
+              total_voxels, frames_written, vox_dir.c_str(), elapsed);
+            vox_status = buf;
+            logger->info("[Voxelize] {}", vox_status);
+            vox_processing = false;
+          }).detach();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Voxelize all HD frames along trajectory.\nWrites to hd_frames_voxelized/ folder.\nOriginal HD data is preserved.");
+
+        if (!vox_status.empty()) ImGui::TextWrapped("%s", vox_status.c_str());
+      }
+    }
+    ImGui::End();
+  });
+
   viewer->register_ui_callback("trail_config_window", [this] {
     if (!show_trail_config) return;
     ImGui::SetNextWindowSize(ImVec2(250, 0), ImGuiCond_FirstUseEver);
@@ -819,17 +1295,43 @@ void OfflineViewer::setup_ui() {
     if (!show_data_filter) return;
     ImGui::SetNextWindowSize(ImVec2(350, 320), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Data Filter", &show_data_filter)) {
-      ImGui::Combo("Mode", &df_mode, "Range\0Dynamic\0SOR\0Scalar\0");
+      ImGui::Combo("Mode", &df_mode, "SOR\0Dynamic\0Range\0Scalar\0");
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Range: remove distant noise when closer points exist.\nDynamic: remove objects that moved between passes.");
+
+      // Ground-only checkbox (Range mode only, right after dropdown)
+      if (df_mode == 2) {
+        bool has_ground = false;
+        if (!hd_frames_path.empty()) {
+          for (const auto& submap : submaps) {
+            if (!submap || submap->frames.empty()) continue;
+            std::string shd = hd_frames_path;
+            for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+            char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", submap->frames.front()->id);
+            if (boost::filesystem::exists(shd + "/" + dn + "/aux_ground.bin")) { has_ground = true; break; }
+          }
+        }
+        if (!has_ground) { ImGui::BeginDisabled(); rf_ground_only = false; }
+        ImGui::Checkbox("Affect only ground", &rf_ground_only);
+        if (!has_ground) {
+          ImGui::EndDisabled();
+          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Requires aux_ground.bin per frame.\nGenerate with Data Filter > Dynamic > Classify ground to scalar.");
+        } else {
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Only filter ground-classified points.\nNon-ground points pass through untouched.\nUseful for tight road cleanup without affecting walls/vegetation.");
+        }
+      }
+
       ImGui::Separator();
 
       // Shared parameter
-      if (df_mode == 0) {
+      if (df_mode == 2) {
         // Range filter parameters
         ImGui::Combo("Criteria", &rf_criteria, "Range\0GPS Time\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Range: remove distant points when closer exist.\nGPS Time: remove overlapping pass points when earlier/later exist.");
         ImGui::SliderFloat("Voxel size (m)", &rf_voxel_size, 0.05f, 5.0f, "%.2f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Spatial grid cell size for grouping points.");
+
         if (rf_criteria == 0) {
           ImGui::SliderFloat("Safe range (m)", &rf_safe_range, 5.0f, 50.0f, "%.0f");
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Points within this range are ALWAYS kept.");
@@ -840,8 +1342,8 @@ void OfflineViewer::setup_ui() {
           ImGui::SliderInt("Min close points", &rf_min_close_pts, 1, 20);
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum close-range points in a voxel before\nthe primary delta applies.");
         } else {
-          ImGui::Text("GPS Time: within each voxel, keep only\nthe temporal group with most points.");
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overlapping passes contribute different GPS time clusters.\nThe dominant cluster is kept, others removed.");
+          ImGui::Combo("Keep", &rf_gps_keep, "Dominant\0Newest\0Oldest\0");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Dominant: keep cluster with most points.\nNewest: keep latest temporal cluster.\nOldest: keep earliest temporal cluster.");
         }
       } else if (df_mode == 1) {
         // Dynamic filter parameters
@@ -856,113 +1358,169 @@ void OfflineViewer::setup_ui() {
 
         // Ground exclusion
         ImGui::Separator();
-        if (ImGui::Checkbox("Exclude ground (normals)", &df_exclude_ground)) {
-          if (df_exclude_ground) df_exclude_ground_pw = false;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip ground using normal Z threshold.");
-        if (df_exclude_ground) {
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(80);
-          ImGui::DragFloat("Z thr", &df_ground_normal_z, 0.05f, 0.3f, 0.95f, "%.2f");
-          ImGui::SameLine();
-          if (ImGui::Button("Show##normals")) {
-            rf_status = "Classifying ground (normals)...";
-            std::thread([this] {
-              auto vw = guik::LightViewer::instance();
-              const Eigen::Matrix4f vm = vw->view_matrix();
-              const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
-              std::vector<Eigen::Vector3f> ground_pts, nonground_pts;
-              for (const auto& submap : submaps) {
-                if (!submap) continue;
-                if ((submap->T_world_origin.translation().cast<float>() - cam_pos).norm() > lod_hd_range) continue;
-                std::string shd = hd_frames_path;
-                for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
-                const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
-                for (const auto& fr : submap->frames) {
-                  char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
-                  std::string fd = shd + "/" + dn;
-                  std::vector<Eigen::Vector3f> pts, nrm; std::vector<float> rng;
-                  std::ifstream mf(fd + "/frame_meta.json"); auto meta = nlohmann::json::parse(mf, nullptr, false);
-                  if (meta.is_discarded()) continue; const int n = meta.value("num_points", 0);
-                  if (!glim::load_bin(fd + "/points.bin", pts, n) || !glim::load_bin(fd + "/range.bin", rng, n)) continue;
-                  glim::load_bin(fd + "/normals.bin", nrm, n);
-                  const auto T = glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu);
-                  const Eigen::Matrix3f R = T.rotation().cast<float>(); const Eigen::Vector3f t = T.translation().cast<float>();
-                  for (int i = 0; i < n; i++) {
-                    if (rng[i] < 1.5f) continue;
-                    const Eigen::Vector3f wp = R * pts[i] + t;
-                    bool gnd = (i < static_cast<int>(nrm.size())) && std::abs((R * nrm[i]).normalized().z()) > df_ground_normal_z;
-                    if (gnd) ground_pts.push_back(wp); else nonground_pts.push_back(wp);
-                  }
-                }
-              }
-              vw->invoke([this, ground_pts, nonground_pts] {
-                auto v = guik::LightViewer::instance(); lod_hide_all_submaps = true; rf_preview_active = true;
-                if (!ground_pts.empty()) v->update_drawable("rf_preview_kept", std::make_shared<glk::PointCloudBuffer>(ground_pts[0].data(), sizeof(Eigen::Vector3f), ground_pts.size()), guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f));
-                if (!nonground_pts.empty()) v->update_drawable("rf_preview_removed", std::make_shared<glk::PointCloudBuffer>(nonground_pts[0].data(), sizeof(Eigen::Vector3f), nonground_pts.size()), guik::FlatColor(0.2f, 0.9f, 0.2f, 1.0f));
-              });
-              rf_status = "Normals: " + std::to_string(ground_pts.size()) + " ground (yellow), " + std::to_string(nonground_pts.size()) + " non-ground (green)";
-            }).detach();
-          }
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Visualize ground (yellow) vs non-ground (green).");
-        }
-        if (ImGui::Checkbox("Exclude ground (PatchWork++)", &df_exclude_ground_pw)) {
-          if (df_exclude_ground_pw) df_exclude_ground = false;
-        }
+        ImGui::Checkbox("Exclude ground (PatchWork++)", &df_exclude_ground_pw);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip ground using PatchWork++ plane fitting.");
         if (df_exclude_ground_pw) {
           ImGui::SameLine();
           if (ImGui::Button("Config##pw")) { show_pw_config = !show_pw_config; }
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open PatchWork++ configuration window.");
           ImGui::SameLine();
-          if (ImGui::Button("Show##pw")) {
-            rf_status = "Classifying ground (PatchWork++)...";
-            std::thread([this] {
+          if (ImGui::Button("Preview chunk##pw")) {
+            rf_processing = true;
+            rf_status = "Classifying ground (chunk)...";
+            const bool accumulate = pw_accumulate;
+            const int acc_count = pw_accumulate_count;
+            const bool refine_z = df_refine_ground;
+            std::thread([this, accumulate, acc_count, refine_z] {
+              if (!trajectory_built) build_trajectory();
               auto vw = guik::LightViewer::instance();
               const Eigen::Matrix4f vm = vw->view_matrix();
               const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
-              std::vector<Eigen::Vector3f> ground_pts, nonground_pts;
+
+              // Find nearest trajectory point
+              double min_d = 1e9; size_t best_idx = 0;
+              for (size_t k = 0; k < trajectory_data.size(); k++) {
+                const double d = (trajectory_data[k].pose.translation().cast<float>() - cam_pos).cast<double>().norm();
+                if (d < min_d) { min_d = d; best_idx = k; }
+              }
+              // Build one chunk
+              const double chunk_hs = df_chunk_size * 0.5;
+              const Eigen::Vector3d c = trajectory_data[best_idx].pose.translation();
+              const size_t next = std::min(best_idx + 1, trajectory_data.size() - 1);
+              Eigen::Vector3d fwd = trajectory_data[next].pose.translation() - c;
+              fwd.z() = 0; if (fwd.norm() < 0.01) fwd = Eigen::Vector3d::UnitX(); else fwd.normalize();
+              const Eigen::Vector3d up = Eigen::Vector3d::UnitZ(), right = fwd.cross(up).normalized();
+              Eigen::Matrix3d R; R.col(0) = fwd; R.col(1) = right; R.col(2) = up;
+              glim::Chunk chunk{c, R, R.transpose(), chunk_hs, 50.0};
+
+              // Build flat frame list within chunk
+              struct FrameEntry { std::string dir; Eigen::Isometry3d T_world_lidar; int num_points; };
+              std::vector<FrameEntry> chunk_frames;
+              const auto chunk_aabb = chunk.world_aabb();
               for (const auto& submap : submaps) {
                 if (!submap) continue;
-                if ((submap->T_world_origin.translation().cast<float>() - cam_pos).norm() > lod_hd_range) continue;
+                if (hidden_sessions.count(submap->session_id)) continue;
                 std::string shd = hd_frames_path;
                 for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
                 const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
                 for (const auto& fr : submap->frames) {
                   char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
-                  std::string fd = shd + "/" + dn;
-                  std::vector<Eigen::Vector3f> pts; std::vector<float> rng;
-                  std::ifstream mf(fd + "/frame_meta.json"); auto meta = nlohmann::json::parse(mf, nullptr, false);
-                  if (meta.is_discarded()) continue; const int n = meta.value("num_points", 0);
-                  if (!glim::load_bin(fd + "/points.bin", pts, n) || !glim::load_bin(fd + "/range.bin", rng, n)) continue;
-                  std::vector<float> ints; glim::load_bin(fd + "/intensities.bin", ints, n);
-                  auto pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, n, 1.7f, ints);
-                  const auto T = glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu);
-                  const Eigen::Matrix3f R = T.rotation().cast<float>(); const Eigen::Vector3f t = T.translation().cast<float>();
-                  for (int i = 0; i < n; i++) {
-                    if (rng[i] < 1.5f) continue;
-                    const Eigen::Vector3f wp = R * pts[i] + t;
-                    if (!pw_gnd.empty() && pw_gnd[i]) ground_pts.push_back(wp); else nonground_pts.push_back(wp);
-                  }
+                  auto fi = glim::frame_info_from_meta(shd + "/" + dn,
+                    glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu));
+                  if (fi.num_points > 0 && chunk_aabb.intersects(fi.world_bbox)
+                      && (fi.T_world_lidar.translation().cast<float>() - chunk.center.cast<float>()).norm() < chunk_hs + 50.0)
+                    chunk_frames.push_back({fi.dir, fi.T_world_lidar, fi.num_points});
                 }
               }
+
+              rf_status = "Classifying " + std::to_string(chunk_frames.size()) + " frames...";
+              std::vector<Eigen::Vector3f> ground_pts, nonground_pts;
+
+              for (size_t fi = 0; fi < chunk_frames.size(); fi++) {
+                const auto& entry = chunk_frames[fi];
+                std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints;
+                if (!glim::load_bin(entry.dir + "/points.bin", pts, entry.num_points)) continue;
+                glim::load_bin(entry.dir + "/range.bin", rng, entry.num_points);
+                glim::load_bin(entry.dir + "/intensities.bin", ints, entry.num_points);
+                const int n = entry.num_points;
+
+                // Classify ground (with frame accumulation if enabled)
+                std::vector<bool> pw_gnd;
+                if (accumulate) {
+                  std::vector<Eigen::Vector3f> merged_pts(pts);
+                  std::vector<float> merged_ints(ints);
+                  const Eigen::Isometry3f T_cur_inv = entry.T_world_lidar.inverse().cast<float>();
+                  int start = static_cast<int>(fi) - acc_count;
+                  int end = static_cast<int>(fi) + acc_count;
+                  if (start < 0) { end = std::min(end - start, static_cast<int>(chunk_frames.size()) - 1); start = 0; }
+                  if (end >= static_cast<int>(chunk_frames.size())) { start = std::max(start - (end - static_cast<int>(chunk_frames.size()) + 1), 0); end = static_cast<int>(chunk_frames.size()) - 1; }
+                  for (int ni = start; ni <= end; ni++) {
+                    if (ni == static_cast<int>(fi)) continue;
+                    const auto& nb = chunk_frames[ni];
+                    std::vector<Eigen::Vector3f> nb_pts; std::vector<float> nb_ints;
+                    if (!glim::load_bin(nb.dir + "/points.bin", nb_pts, nb.num_points)) continue;
+                    glim::load_bin(nb.dir + "/intensities.bin", nb_ints, nb.num_points);
+                    const Eigen::Matrix3f R_to = (T_cur_inv * nb.T_world_lidar.cast<float>()).rotation();
+                    const Eigen::Vector3f t_to = (T_cur_inv * nb.T_world_lidar.cast<float>()).translation();
+                    for (int pi = 0; pi < nb.num_points; pi++) {
+                      merged_pts.push_back(R_to * nb_pts[pi] + t_to);
+                      merged_ints.push_back(pi < static_cast<int>(nb_ints.size()) ? nb_ints[pi] : 0.0f);
+                    }
+                  }
+                  auto merged_gnd = glim::MapCleanerFilter::classify_ground_patchwork(
+                    merged_pts, static_cast<int>(merged_pts.size()), 1.7f, merged_ints);
+                  pw_gnd.resize(n);
+                  for (int i = 0; i < n; i++) pw_gnd[i] = !merged_gnd.empty() && i < static_cast<int>(merged_gnd.size()) && merged_gnd[i];
+                } else {
+                  pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, n, 1.7f, ints);
+                }
+
+                const Eigen::Matrix3f Rf = entry.T_world_lidar.rotation().cast<float>();
+                const Eigen::Vector3f t = entry.T_world_lidar.translation().cast<float>();
+                for (int i = 0; i < n; i++) {
+                  if (!rng.empty() && rng[i] < 1.5f) continue;
+                  const Eigen::Vector3f wp = Rf * pts[i] + t;
+                  if (!chunk.contains(wp)) continue;
+                  if (!pw_gnd.empty() && pw_gnd[i]) ground_pts.push_back(wp); else nonground_pts.push_back(wp);
+                }
+              }
+
+              // Z-column refinement: revoke false ground above column minimum
+              if (refine_z && !ground_pts.empty()) {
+                const float col_res = 1.0f, col_inv = 1.0f / col_res, ground_z_tol = 0.5f;
+                std::unordered_map<uint64_t, float> col_min_z;
+                for (const auto& p : ground_pts) {
+                  const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(p.x() * col_inv)) + 1048576) << 21)
+                                    | static_cast<uint64_t>(static_cast<int>(std::floor(p.y() * col_inv)) + 1048576);
+                  auto it = col_min_z.find(ck);
+                  if (it == col_min_z.end() || p.z() < it->second) col_min_z[ck] = p.z();
+                }
+                std::vector<Eigen::Vector3f> refined_ground;
+                int revoked = 0;
+                for (const auto& p : ground_pts) {
+                  const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(p.x() * col_inv)) + 1048576) << 21)
+                                    | static_cast<uint64_t>(static_cast<int>(std::floor(p.y() * col_inv)) + 1048576);
+                  if (p.z() > col_min_z[ck] + ground_z_tol) { nonground_pts.push_back(p); revoked++; }
+                  else refined_ground.push_back(p);
+                }
+                ground_pts = std::move(refined_ground);
+                if (revoked > 0) logger->info("[Ground preview] Z-column revoked {} points", revoked);
+              }
+
               vw->invoke([this, ground_pts, nonground_pts] {
                 auto v = guik::LightViewer::instance(); lod_hide_all_submaps = true; rf_preview_active = true;
+                v->remove_drawable("rf_preview_kept"); v->remove_drawable("rf_preview_removed");
                 if (!ground_pts.empty()) v->update_drawable("rf_preview_kept", std::make_shared<glk::PointCloudBuffer>(ground_pts[0].data(), sizeof(Eigen::Vector3f), ground_pts.size()), guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f));
                 if (!nonground_pts.empty()) v->update_drawable("rf_preview_removed", std::make_shared<glk::PointCloudBuffer>(nonground_pts[0].data(), sizeof(Eigen::Vector3f), nonground_pts.size()), guik::FlatColor(0.2f, 0.9f, 0.2f, 1.0f));
               });
-              rf_status = "PatchWork++: " + std::to_string(ground_pts.size()) + " ground (yellow), " + std::to_string(nonground_pts.size()) + " non-ground (green)";
+              char buf[256]; std::snprintf(buf, sizeof(buf), "Ground: %zu ground (yellow), %zu non-ground (green)", ground_pts.size(), nonground_pts.size());
+              rf_status = buf;
+              rf_processing = false;
             }).detach();
           }
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Visualize ground (yellow) vs non-ground (green).");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Preview ground classification on one chunk.\nUses frame accumulation and Z refinement if enabled.\nYellow = ground, Green = non-ground.");
         }
         ImGui::Checkbox("Refine ground (Z column)", &df_refine_ground);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Revoke false ground labels for points above\nthe lowest Z in each XY column.");
-        if (ImGui::Button("Save ground to HD")) {
+        if (ImGui::Button("Classify ground to scalar")) {
           rf_processing = true;
           rf_status = "Saving ground classification...";
-          std::thread([this] {
-            int frames_written = 0;
+          const bool accumulate = pw_accumulate && df_exclude_ground_pw;
+          const int acc_count = pw_accumulate_count;
+          const bool refine_z = df_refine_ground;
+          const float chunk_size = df_chunk_size;
+          const float chunk_spacing = df_chunk_spacing;
+          std::thread([this, accumulate, acc_count, refine_z, chunk_size, chunk_spacing] {
+            if (!trajectory_built) build_trajectory();
+            const auto start_time = std::chrono::steady_clock::now();
+
+            // Build flat list of all frame entries with poses
+            struct FrameEntry {
+              std::string dir;
+              Eigen::Isometry3d T_world_lidar;
+              int num_points;
+            };
+            std::vector<FrameEntry> all_frames;
             for (const auto& submap : submaps) {
               if (!submap) continue;
               if (hidden_sessions.count(submap->session_id)) continue;
@@ -972,46 +1530,218 @@ void OfflineViewer::setup_ui() {
               for (const auto& fr : submap->frames) {
                 char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
                 const std::string fd = shd + "/" + dn;
-                std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints;
-                std::ifstream mf(fd + "/frame_meta.json");
-                auto meta = nlohmann::json::parse(mf, nullptr, false); mf.close();
-                if (meta.is_discarded()) continue;
-                const int n = meta.value("num_points", 0);
-                if (!glim::load_bin(fd + "/points.bin", pts, n)) continue;
-                glim::load_bin(fd + "/range.bin", rng, n);
-                glim::load_bin(fd + "/intensities.bin", ints, n);
-                std::vector<Eigen::Vector3f> nrm(n, Eigen::Vector3f::Zero());
-                glim::load_bin(fd + "/normals.bin", nrm, n);
+                auto fi = glim::frame_info_from_meta(fd,
+                  glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu));
+                if (fi.num_points > 0) all_frames.push_back({fi.dir, fi.T_world_lidar, fi.num_points});
+              }
+            }
 
-                // Classify ground
+            // Build chunks along trajectory
+            auto chunks = glim::build_chunks(trajectory_data, trajectory_total_dist, chunk_spacing, chunk_size * 0.5);
+            logger->info("[Ground] {} frames, {} chunks (size={:.0f}m, spacing={:.0f}m, accumulate={}, refine_z={})",
+              all_frames.size(), chunks.size(), chunk_size, chunk_spacing, accumulate, refine_z);
+
+            // Track which frames have been written (to avoid double-write at chunk overlaps)
+            std::unordered_set<std::string> written_frames;
+            int frames_written = 0;
+
+            // Sliding window frame cache (avoids redundant disk I/O for accumulation neighbors)
+            struct CachedFrameData {
+              std::vector<Eigen::Vector3f> pts;
+              std::vector<float> ints;
+              int num_points;
+            };
+            std::unordered_map<std::string, std::shared_ptr<CachedFrameData>> frame_cache;
+
+            for (size_t ci = 0; ci < chunks.size(); ci++) {
+              const auto& chunk = chunks[ci];
+              const auto chunk_aabb = chunk.world_aabb();
+              glim::Chunk core_chunk = chunk;
+              core_chunk.half_size = chunk_size * 0.5;
+
+              if (ci % 5 == 0) {
+                char buf[128]; std::snprintf(buf, sizeof(buf), "Ground: chunk %zu/%zu (cache: %zu)...", ci + 1, chunks.size(), frame_cache.size());
+                rf_status = buf;
+              }
+
+              // Find frames overlapping this chunk (sensor within chunk range)
+              // Include extra margin for accumulation neighbors
+              const float frame_search_radius = chunk_size + 50.0f + (accumulate ? acc_count * 5.0f : 0.0f);
+              struct ChunkFrame { size_t all_idx; };
+              std::vector<ChunkFrame> chunk_frame_indices;
+              std::unordered_set<std::string> needed_dirs;
+              for (size_t fi = 0; fi < all_frames.size(); fi++) {
+                const auto& entry = all_frames[fi];
+                if ((entry.T_world_lidar.translation().cast<float>() - chunk.center.cast<float>()).norm() > frame_search_radius) continue;
+                chunk_frame_indices.push_back({fi});
+                needed_dirs.insert(entry.dir);
+                // Also mark accumulation neighbors as needed
+                if (accumulate) {
+                  int start = std::max(0, static_cast<int>(fi) - acc_count);
+                  int end = std::min(static_cast<int>(all_frames.size()) - 1, static_cast<int>(fi) + acc_count);
+                  for (int ni = start; ni <= end; ni++) needed_dirs.insert(all_frames[ni].dir);
+                }
+              }
+              if (chunk_frame_indices.empty()) continue;
+
+              // Evict frames no longer needed
+              std::vector<std::string> evict_keys;
+              for (const auto& [dir, _] : frame_cache) {
+                if (!needed_dirs.count(dir)) evict_keys.push_back(dir);
+              }
+              for (const auto& k : evict_keys) frame_cache.erase(k);
+
+              // Load missing frames into cache
+              for (const auto& dir : needed_dirs) {
+                if (frame_cache.count(dir)) continue;
+                // Find the frame entry to get num_points
+                int np = 0;
+                for (const auto& cf : chunk_frame_indices) {
+                  if (all_frames[cf.all_idx].dir == dir) { np = all_frames[cf.all_idx].num_points; break; }
+                }
+                if (np == 0) {
+                  // Might be an accumulation neighbor not in chunk_frame_indices — find from all_frames
+                  for (const auto& f : all_frames) { if (f.dir == dir) { np = f.num_points; break; } }
+                }
+                if (np == 0) continue;
+                auto cf = std::make_shared<CachedFrameData>();
+                cf->num_points = np;
+                if (!glim::load_bin(dir + "/points.bin", cf->pts, np)) continue;
+                glim::load_bin(dir + "/intensities.bin", cf->ints, np);
+                frame_cache[dir] = cf;
+              }
+
+              // Phase 1: Run PatchWork++ per frame, store per-frame ground labels + world-space positions
+              struct FrameResult {
+                std::string dir;
+                std::vector<float> ground_values;
+                std::vector<Eigen::Vector3f> world_pts;
+                Eigen::Isometry3d T_world_lidar;
+                int num_points;
+                bool in_core;
+              };
+              std::vector<FrameResult> frame_results;
+
+              for (const auto& cf : chunk_frame_indices) {
+                const auto& entry = all_frames[cf.all_idx];
+                if (written_frames.count(entry.dir)) continue;
+
+                auto cache_it = frame_cache.find(entry.dir);
+                if (cache_it == frame_cache.end()) continue;
+                const auto& cached = cache_it->second;
+                const int n = cached->num_points;
+
                 std::vector<float> ground_values(n, 0.0f);
                 if (df_exclude_ground_pw) {
-                  auto pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, n, 1.7f, ints);
-                  for (int i = 0; i < n; i++) { if (!pw_gnd.empty() && pw_gnd[i]) ground_values[i] = 1.0f; }
-                } else if (df_exclude_ground) {
-                  const auto T = glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu);
-                  const Eigen::Matrix3f R = T.rotation().cast<float>();
-                  for (int i = 0; i < n; i++) {
-                    const Eigen::Vector3f wn = (R * nrm[i]).normalized();
-                    if (std::abs(wn.z()) > df_ground_normal_z) ground_values[i] = 1.0f;
+                  if (accumulate) {
+                    std::vector<Eigen::Vector3f> merged_pts(cached->pts);
+                    std::vector<float> merged_ints(cached->ints);
+                    const Eigen::Isometry3f T_cur_inv = entry.T_world_lidar.inverse().cast<float>();
+                    int start = static_cast<int>(cf.all_idx) - acc_count;
+                    int end = static_cast<int>(cf.all_idx) + acc_count;
+                    if (start < 0) { end = std::min(end - start, static_cast<int>(all_frames.size()) - 1); start = 0; }
+                    if (end >= static_cast<int>(all_frames.size())) { start = std::max(start - (end - static_cast<int>(all_frames.size()) + 1), 0); end = static_cast<int>(all_frames.size()) - 1; }
+                    for (int ni = start; ni <= end; ni++) {
+                      if (ni == static_cast<int>(cf.all_idx)) continue;
+                      const auto& nb = all_frames[ni];
+                      auto nb_cache = frame_cache.find(nb.dir);
+                      if (nb_cache == frame_cache.end()) continue;
+                      const auto& nb_data = nb_cache->second;
+                      const Eigen::Matrix3f R_to_cur = (T_cur_inv * nb.T_world_lidar.cast<float>()).rotation();
+                      const Eigen::Vector3f t_to_cur = (T_cur_inv * nb.T_world_lidar.cast<float>()).translation();
+                      for (int pi = 0; pi < nb_data->num_points; pi++) {
+                        merged_pts.push_back(R_to_cur * nb_data->pts[pi] + t_to_cur);
+                        merged_ints.push_back(pi < static_cast<int>(nb_data->ints.size()) ? nb_data->ints[pi] : 0.0f);
+                      }
+                    }
+                    auto pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(
+                      merged_pts, static_cast<int>(merged_pts.size()), 1.7f, merged_ints);
+                    for (int i = 0; i < n; i++) {
+                      if (!pw_gnd.empty() && i < static_cast<int>(pw_gnd.size()) && pw_gnd[i]) ground_values[i] = 1.0f;
+                    }
+                  } else {
+                    auto pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(cached->pts, n, 1.7f, cached->ints);
+                    for (int i = 0; i < n; i++) { if (!pw_gnd.empty() && pw_gnd[i]) ground_values[i] = 1.0f; }
                   }
                 }
 
-                // Write aux_ground.bin
-                { std::ofstream f(fd + "/aux_ground.bin", std::ios::binary);
-                  f.write(reinterpret_cast<const char*>(ground_values.data()), sizeof(float) * n); }
-                frames_written++;
-                if (frames_written % 100 == 0) {
-                  rf_status = "Ground: " + std::to_string(frames_written) + " frames...";
+                // Transform to world space for Z refinement
+                const Eigen::Matrix3f Rf = entry.T_world_lidar.rotation().cast<float>();
+                const Eigen::Vector3f tf = entry.T_world_lidar.translation().cast<float>();
+                std::vector<Eigen::Vector3f> world_pts(n);
+                for (int i = 0; i < n; i++) world_pts[i] = Rf * cached->pts[i] + tf;
+
+                const bool sensor_in_core = core_chunk.contains(tf);
+                frame_results.push_back({entry.dir, std::move(ground_values), std::move(world_pts),
+                  entry.T_world_lidar, n, sensor_in_core});
+              }
+
+              // Phase 2: Cross-frame Z-column refinement on merged chunk data
+              if (refine_z) {
+                const float col_res = 1.0f, col_inv = 1.0f / col_res, ground_z_tol = 0.5f;
+                // Build global min Z per XY column from ALL ground points in chunk
+                std::unordered_map<uint64_t, float> col_min_z;
+                for (const auto& fr : frame_results) {
+                  for (int i = 0; i < fr.num_points; i++) {
+                    if (fr.ground_values[i] < 0.5f) continue;
+                    const auto& wp = fr.world_pts[i];
+                    const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(wp.x() * col_inv)) + 1048576) << 21)
+                                      | static_cast<uint64_t>(static_cast<int>(std::floor(wp.y() * col_inv)) + 1048576);
+                    auto it = col_min_z.find(ck);
+                    if (it == col_min_z.end() || wp.z() < it->second) col_min_z[ck] = wp.z();
+                  }
                 }
+                // Revoke ground for points above column min + tolerance
+                int total_revoked = 0;
+                for (auto& fr : frame_results) {
+                  for (int i = 0; i < fr.num_points; i++) {
+                    if (fr.ground_values[i] < 0.5f) continue;
+                    const auto& wp = fr.world_pts[i];
+                    const uint64_t ck = (static_cast<uint64_t>(static_cast<int>(std::floor(wp.x() * col_inv)) + 1048576) << 21)
+                                      | static_cast<uint64_t>(static_cast<int>(std::floor(wp.y() * col_inv)) + 1048576);
+                    if (wp.z() > col_min_z[ck] + ground_z_tol) { fr.ground_values[i] = 0.0f; total_revoked++; }
+                  }
+                }
+                if (total_revoked > 0 && ci % 10 == 0)
+                  logger->info("[Ground] Chunk {}/{}: Z-column revoked {} points", ci + 1, chunks.size(), total_revoked);
+              }
+
+              // Phase 3: Write results (only core-area frames, avoid double-writes)
+              for (const auto& fr : frame_results) {
+                if (!fr.in_core) continue;
+                if (written_frames.count(fr.dir)) continue;
+                std::ofstream f(fr.dir + "/aux_ground.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(fr.ground_values.data()), sizeof(float) * fr.num_points);
+                written_frames.insert(fr.dir);
+                frames_written++;
               }
             }
-            rf_status = "Ground saved: " + std::to_string(frames_written) + " frames";
-            logger->info("[Ground] Saved classification to {} frames", frames_written);
+
+            // Write any remaining frames not covered by chunks (shouldn't happen but safety)
+            for (const auto& entry : all_frames) {
+              if (written_frames.count(entry.dir)) continue;
+              std::vector<Eigen::Vector3f> pts; std::vector<float> ints;
+              if (!glim::load_bin(entry.dir + "/points.bin", pts, entry.num_points)) continue;
+              glim::load_bin(entry.dir + "/intensities.bin", ints, entry.num_points);
+              std::vector<float> ground_values(entry.num_points, 0.0f);
+              if (df_exclude_ground_pw) {
+                auto pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, entry.num_points, 1.7f, ints);
+                for (int i = 0; i < entry.num_points; i++) { if (!pw_gnd.empty() && pw_gnd[i]) ground_values[i] = 1.0f; }
+              }
+              std::ofstream f(entry.dir + "/aux_ground.bin", std::ios::binary);
+              f.write(reinterpret_cast<const char*>(ground_values.data()), sizeof(float) * entry.num_points);
+              written_frames.insert(entry.dir);
+              frames_written++;
+            }
+
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+            char buf[256]; std::snprintf(buf, sizeof(buf), "Ground saved: %d frames, %zu chunks (%.1f sec)", frames_written, chunks.size(), elapsed);
+            rf_status = buf;
+            logger->info("[Ground] {}", rf_status);
             rf_processing = false;
           }).detach();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run ground classification on all HD frames\nand save as aux_ground.bin scalar field.\nAppears in Scalar mode and color mode dropdown.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Classify ground on all HD frames.\nSaves aux_ground.bin scalar field per frame.\nAppears in color mode dropdown on HD reload.");
         ImGui::Separator();
 
         // Trail refinement
@@ -1022,7 +1752,7 @@ void OfflineViewer::setup_ui() {
           if (ImGui::Button("Config##trail")) { show_trail_config = !show_trail_config; }
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open trail refinement configuration.");
         }
-      } else if (df_mode == 2) {
+      } else if (df_mode == 0) {
         // SOR filter parameters
         ImGui::DragFloat("Search radius (m)", &sor_radius, 0.01f, 0.05f, 5.0f, "%.2f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Radius for neighbor search.\nPoints with fewer neighbors than threshold are removed.");
@@ -1171,15 +1901,15 @@ void OfflineViewer::setup_ui() {
 
       // Reset defaults button
       if (ImGui::Button("Reset defaults")) {
-        if (df_mode == 0) {
-          rf_voxel_size = 1.0f; rf_safe_range = 30.0f; rf_range_delta = 10.0f;
+        if (df_mode == 2) {
+          rf_voxel_size = 1.0f; rf_safe_range = 20.0f; rf_range_delta = 10.0f;
           rf_far_delta = 30.0f; rf_min_close_pts = 3;
         } else if (df_mode == 1) {
           df_voxel_size = 0.64f; df_range_threshold = 0.8f; df_observation_range = 30.0f;
           df_min_observations = 15; df_refine_ground = true; df_refine_trails = true;
-          df_trail_min_length = 7.0f; df_trail_min_aspect = 9.0f; df_trail_min_density = 11.0f;
-          df_refine_voxel = 0.48f; df_chunk_size = 120.0f; df_chunk_spacing = 60.0f;
-        } else if (df_mode == 2) {
+          df_trail_min_length = 7.0f; df_trail_min_aspect = 5.0f; df_trail_min_density = 11.0f;
+          df_refine_voxel = 0.23f; df_chunk_size = 120.0f; df_chunk_spacing = 60.0f;
+        } else if (df_mode == 0) {
           sor_radius = 0.3f; sor_min_neighbors = 5; sor_chunk_size = 100.0f;
         } else {
           sv_threshold = 0.5f; sv_hide_below = false; sv_hide_above = false;
@@ -1188,7 +1918,7 @@ void OfflineViewer::setup_ui() {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset current mode parameters to defaults.");
 
       // Range highlight (only for Range/Dynamic modes)
-      if (df_mode == 0 || df_mode == 1) {
+      if (df_mode == 2 || df_mode == 1) {
       ImGui::Separator();
       ImGui::Text("Range highlight");
       if (!rf_preview_data.empty()) {
@@ -1251,7 +1981,7 @@ void OfflineViewer::setup_ui() {
         ImGui::Text("%s", rf_status.c_str());
       } else {
         // Preview buttons
-        if (ImGui::Button("Preview (visible area)")) {
+        if (df_mode == 0 || df_mode == 3) if (ImGui::Button("Preview (visible area)")) {
           rf_processing = true;
           rf_preview_active = true;
           lod_hide_all_submaps = true;
@@ -1331,13 +2061,21 @@ void OfflineViewer::setup_ui() {
                 const Eigen::Matrix3f R = T_w_lidar.rotation().cast<float>();
                 const Eigen::Vector3f t_vec = T_w_lidar.translation().cast<float>();
 
-                // PatchWork++ ground classification for this frame (cached)
+                // PatchWork++ ground classification for this frame (cached → scalar file → recompute)
                 std::vector<bool> pw_ground;
                 if (df_mode == 1 && df_exclude_ground_pw) {
                   auto cache_it = pw_ground_cache.find(frame_dir);
                   if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == num_pts) {
                     pw_ground = cache_it->second;
-                  } else {
+                  } else if (pw_reuse_scalar) {
+                    std::vector<float> gnd_scalar;
+                    if (glim::load_bin(frame_dir + "/aux_ground.bin", gnd_scalar, num_pts) && static_cast<int>(gnd_scalar.size()) == num_pts) {
+                      pw_ground.resize(num_pts);
+                      for (int gi = 0; gi < num_pts; gi++) pw_ground[gi] = gnd_scalar[gi] >= 0.5f;
+                      pw_ground_cache[frame_dir] = pw_ground;
+                    }
+                  }
+                  if (pw_ground.empty()) {
                     pw_ground = glim::MapCleanerFilter::classify_ground_patchwork(pts, num_pts, 1.7f, intensity);
                     pw_ground_cache[frame_dir] = pw_ground;
                   }
@@ -1374,7 +2112,7 @@ void OfflineViewer::setup_ui() {
             std::vector<float> removed_ranges, removed_intensities;
             size_t preview_kept = 0, preview_removed = 0;
 
-            if (df_mode == 0 && rf_criteria == 0) {
+            if (df_mode == 2 && rf_criteria == 0) {
               // --- RANGE MODE (range criteria) ---
               for (const auto& [key, entries] : voxels) {
                 float max_close_range = 0.0f;
@@ -1409,7 +2147,7 @@ void OfflineViewer::setup_ui() {
                   }
                 }
               }
-            } else if (df_mode == 0 && rf_criteria == 1) {
+            } else if (df_mode == 2 && rf_criteria == 1) {
               // --- RANGE MODE (GPS time criteria) ---
               // Per voxel: cluster points by GPS time, keep the dominant cluster
               const float time_gap = 5.0f;  // seconds — points within this gap are same cluster
@@ -1439,11 +2177,11 @@ void OfflineViewer::setup_ui() {
                   continue;
                 }
 
-                // Find dominant cluster (most points)
+                // Select cluster to keep
                 int best_cluster = 0;
-                for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) {
-                  if (clusters[ci].size() > clusters[best_cluster].size()) best_cluster = ci;
-                }
+                if (rf_gps_keep == 0) { for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) { if (clusters[ci].size() > clusters[best_cluster].size()) best_cluster = ci; } }
+                else if (rf_gps_keep == 1) { best_cluster = static_cast<int>(clusters.size()) - 1; }
+                // else rf_gps_keep == 2: best_cluster = 0 (oldest)
 
                 // Keep dominant, remove others
                 std::unordered_set<int> keep_set(clusters[best_cluster].begin(), clusters[best_cluster].end());
@@ -1497,7 +2235,7 @@ void OfflineViewer::setup_ui() {
                 for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
                   mc_points.push_back(entries[ei].world_pos);
                   mc_ranges.push_back(entries[ei].range);
-                  const bool is_gnd = (df_exclude_ground && entries[ei].normal_z > df_ground_normal_z) || (df_exclude_ground_pw && entries[ei].ground_pw);
+                  const bool is_gnd = df_exclude_ground_pw && entries[ei].ground_pw;
                   mc_ground.push_back(is_gnd);
                   mc_refs.push_back({key, ei});
                 }
@@ -1510,8 +2248,6 @@ void OfflineViewer::setup_ui() {
               mc_params.lidar_range = df_observation_range;
               mc_params.voxel_size = df_voxel_size;
               mc_params.frame_skip = (mc_frames.size() > 150) ? static_cast<int>(mc_frames.size() / 150) : 0;
-              mc_params.exclude_ground = df_exclude_ground;
-              mc_params.ground_normal_z = df_ground_normal_z;
               mc_params.exclude_ground_pw = df_exclude_ground_pw;
 
               glim::MapCleanerFilter filter(mc_params);
@@ -1527,7 +2263,7 @@ void OfflineViewer::setup_ui() {
                   kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++;
                 }
               }
-            } else if (df_mode == 2) {
+            } else if (df_mode == 0) {
               // --- SOR MODE ---
               // Flatten all voxel points for KD-tree
               std::vector<Eigen::Vector3f> all_pts;
@@ -1576,7 +2312,7 @@ void OfflineViewer::setup_ui() {
                   float scalar_val = 0.0f;
                   if (field_name == "intensity") scalar_val = e.intensity;
                   else if (field_name == "range") scalar_val = e.range;
-                  else if (field_name == "ground") scalar_val = ((df_exclude_ground && e.normal_z > df_ground_normal_z) || (df_exclude_ground_pw && e.ground_pw)) ? 1.0f : 0.0f;
+                  else if (field_name == "ground") scalar_val = (df_exclude_ground_pw && e.ground_pw) ? 1.0f : 0.0f;
                   else scalar_val = e.range;  // fallback
 
                   const bool below = scalar_val < sv_threshold;
@@ -1649,7 +2385,12 @@ void OfflineViewer::setup_ui() {
         }
 
         if (df_mode == 1) {
-          ImGui::SameLine();
+          ImGui::Checkbox("Reuse ground scalar", &pw_reuse_scalar);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Use existing aux_ground.bin instead of recomputing PatchWork++.\nEnable after running Classify ground to scalar with tuned params.");
+        }
+
+        if (df_mode == 1 || df_mode == 2) {
+          if (df_mode == 0 || df_mode == 3) ImGui::SameLine();  // SOR/Scalar: inline with Preview
           if (ImGui::Button("Process chunk")) {
             rf_processing = true;
             rf_preview_active = true;
@@ -1672,9 +2413,9 @@ void OfflineViewer::setup_ui() {
               }
 
               // Build one chunk centered here with overlap
-              const double overlap = df_chunk_size * 0.5;
-              const double chunk_total = rf_chunk_size + 2.0 * overlap;
-              auto chunks = glim::build_chunks(trajectory_data, trajectory_total_dist, trajectory_total_dist + 1.0, chunk_total * 0.5);
+              const double core_size = (df_mode == 1) ? df_chunk_size : rf_chunk_size;
+              const double overlap = core_size * 0.5;
+              const double chunk_total = core_size + 2.0 * overlap;
               // Override: build a single chunk at the found position
               glim::Chunk chunk;
               {
@@ -1693,7 +2434,7 @@ void OfflineViewer::setup_ui() {
                 chunk = {c, R, R.transpose(), chunk_total * 0.5, 50.0};
               }
               glim::Chunk core_chunk = chunk;
-              core_chunk.half_size = df_chunk_size * 0.5;
+              core_chunk.half_size = core_size * 0.5;
 
               // Index all frames
               rf_status = "Indexing frames...";
@@ -1730,6 +2471,10 @@ void OfflineViewer::setup_ui() {
               std::vector<bool> chunk_ground;
               std::vector<float> chunk_normal_z;
               std::vector<bool> chunk_ground_pw;
+              std::vector<bool> chunk_is_ground_scalar;  // from aux_ground.bin (for range ground-only)
+              std::vector<float> chunk_gps_times;         // for GPS time criteria in range mode
+              const bool range_ground_only = (df_mode == 2) && rf_ground_only;
+              const bool need_gps_time = (df_mode == 2) && (rf_criteria == 1);
               const auto chunk_aabb = chunk.world_aabb();
 
               for (const auto& fd : all_mc_frames) {
@@ -1738,14 +2483,34 @@ void OfflineViewer::setup_ui() {
                 if (!glim::load_bin(fd.dir + "/points.bin", pts, fd.num_points)) continue;
                 if (!glim::load_bin(fd.dir + "/range.bin", rng, fd.num_points)) continue;
                 glim::load_bin(fd.dir + "/intensities.bin", ints, fd.num_points);
+                // Load times for GPS time criteria
+                std::vector<float> frame_times;
+                double frame_stamp = 0.0;
+                if (need_gps_time) {
+                  glim::load_bin(fd.dir + "/times.bin", frame_times, fd.num_points);
+                  std::ifstream mf(fd.dir + "/frame_meta.json");
+                  auto meta = nlohmann::json::parse(mf, nullptr, false);
+                  if (!meta.is_discarded()) frame_stamp = meta.value("stamp", 0.0);
+                }
+                // Load ground scalar for range ground-only mode
+                std::vector<float> frame_ground_scalar;
+                if (range_ground_only) glim::load_bin(fd.dir + "/aux_ground.bin", frame_ground_scalar, fd.num_points);
                 std::vector<Eigen::Vector3f> nrm(fd.num_points, Eigen::Vector3f::Zero());
-                if (df_exclude_ground || df_exclude_ground_pw) glim::load_bin(fd.dir + "/normals.bin", nrm, fd.num_points);
+                if (df_exclude_ground_pw) glim::load_bin(fd.dir + "/normals.bin", nrm, fd.num_points);
                 std::vector<bool> pw_gnd;
                 if (df_exclude_ground_pw) {
                   auto cache_it = pw_ground_cache.find(fd.dir);
                   if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == fd.num_points) {
                     pw_gnd = cache_it->second;
-                  } else {
+                  } else if (pw_reuse_scalar) {
+                    std::vector<float> gnd_scalar;
+                    if (glim::load_bin(fd.dir + "/aux_ground.bin", gnd_scalar, fd.num_points) && static_cast<int>(gnd_scalar.size()) == fd.num_points) {
+                      pw_gnd.resize(fd.num_points);
+                      for (int gi = 0; gi < fd.num_points; gi++) pw_gnd[gi] = gnd_scalar[gi] >= 0.5f;
+                      pw_ground_cache[fd.dir] = pw_gnd;
+                    }
+                  }
+                  if (pw_gnd.empty()) {
                     pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, fd.num_points, 1.7f, ints);
                     pw_ground_cache[fd.dir] = pw_gnd;
                   }
@@ -1763,14 +2528,29 @@ void OfflineViewer::setup_ui() {
                   const Eigen::Vector3f wn = (R * nrm[i]).normalized();
                   const float nz = std::abs(wn.z());
                   const bool gpw = !pw_gnd.empty() && pw_gnd[i];
+                  if (range_ground_only) {
+                    chunk_is_ground_scalar.push_back(
+                      i < static_cast<int>(frame_ground_scalar.size()) && frame_ground_scalar[i] >= 0.5f);
+                  }
+                  if (need_gps_time) {
+                    const float base = (gps_time_base > 0.0) ? static_cast<float>(frame_stamp - gps_time_base) : 0.0f;
+                    chunk_gps_times.push_back(base + (i < static_cast<int>(frame_times.size()) ? frame_times[i] : 0.0f));
+                  }
                   chunk_normal_z.push_back(nz);
                   chunk_ground_pw.push_back(gpw);
-                  chunk_ground.push_back((df_exclude_ground && nz > df_ground_normal_z) || (df_exclude_ground_pw && gpw));
+                  chunk_ground.push_back(df_exclude_ground_pw && gpw);
                 }
               }
 
+              // Mode-specific processing
+              std::vector<Eigen::Vector3f> kept_points, removed_points;
+              std::vector<float> kept_ints, removed_ints;
+              rf_preview_data.clear();
+
+              if (df_mode == 1) {
+              // ========== DYNAMIC MODE ==========
               // Pre-MapCleaner ground refinement: revoke false ground labels
-              if (df_refine_ground && (df_exclude_ground || df_exclude_ground_pw)) {
+              if (df_refine_ground && df_exclude_ground_pw) {
                 const float col_res = 1.0f, col_inv = 1.0f / col_res, ground_z_tol = 0.5f;
                 // Find min Z per XY column
                 std::unordered_map<uint64_t, float> col_min_z;
@@ -1823,18 +2603,15 @@ void OfflineViewer::setup_ui() {
               mc_params.lidar_range = df_observation_range;
               mc_params.voxel_size = df_voxel_size;
               mc_params.frame_skip = (all_mc_frames.size() > 200) ? static_cast<int>(all_mc_frames.size() / 200) : 0;
-              mc_params.exclude_ground = df_exclude_ground;
-              mc_params.ground_normal_z = df_ground_normal_z;
               mc_params.exclude_ground_pw = df_exclude_ground_pw;
 
+              logger->info("[Dynamic chunk] {} frames (skip={}), {} pts, chunk_size={:.0f}m",
+                all_mc_frames.size(), mc_params.frame_skip, chunk_pts.size(), core_size);
               glim::MapCleanerFilter filter(mc_params);
               auto result = filter.compute(all_mc_frames, chunk_pts, chunk_ranges, chunk_ground);
               logger->info("[Dynamic chunk] {} static, {} dynamic", result.num_static, result.num_dynamic);
 
-              // Render result as preview (only core area)
-              std::vector<Eigen::Vector3f> kept_points, removed_points;
-              std::vector<float> kept_ints, removed_ints, kept_ranges, removed_ranges;
-              rf_preview_data.clear();
+              // Classify core-area points as kept/removed
               for (size_t i = 0; i < chunk_pts.size(); i++) {
                 if (!core_chunk.contains(chunk_pts[i])) continue;  // only show core area
                 const float nz = (i < static_cast<int>(chunk_normal_z.size())) ? chunk_normal_z[i] : 0.0f;
@@ -1842,12 +2619,10 @@ void OfflineViewer::setup_ui() {
                 if (result.is_dynamic[i]) {
                   removed_points.push_back(chunk_pts[i]);
                   removed_ints.push_back(chunk_intensities[i]);
-                  removed_ranges.push_back(chunk_ranges[i]);
                   rf_preview_data.push_back({chunk_pts[i], chunk_ranges[i], chunk_intensities[i], nz, gpw, false});
                 } else {
                   kept_points.push_back(chunk_pts[i]);
                   kept_ints.push_back(chunk_intensities[i]);
-                  kept_ranges.push_back(chunk_ranges[i]);
                   rf_preview_data.push_back({chunk_pts[i], chunk_ranges[i], chunk_intensities[i], nz, gpw, true});
                 }
               }
@@ -1864,7 +2639,7 @@ void OfflineViewer::setup_ui() {
                   all_vox[k].push_back(i);
                   // Only add as candidate if NOT ground (ground should never be a trail candidate)
                   if (!pp.kept) {
-                    const bool is_gnd = (df_exclude_ground && pp.normal_z > df_ground_normal_z) || (df_exclude_ground_pw && pp.ground_pw);
+                    const bool is_gnd = df_exclude_ground_pw && pp.ground_pw;
                     if (!is_gnd) cand_vox[k].push_back(i);
                     else { rf_preview_data[i].kept = true; }  // force ground back to kept
                   }
@@ -1932,7 +2707,7 @@ void OfflineViewer::setup_ui() {
                     if (!rf_preview_data[idx].kept) continue;
                     const auto& pp = rf_preview_data[idx];
                     // Skip ground
-                    if ((df_exclude_ground && pp.normal_z > df_ground_normal_z) || (df_exclude_ground_pw && pp.ground_pw)) continue;
+                    if (df_exclude_ground_pw && pp.ground_pw) continue;
                     // Only fill if clearly above ground (at or above trail min Z)
                     if (pp.pos.z() < trail_min_z) continue;
                     rf_preview_data[idx].kept = false; filled++;
@@ -1947,6 +2722,85 @@ void OfflineViewer::setup_ui() {
                 if (p.kept) { kept_points.push_back(p.pos); kept_ints.push_back(p.intensity); }
                 else removed_points.push_back(p.pos);
               }
+
+              } else if (df_mode == 2) {
+              // ========== RANGE MODE ==========
+              // Build voxel grid from chunk points (ground-only: only ground enters the grid)
+              const float inv_voxel = 1.0f / rf_voxel_size;
+              struct VoxEntry { size_t idx; float range; float gps_time; };
+              std::unordered_map<uint64_t, std::vector<VoxEntry>> voxels;
+              for (size_t i = 0; i < chunk_pts.size(); i++) {
+                if (!core_chunk.contains(chunk_pts[i])) continue;
+                if (range_ground_only && (i >= chunk_is_ground_scalar.size() || !chunk_is_ground_scalar[i])) continue;
+                const uint64_t key = glim::voxel_key(chunk_pts[i], inv_voxel);
+                const float gt = (i < chunk_gps_times.size()) ? chunk_gps_times[i] : 0.0f;
+                voxels[key].push_back({i, chunk_ranges[i], gt});
+              }
+
+              // Per-voxel discrimination
+              std::vector<bool> is_removed(chunk_pts.size(), false);
+              if (rf_criteria == 0) {
+                // Range criteria
+                for (const auto& [key, entries] : voxels) {
+                  float max_close_range = 0.0f;
+                  int close_count = 0;
+                  for (const auto& e : entries) {
+                    if (e.range <= rf_safe_range) { max_close_range = std::max(max_close_range, e.range); close_count++; }
+                  }
+                  if (close_count < rf_min_close_pts) {
+                    float min_range = std::numeric_limits<float>::max();
+                    for (const auto& e : entries) min_range = std::min(min_range, e.range);
+                    const float far_threshold = min_range + rf_far_delta;
+                    for (const auto& e : entries) { if (e.range > far_threshold) is_removed[e.idx] = true; }
+                    continue;
+                  }
+                  const float threshold = max_close_range + rf_range_delta;
+                  for (const auto& e : entries) {
+                    if (e.range <= rf_safe_range) continue;
+                    if (e.range > threshold) is_removed[e.idx] = true;
+                  }
+                }
+              } else {
+                // GPS Time criteria — keep dominant temporal cluster per voxel
+                const float time_gap = 5.0f;
+                for (const auto& [key, entries] : voxels) {
+                  if (entries.size() <= 1) continue;
+                  std::vector<int> si(entries.size()); std::iota(si.begin(), si.end(), 0);
+                  std::sort(si.begin(), si.end(), [&](int a, int b) { return entries[a].gps_time < entries[b].gps_time; });
+                  std::vector<std::vector<int>> clusters;
+                  clusters.push_back({si[0]});
+                  for (size_t k = 1; k < si.size(); k++) {
+                    if (entries[si[k]].gps_time - entries[si[k-1]].gps_time > time_gap) clusters.push_back({});
+                    clusters.back().push_back(si[k]);
+                  }
+                  if (clusters.size() <= 1) continue;
+                  int best = 0;
+                  if (rf_gps_keep == 0) { for (int tci = 1; tci < static_cast<int>(clusters.size()); tci++) { if (clusters[tci].size() > clusters[best].size()) best = tci; } }
+                  else if (rf_gps_keep == 1) { best = static_cast<int>(clusters.size()) - 1; }  // newest = last cluster (sorted by time)
+                  // else rf_gps_keep == 2: best = 0 (oldest = first cluster, already default)
+                  std::unordered_set<int> keep_set(clusters[best].begin(), clusters[best].end());
+                  for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
+                    if (!keep_set.count(ei)) is_removed[entries[ei].idx] = true;
+                  }
+                }
+              }
+
+              // Build kept/removed lists (core area only)
+              for (size_t i = 0; i < chunk_pts.size(); i++) {
+                if (!core_chunk.contains(chunk_pts[i])) continue;
+                if (is_removed[i]) {
+                  removed_points.push_back(chunk_pts[i]);
+                  rf_preview_data.push_back({chunk_pts[i], chunk_ranges[i], chunk_intensities[i], 0.0f, false, false});
+                } else {
+                  kept_points.push_back(chunk_pts[i]);
+                  kept_ints.push_back(chunk_intensities[i]);
+                  rf_preview_data.push_back({chunk_pts[i], chunk_ranges[i], chunk_intensities[i], 0.0f, false, true});
+                }
+              }
+              size_t total_core = kept_points.size() + removed_points.size();
+              logger->info("[Range chunk] {} kept, {} removed out of {} core points (ground_only={})",
+                kept_points.size(), removed_points.size(), total_core, range_ground_only);
+              } // end mode branch
 
               // Render (same pattern as regular preview — with intensity buffer)
               auto kept_buf2 = std::make_shared<std::vector<Eigen::Vector3f>>(std::move(kept_points));
@@ -1996,6 +2850,7 @@ void OfflineViewer::setup_ui() {
           rf_preview_data.clear();
           lod_hide_all_submaps = false;
         }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove preview overlay and restore normal view.");
 
         ImGui::SameLine();
         if (ImGui::Button("Filter preview")) {
@@ -2031,12 +2886,15 @@ void OfflineViewer::setup_ui() {
 
         // Show chunks visualization
         ImGui::Checkbox("Display chunks", &rf_show_chunks);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show processing chunk boundaries as wireframes.");
         if (rf_show_chunks) {
           if (!trajectory_built) build_trajectory();
           auto vw = guik::LightViewer::instance();
-          const double hs = rf_chunk_size * 0.5;
+          const double active_chunk_size = (df_mode == 1) ? df_chunk_size : rf_chunk_size;
+          const double active_chunk_spacing = (df_mode == 1) ? df_chunk_spacing : rf_chunk_spacing;
+          const double hs = active_chunk_size * 0.5;
           int chunk_count = 0;
-          for (double d = 0.0; d < trajectory_total_dist; d += rf_chunk_spacing) {
+          for (double d = 0.0; d < trajectory_total_dist; d += active_chunk_spacing) {
             size_t idx = 0;
             for (size_t k = 1; k < trajectory_data.size(); k++) {
               if (trajectory_data[k].cumulative_dist >= d) { idx = k; break; }
@@ -2075,7 +2933,7 @@ void OfflineViewer::setup_ui() {
           }
         }
 
-        if (df_mode == 0) {
+        if (df_mode == 2) {
           ImGui::SliderFloat("Chunk size (m)", &rf_chunk_size, 20.0f, 200.0f, "%.0f");
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of each processing chunk.");
           ImGui::SliderFloat("Chunk spacing (m)", &rf_chunk_spacing, 10.0f, 100.0f, "%.0f");
@@ -2088,9 +2946,24 @@ void OfflineViewer::setup_ui() {
         }
 
         if (df_mode == 1 && ImGui::Button("Apply dynamic filter to HD")) {
+          ImGui::OpenPopup("DynApplyGroundReuse");
+        }
+        if (ImGui::BeginPopup("DynApplyGroundReuse")) {
+          ImGui::Text("Reuse existing ground classification?");
+          ImGui::Separator();
+          bool launch = false;
+          bool reuse_ground = false;
+          if (ImGui::Button("Yes — reuse aux_ground.bin")) { reuse_ground = true; launch = true; ImGui::CloseCurrentPopup(); }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses ground from last Classify ground to scalar.\nFaster, recommended if ground is already tuned.");
+          if (ImGui::Button("No — recompute PatchWork++")) { reuse_ground = false; launch = true; ImGui::CloseCurrentPopup(); }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Runs PatchWork++ fresh per frame.\nSlower, use if ground hasn't been classified yet.");
+          ImGui::Separator();
+          if (ImGui::Button("Cancel")) { ImGui::CloseCurrentPopup(); }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Abort without applying.");
+          if (launch) {
           rf_processing = true;
           rf_status = "Starting dynamic filter...";
-          std::thread([this] {
+          std::thread([this, reuse_ground] {
             if (!trajectory_built) build_trajectory();
             const auto start_time = std::chrono::steady_clock::now();
 
@@ -2139,8 +3012,6 @@ void OfflineViewer::setup_ui() {
             mc_params.range_threshold = df_range_threshold;
             mc_params.lidar_range = df_observation_range;
             mc_params.voxel_size = df_voxel_size;
-            mc_params.exclude_ground = df_exclude_ground;
-            mc_params.ground_normal_z = df_ground_normal_z;
             mc_params.exclude_ground_pw = df_exclude_ground_pw;
 
             for (size_t ci = 0; ci < chunks.size(); ci++) {
@@ -2182,14 +3053,22 @@ void OfflineViewer::setup_ui() {
                 if (!glim::load_bin(fd.dir + "/range.bin", rng, fd.num_points)) continue;
                 glim::load_bin(fd.dir + "/intensities.bin", ints, fd.num_points);
                 std::vector<Eigen::Vector3f> nrm(fd.num_points, Eigen::Vector3f::Zero());
-                if (df_exclude_ground || df_exclude_ground_pw) glim::load_bin(fd.dir + "/normals.bin", nrm, fd.num_points);
-                // PatchWork++ ground classification (cached)
+                if (df_exclude_ground_pw) glim::load_bin(fd.dir + "/normals.bin", nrm, fd.num_points);
+                // PatchWork++ ground classification (cached or from popup choice)
                 std::vector<bool> pw_gnd;
                 if (df_exclude_ground_pw) {
                   auto cache_it = pw_ground_cache.find(fd.dir);
                   if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == fd.num_points) {
                     pw_gnd = cache_it->second;
-                  } else {
+                  } else if (reuse_ground) {
+                    std::vector<float> gnd_scalar;
+                    if (glim::load_bin(fd.dir + "/aux_ground.bin", gnd_scalar, fd.num_points) && static_cast<int>(gnd_scalar.size()) == fd.num_points) {
+                      pw_gnd.resize(fd.num_points);
+                      for (int gi = 0; gi < fd.num_points; gi++) pw_gnd[gi] = gnd_scalar[gi] >= 0.5f;
+                      pw_ground_cache[fd.dir] = pw_gnd;
+                    }
+                  }
+                  if (pw_gnd.empty()) {
                     pw_gnd = glim::MapCleanerFilter::classify_ground_patchwork(pts, fd.num_points, 1.7f, ints);
                     pw_ground_cache[fd.dir] = pw_gnd;
                   }
@@ -2203,9 +3082,8 @@ void OfflineViewer::setup_ui() {
                   if (!chunk.contains(wp)) continue;
                   chunk_pts.push_back(wp);
                   chunk_ranges.push_back(rng[i]);
-                  const Eigen::Vector3f wn = (R * nrm[i]).normalized();
                   const bool gpw = !pw_gnd.empty() && pw_gnd[i];
-                  chunk_ground.push_back((df_exclude_ground && std::abs(wn.z()) > df_ground_normal_z) || (df_exclude_ground_pw && gpw));
+                  chunk_ground.push_back(df_exclude_ground_pw && gpw);
                   chunk_sources.push_back({fi, i, core_chunk.contains(wp)});
                 }
               }
@@ -2213,7 +3091,7 @@ void OfflineViewer::setup_ui() {
               if (chunk_pts.empty()) continue;
 
               // Pre-MapCleaner ground refinement (same as process chunk)
-              if (df_refine_ground && (df_exclude_ground || df_exclude_ground_pw)) {
+              if (df_refine_ground && df_exclude_ground_pw) {
                 const float col_res = 1.0f, col_inv = 1.0f / col_res, ground_z_tol = 0.5f;
                 std::unordered_map<uint64_t, float> col_min_z;
                 for (size_t i = 0; i < chunk_pts.size(); i++) {
@@ -2240,6 +3118,64 @@ void OfflineViewer::setup_ui() {
               glim::MapCleanerFilter filter(mc_params);
               auto result = filter.compute(chunk_mc_frames, chunk_pts, chunk_ranges, chunk_ground);
 
+              // Trail refinement (same logic as Process chunk preview)
+              if (df_refine_trails) {
+                const float rv = df_refine_voxel, inv_rv = 1.0f / rv, voxel_vol = rv * rv * rv;
+                std::unordered_map<uint64_t, std::vector<size_t>> cand_vox;
+                for (size_t i = 0; i < chunk_pts.size(); i++) {
+                  if (!result.is_dynamic[i]) continue;
+                  if (chunk_ground[i]) { result.is_dynamic[i] = false; continue; }  // ground → force static
+                  cand_vox[glim::voxel_key(chunk_pts[i], inv_rv)].push_back(i);
+                }
+                // BFS clustering
+                std::unordered_map<uint64_t, int> vox_cluster;
+                std::vector<std::vector<uint64_t>> clusters;
+                int nc = 0;
+                for (const auto& [k, _] : cand_vox) {
+                  if (vox_cluster.count(k)) continue;
+                  std::vector<uint64_t> ck; std::queue<uint64_t> q;
+                  q.push(k); vox_cluster[k] = nc;
+                  while (!q.empty()) {
+                    const uint64_t c = q.front(); q.pop(); ck.push_back(c);
+                    const int cx = static_cast<int>((c >> 42) & 0x1FFFFF) - 1048576;
+                    const int cy = static_cast<int>((c >> 21) & 0x1FFFFF) - 1048576;
+                    const int cz = static_cast<int>(c & 0x1FFFFF) - 1048576;
+                    for (int dz=-1;dz<=1;dz++) for (int dy=-1;dy<=1;dy++) for (int dx=-1;dx<=1;dx++) {
+                      if (!dx && !dy && !dz) continue;
+                      const uint64_t nk = glim::voxel_key(cx+dx, cy+dy, cz+dz);
+                      if (cand_vox.count(nk) && !vox_cluster.count(nk)) { vox_cluster[nk] = nc; q.push(nk); }
+                    }
+                  }
+                  clusters.push_back(std::move(ck)); nc++;
+                }
+                // Evaluate clusters — keep only trail-shaped ones
+                std::unordered_set<uint64_t> trail_voxels;
+                for (int tci = 0; tci < nc; tci++) {
+                  Eigen::Vector3f bmin = Eigen::Vector3f::Constant(1e9f), bmax = Eigen::Vector3f::Constant(-1e9f);
+                  int tp = 0;
+                  for (const auto& vk : clusters[tci]) {
+                    auto it = cand_vox.find(vk);
+                    if (it == cand_vox.end()) continue;
+                    for (size_t idx : it->second) { bmin = bmin.cwiseMin(chunk_pts[idx]); bmax = bmax.cwiseMax(chunk_pts[idx]); tp++; }
+                  }
+                  const Eigen::Vector3f ext = bmax - bmin;
+                  const float longest = ext.maxCoeff(), shortest = std::max(0.01f, ext.minCoeff());
+                  const float density = tp / std::max(0.001f, static_cast<float>(clusters[tci].size()) * voxel_vol);
+                  if (longest >= df_trail_min_length && longest/shortest >= df_trail_min_aspect && density >= df_trail_min_density) {
+                    for (const auto& vk : clusters[tci]) trail_voxels.insert(vk);
+                  }
+                }
+                // Reject non-trail candidates
+                int rejected = 0;
+                for (const auto& [vk, indices] : cand_vox) {
+                  if (!trail_voxels.count(vk)) {
+                    for (size_t idx : indices) { result.is_dynamic[idx] = false; rejected++; }
+                  }
+                }
+                logger->info("[Dynamic apply] Chunk {}/{}: trail refine: {} rejected, {} trail voxels",
+                  ci + 1, chunks.size(), rejected, trail_voxels.size());
+              }
+
               // Only mark removals for points in the CORE area, NEVER ground
               for (size_t i = 0; i < chunk_pts.size(); i++) {
                 if (result.is_dynamic[i] && chunk_sources[i].in_core && !chunk_ground[i]) {
@@ -2265,27 +3201,28 @@ void OfflineViewer::setup_ui() {
               const int num_pts = meta.value("num_points", 0);
               if (num_pts == 0) continue;
 
-              // FINAL SAFETY: load normals + run PatchWork++ to protect ground
-              if (df_exclude_ground || df_exclude_ground_pw) {
-                std::vector<Eigen::Vector3f> pts, nrm;
+              // FINAL SAFETY: run PatchWork++ to protect ground
+              if (df_exclude_ground_pw) {
+                std::vector<Eigen::Vector3f> pts;
                 std::vector<float> ints;
                 glim::load_bin(frame_dir + "/points.bin", pts, num_pts);
-                glim::load_bin(frame_dir + "/normals.bin", nrm, num_pts);
                 glim::load_bin(frame_dir + "/intensities.bin", ints, num_pts);
 
                 std::vector<bool> is_ground(num_pts, false);
-                if (df_exclude_ground_pw && !pts.empty()) {
+                bool ground_loaded = false;
+                if (!pts.empty()) {
                   auto cache_it = pw_ground_cache.find(frame_dir);
                   if (cache_it != pw_ground_cache.end() && static_cast<int>(cache_it->second.size()) == num_pts) {
-                    is_ground = cache_it->second;
-                  } else {
-                    is_ground = glim::MapCleanerFilter::classify_ground_patchwork(pts, num_pts, 1.7f, ints);
+                    is_ground = cache_it->second; ground_loaded = true;
+                  } else if (reuse_ground) {
+                    std::vector<float> gnd_scalar;
+                    if (glim::load_bin(frame_dir + "/aux_ground.bin", gnd_scalar, num_pts) && static_cast<int>(gnd_scalar.size()) == num_pts) {
+                      for (int gi = 0; gi < num_pts; gi++) is_ground[gi] = gnd_scalar[gi] >= 0.5f;
+                      ground_loaded = true;
+                    }
                   }
-                } else if (df_exclude_ground) {
-                  // Use normals — but we need world-frame normals, and we don't have the pose here
-                  // Approximate: check raw normal Z (sensor frame) — ground in sensor frame also has high |Z|
-                  for (int i = 0; i < num_pts && i < static_cast<int>(nrm.size()); i++) {
-                    if (std::abs(nrm[i].z()) > df_ground_normal_z) is_ground[i] = true;
+                  if (!ground_loaded) {
+                    is_ground = glim::MapCleanerFilter::classify_ground_patchwork(pts, num_pts, 1.7f, ints);
                   }
                 }
 
@@ -2314,6 +3251,7 @@ void OfflineViewer::setup_ui() {
               glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), num_pts, kept_indices, new_count);
               glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), num_pts, kept_indices, new_count);
               glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/aux_ground.bin", sizeof(float), num_pts, kept_indices, new_count);
 
               {
                 std::ofstream ofs(meta_path);
@@ -2339,15 +3277,18 @@ void OfflineViewer::setup_ui() {
             logger->info("[Dynamic apply] {}", rf_status);
             rf_processing = false;
           }).detach();
-        }
+          } // end if (launch)
+          ImGui::EndPopup();
+        } // end BeginPopup
         if (df_mode == 1 && ImGui::IsItemHovered()) {
           ImGui::SetTooltip("DESTRUCTIVE: runs MapCleaner chunk-by-chunk along trajectory.\nBackup first with Tools > Utils > Backup HD frames.");
         }
 
-        if (df_mode == 0 && ImGui::Button("Apply to HD frames (chunked)")) {
+        if (df_mode == 2 && ImGui::Button("Apply to HD frames (chunked)")) {
           rf_processing = true;
           rf_status = "Building trajectory...";
-          std::thread([this] {
+          const bool apply_ground_only = rf_ground_only;
+          std::thread([this, apply_ground_only] {
             if (!trajectory_built) build_trajectory();
             const auto start_time = std::chrono::steady_clock::now();
 
@@ -2401,6 +3342,7 @@ void OfflineViewer::setup_ui() {
                 std::vector<float> ranges;
                 std::vector<float> gps_times;
                 std::vector<int> original_indices;
+                std::vector<bool> is_ground;  // from aux_ground.bin (for ground-only mode)
               };
               std::vector<ChunkFrameData> chunk_frames;
 
@@ -2415,6 +3357,8 @@ void OfflineViewer::setup_ui() {
                 if (!glim::load_bin(fi.dir + "/range.bin", range, fi.num_points)) continue;
                 std::vector<float> ftimes(fi.num_points, 0.0f);
                 if (rf_criteria == 1) glim::load_bin(fi.dir + "/times.bin", ftimes, fi.num_points);
+                std::vector<float> frame_ground;
+                if (apply_ground_only) glim::load_bin(fi.dir + "/aux_ground.bin", frame_ground, fi.num_points);
 
                 const Eigen::Matrix3f R = fi.T_world_lidar.rotation().cast<float>();
                 const Eigen::Vector3f t = fi.T_world_lidar.translation().cast<float>();
@@ -2425,21 +3369,24 @@ void OfflineViewer::setup_ui() {
                   if (range[i] < 1.5f) continue;
                   const Eigen::Vector3f wp = R * pts[i] + t;
                   if (chunk.contains(wp)) {
+                    const bool is_gnd = i < static_cast<int>(frame_ground.size()) && frame_ground[i] >= 0.5f;
                     cfd.world_points.push_back(wp);
                     cfd.ranges.push_back(range[i]);
                     cfd.gps_times.push_back(static_cast<float>(fi.stamp - gps_time_base) + ftimes[i]);
                     cfd.original_indices.push_back(i);
+                    cfd.is_ground.push_back(is_gnd);
                   }
                 }
                 if (!cfd.world_points.empty()) chunk_frames.push_back(std::move(cfd));
               }
 
-              // Build cross-frame voxel grid for this chunk
+              // Build cross-frame voxel grid for this chunk (ground-only: skip non-ground)
               struct VoxelEntry { int cf_idx; int pt_idx; float range; float gps_time; };
               std::unordered_map<uint64_t, std::vector<VoxelEntry>> voxels;
               for (int cfi = 0; cfi < static_cast<int>(chunk_frames.size()); cfi++) {
                 const auto& cf = chunk_frames[cfi];
                 for (int pi = 0; pi < static_cast<int>(cf.world_points.size()); pi++) {
+                  if (apply_ground_only && (pi >= static_cast<int>(cf.is_ground.size()) || !cf.is_ground[pi])) continue;
                   const uint64_t key = glim::voxel_key(cf.world_points[pi], inv_voxel);
                   const float gt = (pi < static_cast<int>(cf.gps_times.size())) ? cf.gps_times[pi] : 0.0f;
                   voxels[key].push_back({cfi, pi, cf.ranges[pi], gt});
@@ -2485,7 +3432,8 @@ void OfflineViewer::setup_ui() {
                   }
                   if (clusters.size() <= 1) continue;
                   int best = 0;
-                  for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) { if (clusters[ci].size() > clusters[best].size()) best = ci; }
+                  if (rf_gps_keep == 0) { for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) { if (clusters[ci].size() > clusters[best].size()) best = ci; } }
+                  else if (rf_gps_keep == 1) { best = static_cast<int>(clusters.size()) - 1; }
                   std::unordered_set<int> keep_set(clusters[best].begin(), clusters[best].end());
                   for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
                     if (!keep_set.count(ei)) { frame_removals[chunk_frames[entries[ei].cf_idx].dir].insert(chunk_frames[entries[ei].cf_idx].original_indices[entries[ei].pt_idx]); }
@@ -2524,6 +3472,7 @@ void OfflineViewer::setup_ui() {
               glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), num_pts, kept_indices, new_count);
               glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), num_pts, kept_indices, new_count);
               glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), num_pts, kept_indices, new_count);
+              glim::filter_bin_file(frame_dir + "/aux_ground.bin", sizeof(float), num_pts, kept_indices, new_count);
 
               // Update frame_meta.json
               {
@@ -2571,7 +3520,7 @@ void OfflineViewer::setup_ui() {
           ImGui::SetTooltip("DESTRUCTIVE: applies range filter along the\nfull trajectory. Backup first with Tools > Utils > Backup HD frames.");
         }
 
-        if (df_mode == 2 && ImGui::Button("Apply SOR to HD frames")) {
+        if (df_mode == 0 && ImGui::Button("Apply SOR to HD frames")) {
           rf_processing = true;
           rf_status = "Starting SOR filter...";
           std::thread([this] {
@@ -2685,6 +3634,7 @@ void OfflineViewer::setup_ui() {
               glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), np, kept, nc);
               glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), np, kept, nc);
               glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), np, kept, nc);
+              glim::filter_bin_file(frame_dir + "/aux_ground.bin", sizeof(float), np, kept, nc);
               { std::ofstream ofs(mp); ofs << std::setprecision(15) << std::fixed;
                 ofs << "{\n  \"frame_id\": " << meta.value("frame_id", 0) << ",\n";
                 ofs << "  \"stamp\": " << meta.value("stamp", 0.0) << ",\n";
@@ -2702,7 +3652,7 @@ void OfflineViewer::setup_ui() {
             rf_processing = false;
           }).detach();
         }
-        if (df_mode == 2 && ImGui::IsItemHovered()) {
+        if (df_mode == 0 && ImGui::IsItemHovered()) {
           ImGui::SetTooltip("DESTRUCTIVE: removes outlier points from HD frames.\nUses spatial grid (no trajectory needed).\nBackup first.");
         }
       }
@@ -3185,6 +4135,16 @@ void OfflineViewer::main_menu() {
         }
 
         ImGui::Separator();
+
+        // Voxelize HD data
+        if (!has_hd) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Voxelize HD data", nullptr, show_voxelize_tool)) {
+          show_voxelize_tool = !show_voxelize_tool;
+        }
+        if (!has_hd) {
+          if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("No HD frames available.");
+          ImGui::EndDisabled();
+        }
 
         // Regenerate SD from HD
         if (!has_hd) ImGui::BeginDisabled();
@@ -4379,6 +5339,7 @@ std::pair<size_t, size_t> OfflineViewer::apply_range_filter_to_frame(const std::
   glim::filter_bin_file(frame_dir + "/times.bin", sizeof(float), num_pts, kept_indices, new_count);
   glim::filter_bin_file(frame_dir + "/range.bin", sizeof(float), num_pts, kept_indices, new_count);
   glim::filter_bin_file(frame_dir + "/rings.bin", sizeof(uint16_t), num_pts, kept_indices, new_count);
+  glim::filter_bin_file(frame_dir + "/aux_ground.bin", sizeof(float), num_pts, kept_indices, new_count);
 
   // Update frame_meta.json with new point count
   {

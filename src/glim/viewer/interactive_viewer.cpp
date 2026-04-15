@@ -631,7 +631,12 @@ void InteractiveViewer::viewer_loop() {
         }
         rs.current_lod = SubmapLOD::LOADING_HD;
         const auto hd_it = session_hd_paths.find(submap->session_id);
-        const std::string hd_path = (hd_it != session_hd_paths.end()) ? hd_it->second : hd_frames_path;
+        std::string hd_path = (hd_it != session_hd_paths.end()) ? hd_it->second : hd_frames_path;
+        // Swap to voxelized path if enabled
+        if (lod_use_voxelized) {
+          const std::string vox_path = hd_path + "_voxelized";
+          if (boost::filesystem::exists(vox_path)) hd_path = vox_path;
+        }
         lod_work_queue.push_back({i, submap, submap_poses[i], submap->session_id, dist, true, hd_path});
         continue;
       }
@@ -676,11 +681,11 @@ void InteractiveViewer::viewer_loop() {
       }
       if (hd_available) {
         if (ImGui::Checkbox("Display HD only", &lod_hd_only)) {
-          if (lod_hd_only) lod_hd_enabled = true;  // auto-enable HD when HD-only is checked
+          if (lod_hd_only) lod_hd_enabled = true;
         }
-        if (ImGui::IsItemHovered()) {
-          ImGui::SetTooltip("Hide SD submaps, show only HD (LOD 0) data.\nUseful for range filter preview.");
-        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide SD submaps, show only HD (LOD 0) data.");
+        ImGui::Checkbox("Use voxelized HD", &lod_use_voxelized);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Load from hd_frames_voxelized/ instead of hd_frames/.\nRun Voxelize HD first to generate the data.");
       }
       if (!hd_available) ImGui::EndDisabled();
 
@@ -1957,6 +1962,7 @@ void InteractiveViewer::lod_worker_task() {
         std::vector<float> all_intensities;
         std::vector<float> all_range;
         std::vector<float> all_gps_time;
+        std::vector<float> all_ground;
         size_t hd_point_count = 0;
         int frames_found = 0, frames_missing = 0;
 
@@ -2022,20 +2028,30 @@ void InteractiveViewer::lod_worker_task() {
             }
           }
 
+          // Read aux_ground.bin (optional — from Dynamic filter "Save ground to HD")
+          std::vector<float> frame_ground;
+          {
+            std::ifstream ifs(frame_dir + "/aux_ground.bin", std::ios::binary);
+            if (ifs) {
+              frame_ground.resize(num_pts);
+              ifs.read(reinterpret_cast<char*>(frame_ground.data()), sizeof(float) * num_pts);
+            }
+          }
+
           // Compute optimized world pose for this frame
           const Eigen::Isometry3d T_world_endpoint_L = submap->T_world_origin * submap->T_origin_endpoint_L;
           const Eigen::Isometry3d T_odom_imu0 = submap->frames.front()->T_world_imu;
           const Eigen::Isometry3d T_world_imu = T_world_endpoint_L * T_odom_imu0.inverse() * frame->T_world_imu;
           const Eigen::Isometry3d T_world_lidar = T_world_imu * frame->T_lidar_imu.inverse();
-          const Eigen::Matrix3f R = T_world_lidar.rotation().cast<float>();
-          const Eigen::Vector3f t_vec = T_world_lidar.translation().cast<float>();
+          Eigen::Matrix3f R; Eigen::Vector3f t_vec;
+          if (lod_use_voxelized) { R = Eigen::Matrix3f::Identity(); t_vec = Eigen::Vector3f::Zero(); }
+          else { R = T_world_lidar.rotation().cast<float>(); t_vec = T_world_lidar.translation().cast<float>(); }
 
           // Transform points to world frame, filtering by min range
-          constexpr float HD_MIN_RANGE = 1.5f;  // skip near-sensor noise
+          constexpr float HD_MIN_RANGE = 1.5f;
           for (int pi = 0; pi < num_pts; pi++) {
-            // Range filter: skip points too close to sensor
             const float r = frame_range.empty() ? frame_points[pi].norm() : frame_range[pi];
-            if (r < HD_MIN_RANGE) continue;
+            if (!lod_use_voxelized && r < HD_MIN_RANGE) continue;  // skip range filter for voxelized
 
             all_points.push_back(R * frame_points[pi] + t_vec);
             if (!frame_normals.empty()) {
@@ -2048,6 +2064,7 @@ void InteractiveViewer::lod_worker_task() {
               const float base = (gps_time_base > 0.0) ? static_cast<float>(frame_stamp - gps_time_base) : 0.0f;
               all_gps_time.push_back(base + frame_times[pi]);
             }
+            if (!frame_ground.empty()) all_ground.push_back(frame_ground[pi]);
             hd_point_count++;
           }
           frames_found++;
@@ -2065,6 +2082,7 @@ void InteractiveViewer::lod_worker_task() {
         auto intensities_buf = std::make_shared<std::vector<float>>(std::move(all_intensities));
         auto range_buf = std::make_shared<std::vector<float>>(std::move(all_range));
         auto gps_time_buf = std::make_shared<std::vector<float>>(std::move(all_gps_time));
+        auto ground_buf = std::make_shared<std::vector<float>>(std::move(all_ground));
 
         // Convert Vector3f→Vector4d on worker thread (NOT in invoke — avoids GL thread stall)
         const int n_pts = static_cast<int>(all_points.size());
@@ -2075,7 +2093,7 @@ void InteractiveViewer::lod_worker_task() {
         }
 
         guik::LightViewer::instance()->invoke([this, idx, sid, submap_id, points_4d, normals_buf,
-                                                intensities_buf, range_buf, gps_time_buf, hd_pts, n_pts] {
+                                                intensities_buf, range_buf, gps_time_buf, ground_buf, hd_pts, n_pts] {
           auto viewer = guik::LightViewer::instance();
           if (idx >= static_cast<int>(render_states.size()) ||
               render_states[idx].current_lod != SubmapLOD::LOADING_HD) {
@@ -2089,18 +2107,40 @@ void InteractiveViewer::lod_worker_task() {
           }
 
           // Upload aux attribute buffers for colormap rendering
+          // Also track min/max per attribute from HD data (used as fallback for cmap_range)
+          auto track_hd_range = [this](const std::string& name, const std::vector<float>& buf) {
+            float bmin = std::numeric_limits<float>::max(), bmax = std::numeric_limits<float>::lowest();
+            for (float v : buf) { if (std::isfinite(v)) { bmin = std::min(bmin, v); bmax = std::max(bmax, v); } }
+            if (bmin <= bmax) {
+              auto it = hd_attr_ranges.find(name);
+              if (it == hd_attr_ranges.end()) { hd_attr_ranges[name] = Eigen::Vector2f(bmin, bmax); }
+              else { it->second[0] = std::min(it->second[0], bmin); it->second[1] = std::max(it->second[1], bmax); }
+            }
+          };
           std::string first_aux_name;
           if (intensities_buf->size() == static_cast<size_t>(n_pts)) {
             cloud_buffer->add_buffer("intensity", *intensities_buf);
+            track_hd_range("intensity", *intensities_buf);
             if (first_aux_name.empty()) first_aux_name = "intensity";
           }
           if (range_buf->size() == static_cast<size_t>(n_pts)) {
             cloud_buffer->add_buffer("range", *range_buf);
+            track_hd_range("range", *range_buf);
             if (first_aux_name.empty()) first_aux_name = "range";
           }
           if (gps_time_buf->size() == static_cast<size_t>(n_pts)) {
             cloud_buffer->add_buffer("gps_time", *gps_time_buf);
+            track_hd_range("gps_time", *gps_time_buf);
             if (first_aux_name.empty()) first_aux_name = "gps_time";
+          }
+          if (ground_buf->size() == static_cast<size_t>(n_pts)) {
+            cloud_buffer->add_buffer("ground", *ground_buf);
+            track_hd_range("ground", *ground_buf);
+            if (first_aux_name.empty()) first_aux_name = "ground";
+            // Register "ground" in aux_attribute_names if not already present
+            if (std::find(aux_attribute_names.begin(), aux_attribute_names.end(), "ground") == aux_attribute_names.end()) {
+              aux_attribute_names.push_back("ground");
+            }
           }
 
           // Set active colormap buffer
@@ -2544,7 +2584,7 @@ void InteractiveViewer::update_viewer() {
               const float* data = static_cast<const float*>(it->second.second);
               for (int k = 0; k < n; k++) {
                 const float v = data[k];
-                if (std::isfinite(v) && v > 0.0f) {
+                if (std::isfinite(v)) {
                   sm_min = std::min(sm_min, v);
                   sm_max = std::max(sm_max, v);
                   if (samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
@@ -2581,10 +2621,17 @@ void InteractiveViewer::update_viewer() {
                     << " samples=" << samples.size() << std::endl;
           // Use global min/max (covers all submaps regardless of cap) as the range.
           // Fall back to percentile of samples if no global range was computed.
+          // Final fallback: HD tile ranges (for attributes like "ground" that only exist in HD data).
           if (global_min <= global_max) {
             aux_cmap_range = Eigen::Vector2f(global_min, global_max);
           } else if (!samples.empty()) {
             aux_cmap_range = percentile_range(samples);
+          } else {
+            auto hd_it = hd_attr_ranges.find(attr_name);
+            if (hd_it != hd_attr_ranges.end()) {
+              aux_cmap_range = hd_it->second;
+              std::cerr << "[FULL-SCAN] Using HD range for " << attr_name << ": [" << hd_it->second[0] << ", " << hd_it->second[1] << "]" << std::endl;
+            }
           }
         }
       }
@@ -2730,7 +2777,7 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
             const float* data = static_cast<const float*>(it->second.second);
             for (int k = 0; k < n; k++) {
               const float v = data[k];
-              if (std::isfinite(v) && v > 0.0f && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
+              if (std::isfinite(v) && samples.size() < AUX_SAMPLE_CAP) samples.push_back(v);
             }
           } else if (it->second.first == sizeof(double)) {
             const double* data = static_cast<const double*>(it->second.second);

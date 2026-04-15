@@ -140,7 +140,7 @@ private:
 
   // Data filter tool (range + dynamic modes)
   bool show_data_filter = false;
-  int  df_mode = 0;                  // 0=Range, 1=Dynamic, 2=SOR, 3=Scalar
+  int  df_mode = 0;                  // 0=SOR, 1=Dynamic, 2=Range, 3=Scalar
 
   // Scalar visibility tool
   int   sv_field_idx = 0;             // selected scalar field index
@@ -148,12 +148,14 @@ private:
   bool  sv_hide_below = false;        // hide points below threshold
   bool  sv_hide_above = false;        // hide points above threshold
   int   rf_criteria = 0;              // 0=Range, 1=GPS Time
+  int   rf_gps_keep = 0;              // 0=Dominant (most points), 1=Newest, 2=Oldest
   float rf_voxel_size = 1.0f;        // metres (range mode default)
-  float rf_safe_range = 30.0f;      // metres — points within this always kept (range mode)
+  float rf_safe_range = 20.0f;      // metres — points within this always kept (range mode)
   float rf_range_delta = 10.0f;     // metres — remove if >delta further than closest in voxel
   float rf_far_delta = 30.0f;       // metres — in voxels with no safe-range points, remove if > min_range + far_delta
   int   rf_min_close_pts = 3;       // min close points to trigger removal of distant ones
   float rf_range_highlight = 0.0f; // range threshold for red tinting (0=off)
+  bool  rf_ground_only = false;   // range filter affects only ground-classified points (requires aux_ground.bin)
   bool rf_preview_active = false;  // preview overlay is showing — hide other LOD data
   bool rf_intensity_mode = false;  // toggle intensity display on preview
 
@@ -162,25 +164,38 @@ private:
   float df_range_threshold = 0.8f;
   float df_observation_range = 30.0f;
   int   df_min_observations = 15;
-  bool  df_exclude_ground = false;
-  float df_ground_normal_z = 0.7f;
   bool  df_exclude_ground_pw = true;
   bool  show_pw_config = false;
   bool  show_trail_config = false;
+  bool  pw_accumulate = false;         // accumulate neighboring frames for PatchWork++
+  int   pw_accumulate_count = 10;      // number of prior frames to include (or next frames at start)
+  bool  pw_reuse_scalar = false;        // reuse aux_ground.bin if it exists instead of recomputing
   std::unordered_map<std::string, std::vector<bool>> pw_ground_cache;  // frame_dir → cached ground flags
   float df_chunk_size = 120.0f;        // chunk size for dynamic filter (larger = more trail context)
   float df_chunk_spacing = 60.0f;      // chunk spacing for dynamic filter
   bool  df_refine_ground = true;       // refine ground labels using Z + intensity
   bool  df_refine_trails = true;       // cluster candidates into trails, reject noise
   float df_trail_min_length = 7.0f;
-  float df_trail_min_aspect = 9.0f;
+  float df_trail_min_aspect = 5.0f;
   float df_trail_min_density = 11.0f;
-  float df_refine_voxel = 0.48f;
+  float df_refine_voxel = 0.23f;
 
   // SOR filter params
   float sor_radius = 0.3f;             // search radius (metres)
   int   sor_min_neighbors = 5;         // minimum neighbors within radius to keep
   float sor_chunk_size = 100.0f;       // spatial chunk size (metres, axis-aligned cube)
+
+  // Voxelize HD tool
+  bool  show_voxelize_tool = false;
+  float vox_size = 0.03f;              // voxel size in metres
+  int   vox_mode = 2;                  // 0=center, 1=weighted, 2=XY center + Z weighted
+  bool  vox_use_center = true;         // legacy, derived from vox_mode
+  float vox_chunk_size = 60.0f;        // chunk size for processing
+  float vox_chunk_spacing = 30.0f;     // chunk spacing
+  bool  vox_processing = false;
+  std::string vox_status;
+  bool  vox_ground_only = false;       // ground-only mode: 1 point per XY cell (requires aux_ground.bin)
+  bool  lod_use_voxelized = false;     // LOD checkbox: load from hd_frames_voxelized/
 
   // Cached preview data (kept in CPU memory for range highlight re-coloring)
   struct PreviewPoint {

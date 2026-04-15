@@ -95,6 +95,7 @@ protected:
 
   static constexpr size_t AUX_SAMPLE_CAP = 500000;
   std::unordered_map<std::string, std::vector<float>> aux_attr_samples;  // filtered (isfinite && >0) samples per attr
+  std::unordered_map<std::string, Eigen::Vector2f> hd_attr_ranges;     // per-attribute min/max from HD tile uploads
   double gps_time_base;  // first gps_time seen; subtract before float cast to preserve float32 precision
 
   float coord_scale;
@@ -176,6 +177,7 @@ protected:
   float lod_sd_range = 300.0f;     // metres — submaps within this distance get SD
   float lod_vram_budget_mb = 4096.0f;
   bool show_memory_manager = false;
+  bool lod_use_voxelized = false;     // load from hd_frames_voxelized/ instead of hd_frames/
 
   // Frustum culling
   static bool frustum_test_aabb(const Eigen::Matrix4f& vp, const Eigen::AlignedBox3f& box);

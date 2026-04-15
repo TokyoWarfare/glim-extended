@@ -39,8 +39,6 @@ public:
     int frame_skip;         // process every (skip+1)th frame
     float min_range;        // skip points closer than this
 
-    bool exclude_ground;    // skip ground points using normals
-    float ground_normal_z;  // Z-normal threshold for ground detection
     bool exclude_ground_pw; // skip ground points using PatchWork++
 
     Params()
@@ -49,7 +47,7 @@ public:
         range_threshold(0.5f), delta_h(2), delta_v(1),
         lidar_range(70.0f), submap_update_dist(10.0f),
         voxel_size(0.2f), frame_skip(0), min_range(1.5f),
-        exclude_ground(false), ground_normal_z(0.7f), exclude_ground_pw(true) {}
+        exclude_ground_pw(true) {}
   };
 
   struct Result {
