@@ -35,7 +35,7 @@ endif()
 
 if(BUILD_WITH_OPENCV)
   set(GLIM_USE_OPENCV 1)
-  find_package(OpenCV REQUIRED COMPONENTS core)
+  find_package(OpenCV REQUIRED COMPONENTS core imgcodecs highgui imgproc calib3d)
 else()
   set(GLIM_USE_OPENCV 0)
 endif()
@@ -170,9 +170,11 @@ if(BUILD_WITH_VIEWER)
     src/glim/viewer/offline_viewer.cpp
     src/glim/util/map_cleaner.cpp
     src/glim/util/patchworkpp.cpp
+    src/glim/util/colorizer.cpp
   )
   target_link_libraries(interactive_viewer
     glim
+    exif
   )
 
   # Map editor

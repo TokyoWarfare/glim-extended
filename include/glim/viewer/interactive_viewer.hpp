@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <unordered_map>
@@ -45,7 +46,7 @@ class InteractiveViewer : public ExtensionModule {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-  enum class PickType { POINTS = 1, FRAME = (1 << 1), FACTOR = (1 << 2) };
+  enum class PickType { POINTS = 1, FRAME = (1 << 1), FACTOR = (1 << 2), CAMERA = (1 << 3) };
   enum class FactorType { MATCHING_COST, BETWEEN, IMU };
 
   InteractiveViewer();
@@ -65,6 +66,7 @@ protected:
   void drawable_selection();
   void on_click();
   void context_menu();
+  std::function<void()> extra_context_menu_items;  // called inside popup before EndPopup
   void run_modals();
 
   void update_viewer();
@@ -107,6 +109,9 @@ protected:
   bool draw_factors;
   bool draw_spheres;
   bool draw_coords;
+  bool draw_cameras = false;
+  bool draw_frames = false;
+  float frame_coord_scale = 0.15f;
 
   float min_overlap;
   bool cont_optimize;

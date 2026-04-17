@@ -510,6 +510,9 @@ void InteractiveViewer::viewer_loop() {
     if (!draw_coords && starts_with(name, "coord_")) {
       return false;
     }
+    if (!draw_frames && name == "frame_coords") {
+      return false;
+    }
 
     return true;
   });
@@ -911,8 +914,18 @@ void InteractiveViewer::drawable_selection() {
     color_modes.push_back(name.c_str());
   }
   if (ImGui::Combo("ColorMode", &color_mode, color_modes.data(), color_modes.size())) {
-    aux_attr_samples.clear();  // discard old samples so full-scan re-collects for new attribute
+    aux_attr_samples.clear();
     aux_cmap_range = Eigen::Vector2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::lowest());
+    // Force HD tile reload when switching to/from RGB (vertex colors need re-upload)
+    const int aidx_new = color_mode - 3;
+    const bool switching_rgb = (aidx_new >= 0 && aidx_new < static_cast<int>(aux_attribute_names.size()) && aux_attribute_names[aidx_new] == "RGB");
+    static bool was_rgb = false;
+    if (switching_rgb != was_rgb) {
+      for (auto& rs : render_states) {
+        if (rs.current_lod == SubmapLOD::HD) rs.current_lod = SubmapLOD::BBOX;  // force reload
+      }
+    }
+    was_rgb = switching_rgb;
     update_viewer();
   }
   show_note("Color mode for rendering submaps.\n- RAINBOW=Altitude encoding color\n- SESSION=Session ID\n- NORMAL=Surface normal direction\n- others=Per-point attribute colormap");
@@ -926,6 +939,11 @@ void InteractiveViewer::drawable_selection() {
   ImGui::Checkbox("Spheres", &draw_spheres);
 
   ImGui::Checkbox("Coords", &draw_coords);
+  ImGui::SameLine();
+  ImGui::Checkbox("Cameras", &draw_cameras);
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Frames", &draw_frames)) update_viewer();
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show a small RGB triad at every per-frame sensor pose.");
 
   if (ImGui::BeginMenu("Display settings")) {
     bool do_update_viewer = false;
@@ -935,6 +953,9 @@ void InteractiveViewer::drawable_selection() {
 
     do_update_viewer |= ImGui::DragFloat("sphere scale", &sphere_scale, 0.01f, 0.01f, 100.0f);
     show_note("Submap selection sphere maker scale.");
+
+    do_update_viewer |= ImGui::DragFloat("frame triad scale", &frame_coord_scale, 0.005f, 0.01f, 5.0f);
+    show_note("Per-frame RGB triad length (meters).");
 
     auto viewer = guik::viewer();
     if (ImGui::Checkbox("Cumulative rendering", &enable_partial_rendering)) {
@@ -1149,14 +1170,15 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
     if (npts == 0) continue;
 
     std::vector<Eigen::Vector3f> pts(npts);
-    std::vector<float> range(npts);
     std::vector<float> intensity(npts, 0.0f);
     std::vector<float> frame_times(npts, 0.0f);
+    bool has_range = false;
+    std::vector<float> range(npts);
     { std::ifstream f(frame_dir + "/points.bin", std::ios::binary);
       if (!f) continue;
       f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * npts); }
     { std::ifstream f(frame_dir + "/range.bin", std::ios::binary);
-      if (f) f.read(reinterpret_cast<char*>(range.data()), sizeof(float) * npts); }
+      if (f) { f.read(reinterpret_cast<char*>(range.data()), sizeof(float) * npts); has_range = true; } }
     { std::ifstream f(frame_dir + "/intensities.bin", std::ios::binary);
       if (f) f.read(reinterpret_cast<char*>(intensity.data()), sizeof(float) * npts); }
     { std::ifstream f(frame_dir + "/times.bin", std::ios::binary);
@@ -1171,7 +1193,8 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
 
     const double frame_stamp = frame->stamp;
     for (int pi = 0; pi < npts; pi++) {
-      if (range[pi] < 1.5f) continue;
+      const float r = has_range ? range[pi] : pts[pi].norm();
+      if (r < 1.5f) continue;
       const Eigen::Vector3d lp = R * pts[pi].cast<double>() + t;
       all_points.push_back(Eigen::Vector4d(lp.x(), lp.y(), lp.z(), 1.0));
       all_intensities.push_back(static_cast<double>(intensity[pi]));
@@ -1757,6 +1780,9 @@ void InteractiveViewer::context_menu() {
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Place a cylinder probe to find which submaps\nhave points in this area. Useful for identifying\nsources of misaligned features.");
 
+    // Extension point for subclass context menu items
+    if (extra_context_menu_items) extra_context_menu_items();
+
     ImGui::EndPopup();
   }
 }
@@ -1963,6 +1989,7 @@ void InteractiveViewer::lod_worker_task() {
         std::vector<float> all_range;
         std::vector<float> all_gps_time;
         std::vector<float> all_ground;
+        std::vector<Eigen::Vector4f> all_rgb_colors;
         size_t hd_point_count = 0;
         int frames_found = 0, frames_missing = 0;
 
@@ -2038,6 +2065,16 @@ void InteractiveViewer::lod_worker_task() {
             }
           }
 
+          // Read aux_rgb.bin (optional — from Colorize Apply)
+          std::vector<float> frame_rgb;
+          {
+            std::ifstream ifs(frame_dir + "/aux_rgb.bin", std::ios::binary);
+            if (ifs) {
+              frame_rgb.resize(num_pts * 3);
+              ifs.read(reinterpret_cast<char*>(frame_rgb.data()), sizeof(float) * num_pts * 3);
+            }
+          }
+
           // Compute optimized world pose for this frame
           const Eigen::Isometry3d T_world_endpoint_L = submap->T_world_origin * submap->T_origin_endpoint_L;
           const Eigen::Isometry3d T_odom_imu0 = submap->frames.front()->T_world_imu;
@@ -2065,6 +2102,9 @@ void InteractiveViewer::lod_worker_task() {
               all_gps_time.push_back(base + frame_times[pi]);
             }
             if (!frame_ground.empty()) all_ground.push_back(frame_ground[pi]);
+            if (!frame_rgb.empty() && pi * 3 + 2 < static_cast<int>(frame_rgb.size())) {
+              all_rgb_colors.push_back(Eigen::Vector4f(frame_rgb[pi*3], frame_rgb[pi*3+1], frame_rgb[pi*3+2], 1.0f));
+            }
             hd_point_count++;
           }
           frames_found++;
@@ -2083,6 +2123,7 @@ void InteractiveViewer::lod_worker_task() {
         auto range_buf = std::make_shared<std::vector<float>>(std::move(all_range));
         auto gps_time_buf = std::make_shared<std::vector<float>>(std::move(all_gps_time));
         auto ground_buf = std::make_shared<std::vector<float>>(std::move(all_ground));
+        auto rgb_colors_buf = std::make_shared<std::vector<Eigen::Vector4f>>(std::move(all_rgb_colors));
 
         // Convert Vector3f→Vector4d on worker thread (NOT in invoke — avoids GL thread stall)
         const int n_pts = static_cast<int>(all_points.size());
@@ -2093,7 +2134,7 @@ void InteractiveViewer::lod_worker_task() {
         }
 
         guik::LightViewer::instance()->invoke([this, idx, sid, submap_id, points_4d, normals_buf,
-                                                intensities_buf, range_buf, gps_time_buf, ground_buf, hd_pts, n_pts] {
+                                                intensities_buf, range_buf, gps_time_buf, ground_buf, rgb_colors_buf, hd_pts, n_pts] {
           auto viewer = guik::LightViewer::instance();
           if (idx >= static_cast<int>(render_states.size()) ||
               render_states[idx].current_lod != SubmapLOD::LOADING_HD) {
@@ -2102,7 +2143,17 @@ void InteractiveViewer::lod_worker_task() {
 
           auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(points_4d->data(), n_pts);
 
-          if (!normals_buf->empty()) {
+          // Determine if RGB mode is active
+          bool rgb_mode_active = false;
+          if (color_mode >= 3) {
+            const int aidx = color_mode - 3;
+            if (aidx >= 0 && aidx < static_cast<int>(aux_attribute_names.size()) && aux_attribute_names[aidx] == "RGB")
+              rgb_mode_active = true;
+          }
+          // Upload vertex colors: RGB if available and active, otherwise normals
+          if (rgb_mode_active && rgb_colors_buf->size() == static_cast<size_t>(n_pts)) {
+            cloud_buffer->add_color(*rgb_colors_buf);
+          } else if (!normals_buf->empty()) {
             cloud_buffer->add_color(*normals_buf);
           }
 
@@ -2142,6 +2193,12 @@ void InteractiveViewer::lod_worker_task() {
               aux_attribute_names.push_back("ground");
             }
           }
+          // RGB: register in dropdown but don't override normals vertex color for now
+          if (rgb_colors_buf->size() == static_cast<size_t>(n_pts)) {
+            if (std::find(aux_attribute_names.begin(), aux_attribute_names.end(), "RGB") == aux_attribute_names.end()) {
+              aux_attribute_names.push_back("RGB");
+            }
+          }
 
           // Set active colormap buffer
           if (color_mode >= 3) {
@@ -2160,7 +2217,13 @@ void InteractiveViewer::lod_worker_task() {
             case 0: break;  // RAINBOW
             case 1: shader_setting.set_color_mode(guik::ColorMode::FLAT_COLOR); break;  // SESSION
             case 2: shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLOR); break;  // NORMAL
-            default: shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP); break;  // AUX
+            default: {
+              const int aidx = color_mode - 3;
+              if (aidx >= 0 && aidx < static_cast<int>(aux_attribute_names.size()) && aux_attribute_names[aidx] == "RGB")
+                shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLOR);
+              else shader_setting.set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+              break;
+            }
           }
 
           viewer->update_drawable("submap_" + std::to_string(submap_id), cloud_buffer, shader_setting);
@@ -2378,7 +2441,13 @@ void InteractiveViewer::update_viewer() {
           case 0: drawable.first->set_color_mode(guik::ColorMode::RAINBOW); break;
           case 1: drawable.first->set_color_mode(guik::ColorMode::FLAT_COLOR); break;
           case 2: drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLOR); break;
-          default: drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP); break;
+          default: {
+            const int aidx2 = color_mode - 3;
+            if (aidx2 >= 0 && aidx2 < static_cast<int>(aux_attribute_names.size()) && aux_attribute_names[aidx2] == "RGB")
+              drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLOR);
+            else drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+            break;
+          }
         }
       }
       continue;
@@ -2410,7 +2479,13 @@ void InteractiveViewer::update_viewer() {
           case 0: drawable.first->set_color_mode(guik::ColorMode::RAINBOW); break;
           case 1: drawable.first->set_color_mode(guik::ColorMode::FLAT_COLOR); break;
           case 2: drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLOR); break;
-          default: drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP); break;
+          default: {
+            const int aidx2 = color_mode - 3;
+            if (aidx2 >= 0 && aidx2 < static_cast<int>(aux_attribute_names.size()) && aux_attribute_names[aidx2] == "RGB")
+              drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLOR);
+            else drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+            break;
+          }
         }
       }
       continue;
@@ -2729,6 +2804,37 @@ void InteractiveViewer::update_viewer() {
   auto traj_line = std::make_shared<glk::ThinLines>(traj, traj_cols, true);
   traj_line->set_line_width(2.0f);
   viewer->update_drawable("traj", traj_line, guik::VertexColor());
+
+  // Per-frame triads — one ThinLines drawable with 3 axes per frame (RGB)
+  if (draw_frames) {
+    std::vector<Eigen::Vector3f> fc_pts;
+    std::vector<Eigen::Vector4f> fc_cols;
+    const float s = frame_coord_scale;
+    const Eigen::Vector4f cx(1.0f, 0.2f, 0.2f, 1.0f);
+    const Eigen::Vector4f cy(0.2f, 1.0f, 0.2f, 1.0f);
+    const Eigen::Vector4f cz(0.3f, 0.5f, 1.0f, 1.0f);
+    for (const auto& submap : submaps) {
+      if (!submap || submap->frames.empty()) continue;
+      if (hidden_sessions.count(submap->session_id)) continue;
+      const Eigen::Isometry3d T_world_endpoint_L = submap->T_world_origin * submap->T_origin_endpoint_L;
+      const Eigen::Isometry3d T_odom_imu0 = submap->frames.front()->T_world_imu;
+      for (const auto& frame : submap->frames) {
+        const Eigen::Isometry3d T = T_world_endpoint_L * T_odom_imu0.inverse() * frame->T_world_imu;
+        const Eigen::Vector3f o = T.translation().cast<float>();
+        const Eigen::Matrix3f R = T.rotation().cast<float>();
+        fc_pts.push_back(o); fc_pts.push_back(o + R.col(0) * s); fc_cols.push_back(cx); fc_cols.push_back(cx);
+        fc_pts.push_back(o); fc_pts.push_back(o + R.col(1) * s); fc_cols.push_back(cy); fc_cols.push_back(cy);
+        fc_pts.push_back(o); fc_pts.push_back(o + R.col(2) * s); fc_cols.push_back(cz); fc_cols.push_back(cz);
+      }
+    }
+    if (!fc_pts.empty()) {
+      auto lines = std::make_shared<glk::ThinLines>(fc_pts, fc_cols, false);
+      lines->set_line_width(1.5f);
+      viewer->update_drawable("frame_coords", lines, guik::VertexColor());
+    } else {
+      viewer->remove_drawable("frame_coords");
+    }
+  }
 }
 
 void InteractiveViewer::odometry_on_new_frame(const EstimationFrame::ConstPtr& new_frame) {

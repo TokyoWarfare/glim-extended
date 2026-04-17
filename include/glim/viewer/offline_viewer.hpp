@@ -7,6 +7,8 @@
 #include <glim/mapping/global_mapping.hpp>
 #include <glim/mapping/async_global_mapping.hpp>
 #include <glim/viewer/interactive_viewer.hpp>
+#include <opencv2/core.hpp>
+#include <glim/util/colorizer.hpp>
 
 namespace guik {
 class ProgressModal;
@@ -115,6 +117,7 @@ private:
   struct TrajectoryPoint {
     Eigen::Isometry3d pose;  // full 6-DOF pose (T_world_lidar)
     double cumulative_dist;  // metres from start
+    double stamp;            // frame timestamp (UNIX epoch)
     int session_id;
     long frame_id;
   };
@@ -220,6 +223,72 @@ private:
   bool  export_hd              = false; // export HD frames instead of SD submaps
   int   geoid_correction_mode  = 0;    // 0=None  1=Manual  2=Auto EGM2008
   float geoid_manual_offset    = 0.0f; // metres, used when mode==1
+
+  // Colorize tool
+  std::vector<ImageSource> image_sources;
+  bool show_colorize_window = false;
+  int  colorize_source_idx = 0;       // selected image source
+  int  colorize_locate_mode = 0;      // 0=Time, 1=Coordinates
+
+  // Colorize projection params
+  float colorize_min_range = 3.0f;   // min projection distance (skip close-up)
+  cv::Mat colorize_mask;             // loaded mask image (black = exclude)
+  float colorize_max_range = 30.0f;  // max projection distance
+  int   colorize_cam_radius = 3;     // cameras before/after submap to include
+  bool  colorize_blend = false;      // average colors from multiple cameras (false = use closest only)
+  bool  colorize_intensity_blend = false;  // blend RGB with intensity
+  float colorize_intensity_mix = 0.5f;     // 0=pure RGB, 1=pure intensity
+  bool  colorize_nonlinear_int = false;    // non-linear intensity scale (compress high values)
+  ColorizeResult colorize_last_result;  // cached for intensity blend adjustment
+  bool  colorize_live_preview = false;
+  float colorize_time_step = 0.02f;  // step for +/- buttons (seconds)
+  float colorize_lever_step = 0.01f; // step for lever arm +/- (metres)
+  float colorize_rot_step = 0.1f;    // step for rotation +/- (degrees)
+  int   colorize_last_submap = -1;   // last colorized submap ID (-1 = none)
+  int   colorize_last_cam_src = -1;  // last colorized camera source
+  int   colorize_last_cam_idx = -1;  // last colorized camera frame index
+
+  // In-app image viewer
+  bool show_image_viewer = false;
+  std::string image_viewer_title;
+  unsigned int image_viewer_texture = 0;
+  int image_viewer_w = 0, image_viewer_h = 0;  // displayed resolution
+  int image_original_w = 0, image_original_h = 0;  // original resolution (for intrinsics mapping)
+
+  // Calibration tool
+  bool calib_active = false;           // calibration mode active
+  int  calib_cam_src = -1;             // source index of calibration camera
+  int  calib_cam_idx = -1;             // frame index of calibration camera
+  bool calib_waiting_3d = true;        // true=waiting for 3D click, false=waiting for 2D click
+  struct CalibPair {
+    Eigen::Vector3d pt_3d;
+    Eigen::Vector2d pt_2d;
+  };
+  std::vector<CalibPair> calib_pairs;
+  float calib_sphere_size = 0.08f;     // green sphere radius for 3D reference points
+  std::string calib_status;
+
+  // Alignment check window: image + projected LiDAR points overlay
+  bool align_show = false;
+  int  align_cam_src = 0;
+  int  align_cam_idx = 0;
+  unsigned int align_texture = 0;
+  int  align_tex_w = 0, align_tex_h = 0;   // texture size (may be downscaled)
+  int  align_img_w = 0, align_img_h = 0;   // original image size (for pixel math)
+  std::string align_loaded_path;           // currently loaded image path
+  float align_display_scale = 0.4f;        // display / native pixel ratio
+  Eigen::Vector2f align_pan = Eigen::Vector2f::Zero();
+  float align_point_size = 2.0f;
+  int   align_point_color_mode = 0;        // 0=intensity, 1=range, 2=depth
+  float align_max_range = 50.0f;
+  float align_min_range = 0.5f;
+  float align_bright_threshold = 0.0f;     // 0=show all, >0=intensity cutoff (0-1)
+  float align_point_alpha = 0.85f;         // overlay dot transparency
+  bool  align_rectified = false;           // true = undistort image & skip distortion math (pure extrinsic check)
+  bool  align_rect_applied = false;        // track which state the current texture was loaded in
+  int   align_last_submap_id = -1;
+  std::vector<Eigen::Vector3f> align_submap_world_pts;
+  std::vector<float>           align_submap_ints;
 };
 
 }  // namespace glim

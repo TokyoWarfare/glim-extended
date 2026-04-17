@@ -32,6 +32,12 @@
 #include <portable-file-dialogs.h>
 #include <glk/pointcloud_buffer.hpp>
 #include <glk/primitives/primitives.hpp>
+#include <GL/gl3w.h>
+#include <glk/thin_lines.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 #include <guik/camera/fps_camera_control.hpp>
 #include <glk/io/ply_io.hpp>
 #include <guik/recent_files.hpp>
@@ -45,6 +51,18 @@ namespace glim {
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// Intensity to blue-cyan-white color ramp (for intensity blend visualization)
+inline Eigen::Vector3f intensity_to_color(float t) {
+  // t in [0,1]: 0=dark blue, 0.5=cyan, 1.0=white
+  if (t < 0.5f) {
+    const float s = t * 2.0f;
+    return Eigen::Vector3f(0.05f, 0.1f + 0.7f * s, 0.3f + 0.7f * s);  // dark blue → cyan
+  } else {
+    const float s = (t - 0.5f) * 2.0f;
+    return Eigen::Vector3f(s, 0.8f + 0.2f * s, 1.0f);  // cyan → white
+  }
+}
 
 // Parsed contents of one .geoid file.
 struct GeoidTable {
@@ -448,7 +466,7 @@ void OfflineViewer::build_trajectory() {
       if (!first) cumul += (pos - prev_pos).norm();
       prev_pos = pos;
       first = false;
-      trajectory_data.push_back({T_world_lidar, cumul, submap->session_id, frame->id});
+      trajectory_data.push_back({T_world_lidar, cumul, frame->stamp, submap->session_id, frame->id});
     }
   }
   trajectory_total_dist = cumul;
@@ -456,7 +474,6 @@ void OfflineViewer::build_trajectory() {
   trajectory_built = true;
   logger->info("[Trajectory] Built: {} points, {:.0f} m", trajectory_data.size(), trajectory_total_dist);
 }
-
 void OfflineViewer::ensure_prefectures_loaded() {
   if (prefectures_loaded) return;
   prefectures_loaded = true;  // mark even on failure to avoid retrying
@@ -1286,6 +1303,1752 @@ void OfflineViewer::setup_ui() {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum longest/shortest axis ratio.\nTrails are elongated (>3).");
       ImGui::DragFloat("Min density (pts/m³)", &df_trail_min_density, 1.0f, 1.0f, 500.0f, "%.0f");
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum point density in occupied voxels.");
+    }
+    ImGui::End();
+  });
+
+  // Colorize context menu items (injected into base class popup via extension point)
+  extra_context_menu_items = [this] {
+    const PickType type = static_cast<PickType>(right_clicked_info[0]);
+
+    // Camera right-click
+    if (type == PickType::CAMERA) {
+      const int src_idx = right_clicked_info[1];
+      const int frame_idx = right_clicked_info[3];
+      if (src_idx >= 0 && src_idx < static_cast<int>(image_sources.size()) &&
+          frame_idx >= 0 && frame_idx < static_cast<int>(image_sources[src_idx].frames.size())) {
+        const auto& frame = image_sources[src_idx].frames[frame_idx];
+        const std::string fname = boost::filesystem::path(frame.filepath).filename().string();
+        ImGui::TextUnformatted(fname.c_str());
+        ImGui::TextDisabled("Source: %s", image_sources[src_idx].name.c_str());
+        if (frame.timestamp > 0.0) {
+          char ts_buf[64]; std::snprintf(ts_buf, sizeof(ts_buf), "Time: %.3f", frame.timestamp);
+          ImGui::TextDisabled("%s", ts_buf);
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Open image (in-app)")) {
+          auto img = cv::imread(frame.filepath);
+          if (!img.empty()) {
+            cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+            image_original_w = img.cols; image_original_h = img.rows;
+            if (img.cols > 1920) { const double s = 1920.0 / img.cols; cv::resize(img, img, cv::Size(), s, s); }
+            if (image_viewer_texture) glDeleteTextures(1, &image_viewer_texture);
+            glGenTextures(1, &image_viewer_texture);
+            glBindTexture(GL_TEXTURE_2D, image_viewer_texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            image_viewer_w = img.cols; image_viewer_h = img.rows;
+            image_viewer_title = fname;
+            show_image_viewer = true;
+          }
+        }
+        if (ImGui::MenuItem("Check alignment")) {
+          align_cam_src = src_idx;
+          align_cam_idx = frame_idx;
+          align_loaded_path.clear();  // force reload if window was already open with another image
+          align_last_submap_id = -1;  // force submap point cache refresh
+          align_show = true;
+        }
+        if (ImGui::MenuItem("Colorize from this camera")) {
+          colorize_last_cam_src = src_idx; colorize_last_cam_idx = frame_idx; colorize_last_submap = -1;
+          // Highlight this camera in yellow
+          if (frame.located) {
+            auto vw = guik::LightViewer::instance();
+            const Eigen::Vector3f hp = frame.T_world_cam.translation().cast<float>();
+            Eigen::Affine3f hbtf = Eigen::Affine3f::Identity(); hbtf.translate(hp);
+            hbtf.linear() = frame.T_world_cam.rotation().cast<float>();
+            hbtf = hbtf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+            vw->update_drawable("cam_" + std::to_string(src_idx) + "_" + std::to_string(frame_idx),
+              glk::Primitives::cube(), guik::FlatColor(1.0f, 1.0f, 0.0f, 0.9f, hbtf).add("info_values",
+                Eigen::Vector4i(static_cast<int>(PickType::CAMERA), src_idx, 0, frame_idx)));
+          }
+          if (frame.located && frame.timestamp > 0.0) {
+            // Find submap by timestamp — the submap whose frames bracket the camera's time
+            const double cam_time = frame.timestamp + image_sources[src_idx].time_shift;
+            int best_sm = -1; double best_dt = 1e9;
+            for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+              if (!submaps[si] || submaps[si]->frames.empty()) continue;
+              const double t_first = submaps[si]->frames.front()->stamp;
+              const double t_last = submaps[si]->frames.back()->stamp;
+              // Camera time within submap's time range → perfect match
+              if (cam_time >= t_first && cam_time <= t_last) { best_sm = si; break; }
+              // Otherwise find closest boundary
+              const double dt = std::min(std::abs(cam_time - t_first), std::abs(cam_time - t_last));
+              if (dt < best_dt) { best_dt = dt; best_sm = si; }
+            }
+            if (best_sm >= 0) {
+              logger->info("[Colorize] Projecting from camera {} onto submap {}", fname, best_sm);
+              // Ensure mask is loaded
+              if (colorize_mask.empty() && !image_sources.empty()) {
+                for (const auto& ms : image_sources) {
+                  if (ms.path.empty()) continue;
+                  const std::string mp = ms.path + "/mask.png";
+                  if (boost::filesystem::exists(mp)) { colorize_mask = cv::imread(mp, cv::IMREAD_UNCHANGED); break; }
+                }
+              }
+              // Load only 1-2 nearest HD frames (not the full submap)
+              const auto& sm = submaps[best_sm];
+              const auto hd_it = session_hd_paths.find(sm->session_id);
+              const Eigen::Isometry3d T_ep = sm->T_world_origin * sm->T_origin_endpoint_L;
+              const Eigen::Isometry3d T_odom0 = sm->frames.front()->T_world_imu;
+              std::vector<Eigen::Vector3f> world_pts;
+              std::vector<float> ints;
+              if (hd_it != session_hd_paths.end()) {
+                // Find the 2 frames closest in time to this camera
+                std::vector<std::pair<double, size_t>> frame_dists;
+                for (size_t fi2 = 0; fi2 < sm->frames.size(); fi2++) {
+                  frame_dists.push_back({std::abs(sm->frames[fi2]->stamp - cam_time), fi2});
+                }
+                std::sort(frame_dists.begin(), frame_dists.end());
+                const int max_frames = std::min(2, static_cast<int>(frame_dists.size()));
+                for (int nf = 0; nf < max_frames; nf++) {
+                  const auto& fr = sm->frames[frame_dists[nf].second];
+                  char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                  const std::string fd = hd_it->second + "/" + dn;
+                  std::vector<Eigen::Vector3f> pts; std::vector<float> rng, fi_ints;
+                  auto fi_info = glim::frame_info_from_meta(fd,
+                    glim::compute_frame_world_pose(sm->T_world_origin, sm->T_origin_endpoint_L, T_odom0, fr->T_world_imu, fr->T_lidar_imu));
+                  if (fi_info.num_points == 0) continue;
+                  if (!glim::load_bin(fd + "/points.bin", pts, fi_info.num_points)) continue;
+                  glim::load_bin(fd + "/range.bin", rng, fi_info.num_points);
+                  glim::load_bin(fd + "/intensities.bin", fi_ints, fi_info.num_points);
+                  const Eigen::Matrix3f R = fi_info.T_world_lidar.rotation().cast<float>();
+                  const Eigen::Vector3f t = fi_info.T_world_lidar.translation().cast<float>();
+                  for (int pi = 0; pi < fi_info.num_points; pi++) {
+                    const float r = (!rng.empty()) ? rng[pi] : pts[pi].norm();
+                    if (r < 1.5f) continue;
+                    world_pts.push_back(R * pts[pi] + t);
+                    ints.push_back(pi < static_cast<int>(fi_ints.size()) ? fi_ints[pi] : 0.0f);
+                  }
+                }
+                logger->info("[Colorize] Loaded {} points from {} nearby frames", world_pts.size(), max_frames);
+              }
+              if (!world_pts.empty()) {
+                std::vector<CameraFrame> cams = {frame};
+                auto cr = Colorizer::project_colors(cams, image_sources[src_idx].intrinsics, world_pts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
+                logger->info("[Colorize] {} / {} points colored", cr.colored, cr.total);
+                colorize_last_result = cr;
+                { auto vw = guik::LightViewer::instance(); lod_hide_all_submaps = true;
+                  const size_t n = cr.points.size();
+                  float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
+                  for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
+                  if (imin >= imax) { imin = 0; imax = 255; }
+                  std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
+                  for (size_t i = 0; i < n; i++) {
+                    p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
+                    Eigen::Vector3f rgb = cr.colors[i];
+                    if (colorize_intensity_blend && i < cr.intensities.size()) {
+                      float inv = (cr.intensities[i] - imin) / (imax - imin);
+                      if (colorize_nonlinear_int) inv = std::sqrt(inv);
+                      rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
+                    }
+                    c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
+                  }
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
+                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+              }
+            }
+          }
+        }
+        if (ImGui::MenuItem("Calibrate from this camera")) {
+          // Open image and enter calibration mode
+          auto img = cv::imread(frame.filepath);
+          if (!img.empty()) {
+            cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+            image_original_w = img.cols; image_original_h = img.rows;
+            if (img.cols > 1920) { const double s = 1920.0 / img.cols; cv::resize(img, img, cv::Size(), s, s); }
+            if (image_viewer_texture) glDeleteTextures(1, &image_viewer_texture);
+            glGenTextures(1, &image_viewer_texture);
+            glBindTexture(GL_TEXTURE_2D, image_viewer_texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            image_viewer_w = img.cols; image_viewer_h = img.rows;
+            image_viewer_title = "Calibrate: " + fname;
+            show_image_viewer = true;
+            calib_active = true;
+            calib_cam_src = src_idx;
+            calib_cam_idx = frame_idx;
+            calib_waiting_3d = true;
+            calib_pairs.clear();
+            calib_status = "Click a 3D point in the viewer (short click). Hold Ctrl for super zoom.";
+            // Move 3D view to camera position and orientation using FPS camera
+            auto vw = guik::LightViewer::instance();
+            {
+              auto fps_cam = vw->use_fps_camera_control(60.0);
+              // Extract yaw/pitch from camera forward direction
+              const Eigen::Vector3f cam_fwd_dir = frame.T_world_cam.rotation().col(0).cast<float>();
+              const float yaw = std::atan2(cam_fwd_dir.y(), cam_fwd_dir.x()) * 180.0f / M_PI;
+              const float pitch = std::asin(std::clamp(cam_fwd_dir.z(), -1.0f, 1.0f)) * 180.0f / M_PI;
+              fps_cam->set_pose(frame.T_world_cam.translation().cast<float>(), yaw, pitch);
+            }
+            // Highlight calibration camera in yellow
+            const auto& cT = frame.T_world_cam;
+            const Eigen::Vector3f cpos = cT.translation().cast<float>();
+            const Eigen::Matrix3f cR = cT.rotation().cast<float>();
+            const Eigen::Vector3f cfwd = cR.col(0).normalized(), cright = cR.col(1).normalized(), cup = cR.col(2).normalized();
+            const float fl = 0.6f, fw = 0.3f, fh = 0.2f;
+            const Eigen::Vector3f cbc = cpos + cfwd * fl;
+            std::vector<Eigen::Vector3f> cverts = {
+              cpos, cbc+cright*fw+cup*fh, cpos, cbc-cright*fw+cup*fh, cpos, cbc-cright*fw-cup*fh, cpos, cbc+cright*fw-cup*fh,
+              cbc+cright*fw+cup*fh, cbc-cright*fw+cup*fh, cbc-cright*fw+cup*fh, cbc-cright*fw-cup*fh,
+              cbc-cright*fw-cup*fh, cbc+cright*fw-cup*fh, cbc+cright*fw-cup*fh, cbc+cright*fw+cup*fh
+            };
+            vw->update_drawable("cam_fov_" + std::to_string(src_idx) + "_" + std::to_string(frame_idx),
+              std::make_shared<glk::ThinLines>(cverts.data(), static_cast<int>(cverts.size()), false),
+              guik::FlatColor(1.0f, 1.0f, 0.0f, 1.0f));
+            Eigen::Affine3f cbtf = Eigen::Affine3f::Identity(); cbtf.translate(cpos); cbtf.linear() = cR;
+            cbtf = cbtf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+            vw->update_drawable("cam_" + std::to_string(src_idx) + "_" + std::to_string(frame_idx),
+              glk::Primitives::cube(),
+              guik::FlatColor(1.0f, 1.0f, 0.0f, 0.9f, cbtf).add("info_values",
+                Eigen::Vector4i(static_cast<int>(PickType::CAMERA), src_idx, 0, frame_idx)));
+          }
+        }
+      }
+    }
+
+    // Submap right-click — add colorize option
+    if (type == PickType::FRAME && !image_sources.empty()) {
+      const int submap_id = right_clicked_info[3];
+      if (submap_id >= 0 && submap_id < static_cast<int>(submaps.size()) && submaps[submap_id]) {
+        ImGui::Separator();
+        if (ImGui::MenuItem("Colorize submap")) {
+          colorize_last_submap = submap_id; colorize_last_cam_src = -1; colorize_last_cam_idx = -1;
+          const auto& sm = submaps[submap_id];
+          // Select cameras by timestamp — those within the submap's time range + margin
+          const double t_first = sm->frames.front()->stamp;
+          const double t_last = sm->frames.back()->stamp;
+          const double t_margin = 1.0;  // 1 second before/after submap time range
+          std::vector<CameraFrame> nearby_cams;
+          for (auto& src : image_sources) {
+            for (auto& cam : src.frames) {
+              if (!cam.located || cam.timestamp <= 0.0) continue;
+              const double cam_t = cam.timestamp + src.time_shift;
+              if (cam_t >= t_first - t_margin && cam_t <= t_last + t_margin) nearby_cams.push_back(cam);
+            }
+          }
+          logger->info("[Colorize] Submap {}: {} cameras (t={:.1f}-{:.1f}s, margin={:.1f}s)",
+            submap_id, nearby_cams.size(), t_first, t_last, t_margin);
+          if (!nearby_cams.empty()) {
+            // Ensure mask is loaded
+            if (colorize_mask.empty() && !image_sources.empty()) {
+              for (const auto& ms : image_sources) {
+                if (ms.path.empty()) continue;
+                const std::string mp = ms.path + "/mask.png";
+                if (boost::filesystem::exists(mp)) { colorize_mask = cv::imread(mp, cv::IMREAD_UNCHANGED); break; }
+              }
+            }
+            auto hd = load_hd_for_submap(submap_id, false);
+            if (hd && hd->size() > 0) {
+              const Eigen::Isometry3d T_wo = sm->T_world_origin;
+              std::vector<Eigen::Vector3f> world_pts(hd->size());
+              std::vector<float> ints(hd->size(), 0.0f);
+              for (size_t i = 0; i < hd->size(); i++) {
+                world_pts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
+                if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+              }
+              logger->info("[Colorize] Mask status: empty={}, size={}x{}", colorize_mask.empty(), colorize_mask.cols, colorize_mask.rows);
+              auto cr = Colorizer::project_colors(nearby_cams, image_sources[colorize_source_idx].intrinsics, world_pts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
+              logger->info("[Colorize] {} / {} points colored from {} cameras", cr.colored, cr.total, nearby_cams.size());
+              colorize_last_result = cr;
+              { auto vw = guik::LightViewer::instance(); lod_hide_all_submaps = true;
+                const size_t n = cr.points.size();
+                float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
+                for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
+                if (imin >= imax) { imin = 0; imax = 255; }
+                std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
+                for (size_t i = 0; i < n; i++) {
+                  p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
+                  Eigen::Vector3f rgb = cr.colors[i];
+                  if (colorize_intensity_blend && i < cr.intensities.size()) {
+                    const float inv = (cr.intensities[i] - imin) / (imax - imin);
+                    rgb = rgb * (1.0f - colorize_intensity_mix) + Eigen::Vector3f(inv, inv, inv) * colorize_intensity_mix;
+                  }
+                  c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
+                }
+                auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
+                vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  // In-app image viewer
+  viewer->register_ui_callback("image_viewer", [this] {
+    if (!show_image_viewer || !image_viewer_texture) return;
+    ImGui::SetNextWindowSize(ImVec2(static_cast<float>(image_viewer_w) * 0.75f + 16, static_cast<float>(image_viewer_h) * 0.75f + 120), ImGuiCond_Appearing);
+    if (ImGui::Begin(image_viewer_title.c_str(), &show_image_viewer)) {
+      const ImVec2 avail = ImGui::GetContentRegionAvail();
+      float panel_h = calib_active ? 160.0f : 0.0f;
+      float img_avail_h = avail.y - panel_h;
+      // Maintain aspect ratio
+      float disp_w = avail.x, disp_h = avail.x * image_viewer_h / image_viewer_w;
+      if (disp_h > img_avail_h) { disp_h = img_avail_h; disp_w = img_avail_h * image_viewer_w / image_viewer_h; }
+
+      // Get image position for pixel coordinate computation
+      const ImVec2 img_pos = ImGui::GetCursorScreenPos();
+      ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(image_viewer_texture)), ImVec2(disp_w, disp_h));
+
+      // Draw calibration point markers on image
+      if (calib_active) {
+        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+        const float scale_x = disp_w / image_viewer_w;
+        const float scale_y = disp_h / image_viewer_h;
+        const float marker_sx = disp_w / (image_original_w > 0 ? image_original_w : image_viewer_w);
+        const float marker_sy = disp_h / (image_original_h > 0 ? image_original_h : image_viewer_h);
+        for (size_t i = 0; i < calib_pairs.size(); i++) {
+          const float px = img_pos.x + static_cast<float>(calib_pairs[i].pt_2d.x()) * marker_sx;
+          const float py = img_pos.y + static_cast<float>(calib_pairs[i].pt_2d.y()) * marker_sy;
+          draw_list->AddCircleFilled(ImVec2(px, py), 6.0f, IM_COL32(0, 255, 0, 255));
+          char label[8]; std::snprintf(label, sizeof(label), "%zu", i + 1);
+          draw_list->AddText(ImVec2(px + 8, py - 8), IM_COL32(255, 255, 255, 255), label);
+        }
+
+        // Virtual cursor in ORIGINAL image resolution for precision picking
+        static float vpx_orig = 0.0f, vpy_orig = 0.0f;  // in original-res pixels
+        static float prev_raw_px = 0.0f, prev_raw_py = 0.0f;
+        static bool vpx_init = false;
+        // Scale from display to original resolution
+        const float orig_sx = (image_original_w > 0) ? static_cast<float>(image_original_w) / image_viewer_w : 1.0f;
+        const float orig_sy = (image_original_h > 0) ? static_cast<float>(image_original_h) / image_viewer_h : 1.0f;
+        // vpx/vpy in display coords for zoom window rendering
+        float vpx = 0.0f, vpy = 0.0f;
+
+        // Zoomed crosshair preview (top-left corner of image window)
+        if (ImGui::IsItemHovered()) {
+          const ImVec2 mouse = ImGui::GetMousePos();
+          const float raw_px = (mouse.x - img_pos.x) / scale_x;  // display-res
+          const float raw_py = (mouse.y - img_pos.y) / scale_y;
+          const bool ctrl_held_pre = ImGui::GetIO().KeyCtrl;
+          if (!ctrl_held_pre || !vpx_init) {
+            vpx_orig = raw_px * orig_sx; vpy_orig = raw_py * orig_sy;
+            prev_raw_px = raw_px; prev_raw_py = raw_py;
+            vpx_init = true;
+          } else {
+            // Move virtual cursor at 1/zoom_factor speed in original-res space
+            const float zoom_factor = 16.0f;
+            const float dx = (raw_px - prev_raw_px) * orig_sx / zoom_factor;
+            const float dy = (raw_py - prev_raw_py) * orig_sy / zoom_factor;
+            vpx_orig += dx; vpy_orig += dy;
+            vpx_orig = std::clamp(vpx_orig, 0.0f, static_cast<float>(image_original_w - 1));
+            vpy_orig = std::clamp(vpy_orig, 0.0f, static_cast<float>(image_original_h - 1));
+            prev_raw_px = raw_px; prev_raw_py = raw_py;
+          }
+          // Convert back to display coords for rendering
+          vpx = vpx_orig / orig_sx; vpy = vpy_orig / orig_sy;
+          const float px = vpx;
+          const float py = vpy;
+          if (px >= 0 && px < image_viewer_w && py >= 0 && py < image_viewer_h) {
+            // Draw zoom window in top-left corner (Ctrl = higher zoom)
+            const bool ctrl_held = ImGui::GetIO().KeyCtrl;
+            const float zoom = ctrl_held ? 16.0f : 4.0f;
+            const float zoom_size = ctrl_held ? 200.0f : 120.0f;
+            const float half_src = zoom_size / (2.0f * zoom * scale_x);  // source region half-size in image pixels
+            // UV coordinates for the zoomed region
+            const float u0 = std::max(0.0f, (px - half_src) / image_viewer_w);
+            const float v0 = std::max(0.0f, (py - half_src) / image_viewer_h);
+            const float u1 = std::min(1.0f, (px + half_src) / image_viewer_w);
+            const float v1 = std::min(1.0f, (py + half_src) / image_viewer_h);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 zp0(img_pos.x + 4, img_pos.y + 4);
+            const ImVec2 zp1(zp0.x + zoom_size, zp0.y + zoom_size);
+            dl->AddImage(reinterpret_cast<void*>(static_cast<intptr_t>(image_viewer_texture)),
+              zp0, zp1, ImVec2(u0, v0), ImVec2(u1, v1));
+            dl->AddRect(zp0, zp1, IM_COL32(255, 255, 255, 200));
+            // Red crosshair
+            const float cx = (zp0.x + zp1.x) * 0.5f, cy = (zp0.y + zp1.y) * 0.5f;
+            dl->AddLine(ImVec2(cx - 10, cy), ImVec2(cx + 10, cy), IM_COL32(255, 0, 0, 255), 1.0f);
+            dl->AddLine(ImVec2(cx, cy - 10), ImVec2(cx, cy + 10), IM_COL32(255, 0, 0, 255), 1.0f);
+            // Pixel coords text
+            char coord_buf[48]; std::snprintf(coord_buf, sizeof(coord_buf), "%.1f, %.1f (orig: %.0f, %.0f)", px, py, vpx_orig, vpy_orig);
+            dl->AddText(ImVec2(zp0.x, zp1.y + 2), IM_COL32(255, 255, 255, 255), coord_buf);
+          }
+        }
+
+        // Handle 2D click (when waiting for 2D point)
+        if (!calib_waiting_3d && ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
+          logger->info("[Calibrate] 2D click: vpx_orig={:.1f}, vpy_orig={:.1f}, orig_w={}, orig_h={}", vpx_orig, vpy_orig, image_original_w, image_original_h);
+          if (vpx_orig >= 0 && vpx_orig < image_original_w && vpy_orig >= 0 && vpy_orig < image_original_h) {
+            calib_pairs.back().pt_2d = Eigen::Vector2d(vpx_orig, vpy_orig);
+            calib_waiting_3d = true;
+            char buf[128]; std::snprintf(buf, sizeof(buf), "Pair %zu added. Click next 3D point%s", calib_pairs.size(), calib_pairs.size() >= 6 ? " (or hit Solve)" : " (need 6+)");
+            calib_status = buf;
+            logger->info("[Calibrate] Pair {}: 2D=({:.0f}, {:.0f})", calib_pairs.size(), vpx_orig, vpy_orig);
+          }
+        }
+
+        // Calibration panel
+        ImGui::Separator();
+
+        // Camera navigation: << < [ID] > >>
+        auto switch_calib_cam = [this](int new_idx) {
+          auto& src = image_sources[calib_cam_src];
+          if (new_idx < 0 || new_idx >= static_cast<int>(src.frames.size())) return;
+          if (!src.frames[new_idx].located) return;
+          // Revert old camera to white
+          auto vw = guik::LightViewer::instance();
+          if (calib_cam_idx >= 0 && calib_cam_idx < static_cast<int>(src.frames.size()) && src.frames[calib_cam_idx].located) {
+            const Eigen::Vector3f op = src.frames[calib_cam_idx].T_world_cam.translation().cast<float>();
+            Eigen::Affine3f obtf = Eigen::Affine3f::Identity(); obtf.translate(op);
+            obtf.linear() = src.frames[calib_cam_idx].T_world_cam.rotation().cast<float>();
+            obtf = obtf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+            vw->update_drawable("cam_" + std::to_string(calib_cam_src) + "_" + std::to_string(calib_cam_idx),
+              glk::Primitives::cube(), guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, obtf).add("info_values",
+                Eigen::Vector4i(static_cast<int>(PickType::CAMERA), calib_cam_src, 0, calib_cam_idx)));
+          }
+          // Auto-save current pairs before switching
+          if (!calib_pairs.empty() && !loaded_map_path.empty()) {
+            nlohmann::json j;
+            j["cam_src"] = calib_cam_src; j["cam_idx"] = calib_cam_idx;
+            j["time_shift"] = src.time_shift;
+            j["pairs"] = nlohmann::json::array();
+            for (const auto& p : calib_pairs) {
+              j["pairs"].push_back({{"pt_3d", {p.pt_3d.x(), p.pt_3d.y(), p.pt_3d.z()}}, {"pt_2d", {p.pt_2d.x(), p.pt_2d.y()}}});
+            }
+            const std::string sp = loaded_map_path + "/calib_pairs_cam" + std::to_string(calib_cam_idx) + ".json";
+            std::ofstream ofs(sp); ofs << std::setprecision(10) << j.dump(2);
+            logger->info("[Calibrate] Auto-saved {} pairs for cam {}", calib_pairs.size(), calib_cam_idx);
+          }
+          // Clean up old 3D markers
+          for (size_t i = 0; i < calib_pairs.size(); i++) vw->remove_drawable("calib_pt_" + std::to_string(i));
+          calib_pairs.clear();
+          calib_cam_idx = new_idx;
+          calib_waiting_3d = true;
+          // Load new image
+          const auto& nf = src.frames[new_idx];
+          auto img = cv::imread(nf.filepath);
+          if (!img.empty()) {
+            cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+            image_original_w = img.cols; image_original_h = img.rows;
+            if (img.cols > 1920) { const double s = 1920.0 / img.cols; cv::resize(img, img, cv::Size(), s, s); }
+            if (image_viewer_texture) glDeleteTextures(1, &image_viewer_texture);
+            glGenTextures(1, &image_viewer_texture);
+            glBindTexture(GL_TEXTURE_2D, image_viewer_texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            image_viewer_w = img.cols; image_viewer_h = img.rows;
+            image_viewer_title = "Calibrate: " + boost::filesystem::path(nf.filepath).filename().string();
+          }
+          // Move 3D view
+          auto fps_cam = vw->use_fps_camera_control(60.0);
+          const Eigen::Vector3f cfwd = nf.T_world_cam.rotation().col(0).cast<float>();
+          fps_cam->set_pose(nf.T_world_cam.translation().cast<float>(),
+            std::atan2(cfwd.y(), cfwd.x()) * 180.0f / M_PI,
+            std::asin(std::clamp(cfwd.z(), -1.0f, 1.0f)) * 180.0f / M_PI);
+          // Highlight new camera in yellow
+          const Eigen::Vector3f np = nf.T_world_cam.translation().cast<float>();
+          Eigen::Affine3f nbtf = Eigen::Affine3f::Identity(); nbtf.translate(np);
+          nbtf.linear() = nf.T_world_cam.rotation().cast<float>();
+          nbtf = nbtf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+          vw->update_drawable("cam_" + std::to_string(calib_cam_src) + "_" + std::to_string(new_idx),
+            glk::Primitives::cube(), guik::FlatColor(1.0f, 1.0f, 0.0f, 0.9f, nbtf).add("info_values",
+              Eigen::Vector4i(static_cast<int>(PickType::CAMERA), calib_cam_src, 0, new_idx)));
+          // Auto-load pairs for new camera if they exist
+          if (!loaded_map_path.empty()) {
+            const std::string lp = loaded_map_path + "/calib_pairs_cam" + std::to_string(new_idx) + ".json";
+            std::ifstream ifs(lp);
+            if (ifs) {
+              auto lj = nlohmann::json::parse(ifs, nullptr, false);
+              if (!lj.is_discarded() && lj.contains("pairs")) {
+                for (const auto& jp : lj["pairs"]) {
+                  CalibPair p;
+                  p.pt_3d = Eigen::Vector3d(jp["pt_3d"][0], jp["pt_3d"][1], jp["pt_3d"][2]);
+                  p.pt_2d = Eigen::Vector2d(jp["pt_2d"][0], jp["pt_2d"][1]);
+                  calib_pairs.push_back(p);
+                  Eigen::Affine3f mtf = Eigen::Affine3f::Identity();
+                  mtf.translate(p.pt_3d.cast<float>()); mtf.scale(calib_sphere_size);
+                  vw->update_drawable("calib_pt_" + std::to_string(calib_pairs.size() - 1),
+                    glk::Primitives::sphere(), guik::FlatColor(0.0f, 1.0f, 0.0f, 0.5f, mtf).make_transparent());
+                }
+                logger->info("[Calibrate] Auto-loaded {} pairs for cam {}", calib_pairs.size(), new_idx);
+              }
+            }
+          }
+          calib_status = calib_pairs.empty() ? "Click a 3D point in the viewer" :
+            std::to_string(calib_pairs.size()) + " pairs loaded. Add more or Solve.";
+        };
+
+        if (ImGui::Button("<<")) { switch_calib_cam(0); }
+        ImGui::SameLine();
+        if (ImGui::Button("<")) {
+          // Find previous located camera
+          for (int ci = calib_cam_idx - 1; ci >= 0; ci--) {
+            if (image_sources[calib_cam_src].frames[ci].located) { switch_calib_cam(ci); break; }
+          }
+        }
+        ImGui::SameLine();
+        char cam_label[64]; std::snprintf(cam_label, sizeof(cam_label), "Camera %d / %zu",
+          calib_cam_idx, image_sources[calib_cam_src].frames.size());
+        ImGui::Text("%s", cam_label);
+        ImGui::SameLine();
+        if (ImGui::Button(">")) {
+          for (int ci = calib_cam_idx + 1; ci < static_cast<int>(image_sources[calib_cam_src].frames.size()); ci++) {
+            if (image_sources[calib_cam_src].frames[ci].located) { switch_calib_cam(ci); break; }
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(">>")) {
+          for (int ci = static_cast<int>(image_sources[calib_cam_src].frames.size()) - 1; ci >= 0; ci--) {
+            if (image_sources[calib_cam_src].frames[ci].located) { switch_calib_cam(ci); break; }
+          }
+        }
+
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", calib_status.c_str());
+        ImGui::Text("Pairs: %zu", calib_pairs.size());
+        if (calib_pairs.size() > 0) {
+          ImGui::SameLine();
+          if (ImGui::Button("Undo last")) {
+            auto vw = guik::LightViewer::instance();
+            vw->remove_drawable("calib_pt_" + std::to_string(calib_pairs.size() - 1));
+            calib_pairs.pop_back();
+            calib_waiting_3d = true;
+            calib_status = "Click a 3D point in the viewer";
+          }
+          // Per-pair list with remove buttons
+          int remove_idx = -1;
+          for (size_t i = 0; i < calib_pairs.size(); i++) {
+            char pair_label[128];
+            std::snprintf(pair_label, sizeof(pair_label), "%zu: 3D(%.1f,%.1f,%.1f) 2D(%.0f,%.0f)",
+              i + 1, calib_pairs[i].pt_3d.x(), calib_pairs[i].pt_3d.y(), calib_pairs[i].pt_3d.z(),
+              calib_pairs[i].pt_2d.x(), calib_pairs[i].pt_2d.y());
+            ImGui::TextDisabled("%s", pair_label);
+            ImGui::SameLine();
+            char btn_label[16]; std::snprintf(btn_label, sizeof(btn_label), "X##rm%zu", i);
+            if (ImGui::SmallButton(btn_label)) remove_idx = static_cast<int>(i);
+          }
+          if (remove_idx >= 0) {
+            auto vw = guik::LightViewer::instance();
+            // Remove all markers and rebuild (indices shift)
+            for (size_t i = 0; i < calib_pairs.size(); i++) vw->remove_drawable("calib_pt_" + std::to_string(i));
+            calib_pairs.erase(calib_pairs.begin() + remove_idx);
+            for (size_t i = 0; i < calib_pairs.size(); i++) {
+              Eigen::Affine3f mtf = Eigen::Affine3f::Identity();
+              mtf.translate(calib_pairs[i].pt_3d.cast<float>()); mtf.scale(calib_sphere_size);
+              vw->update_drawable("calib_pt_" + std::to_string(i),
+                glk::Primitives::sphere(), guik::FlatColor(0.0f, 1.0f, 0.0f, 0.5f, mtf).make_transparent());
+            }
+            calib_waiting_3d = true;
+          }
+        }
+        if (calib_pairs.size() >= 6) {
+          ImGui::SameLine();
+          if (ImGui::Button("Solve")) {
+            // Collect correspondences
+            std::vector<Eigen::Vector3d> pts_3d;
+            std::vector<Eigen::Vector2d> pts_2d;
+            for (const auto& p : calib_pairs) { pts_3d.push_back(p.pt_3d); pts_2d.push_back(p.pt_2d); }
+
+            // Get camera's world-space lidar pose (T_world_lidar at this camera's time)
+            auto& src = image_sources[calib_cam_src];
+            const auto& cam = src.frames[calib_cam_idx];
+            // Get T_world_lidar from trajectory (not from T_world_cam which includes current extrinsic)
+            if (!trajectory_built) build_trajectory();
+            std::vector<TimedPose> timed_traj(trajectory_data.size());
+            for (size_t ti = 0; ti < trajectory_data.size(); ti++) timed_traj[ti] = {trajectory_data[ti].stamp, trajectory_data[ti].pose};
+            const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(timed_traj, cam.timestamp + src.time_shift);
+
+            auto T_lidar_cam_new = Colorizer::solve_extrinsic(pts_3d, pts_2d, src.intrinsics, T_world_lidar);
+
+            // Extract lever arm + RPY from result
+            src.lever_arm = T_lidar_cam_new.translation();
+            // Extract RPY using atan2 (consistent with solvePnP log)
+            const Eigen::Matrix3d R_ext = T_lidar_cam_new.rotation();
+            const double yaw = std::atan2(R_ext(1, 0), R_ext(0, 0)) * 180.0 / M_PI;
+            const double pitch = std::asin(-std::clamp(R_ext(2, 0), -1.0, 1.0)) * 180.0 / M_PI;
+            const double roll = std::atan2(R_ext(2, 1), R_ext(2, 2)) * 180.0 / M_PI;
+            src.rotation_rpy = Eigen::Vector3d(roll, pitch, yaw);
+
+            char buf[256]; std::snprintf(buf, sizeof(buf), "Solved! Lever=[%.3f, %.3f, %.3f] RPY=[%.2f, %.2f, %.2f] deg",
+              src.lever_arm.x(), src.lever_arm.y(), src.lever_arm.z(),
+              src.rotation_rpy.x(), src.rotation_rpy.y(), src.rotation_rpy.z());
+            calib_status = buf;
+            logger->info("[Calibrate] {}", calib_status);
+          }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel calibration")) {
+          calib_active = false;
+          // Clean up 3D markers + revert camera color to white
+          auto vw = guik::LightViewer::instance();
+          for (size_t i = 0; i < calib_pairs.size(); i++) vw->remove_drawable("calib_pt_" + std::to_string(i));
+          if (calib_cam_src >= 0 && calib_cam_idx >= 0 && calib_cam_src < static_cast<int>(image_sources.size()) &&
+              calib_cam_idx < static_cast<int>(image_sources[calib_cam_src].frames.size())) {
+            const auto& cf = image_sources[calib_cam_src].frames[calib_cam_idx];
+            if (cf.located) {
+              const Eigen::Vector3f p = cf.T_world_cam.translation().cast<float>();
+              Eigen::Affine3f btf = Eigen::Affine3f::Identity(); btf.translate(p); btf.linear() = cf.T_world_cam.rotation().cast<float>();
+              btf = btf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+              vw->update_drawable("cam_" + std::to_string(calib_cam_src) + "_" + std::to_string(calib_cam_idx),
+                glk::Primitives::cube(),
+                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, btf).add("info_values",
+                  Eigen::Vector4i(static_cast<int>(PickType::CAMERA), calib_cam_src, 0, calib_cam_idx)));
+            }
+          }
+          calib_pairs.clear();
+          calib_status.clear();
+        }
+        // Save/Load calibration pairs
+        ImGui::Separator();
+        if (ImGui::Button("Save pairs")) {
+          const std::string save_path = loaded_map_path + "/calib_pairs_cam" + std::to_string(calib_cam_idx) + ".json";
+          nlohmann::json j;
+          j["cam_src"] = calib_cam_src;
+          j["cam_idx"] = calib_cam_idx;
+          j["time_shift"] = image_sources[calib_cam_src].time_shift;
+          j["pairs"] = nlohmann::json::array();
+          for (const auto& p : calib_pairs) {
+            j["pairs"].push_back({
+              {"pt_3d", {p.pt_3d.x(), p.pt_3d.y(), p.pt_3d.z()}},
+              {"pt_2d", {p.pt_2d.x(), p.pt_2d.y()}}
+            });
+          }
+          std::ofstream ofs(save_path);
+          ofs << std::setprecision(10) << j.dump(2);
+          calib_status = "Saved " + std::to_string(calib_pairs.size()) + " pairs to " + save_path;
+          logger->info("[Calibrate] {}", calib_status);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load pairs")) {
+          const std::string load_path = loaded_map_path + "/calib_pairs_cam" + std::to_string(calib_cam_idx) + ".json";
+          std::ifstream ifs(load_path);
+          if (ifs) {
+            auto j = nlohmann::json::parse(ifs, nullptr, false);
+            if (!j.is_discarded() && j.contains("pairs")) {
+              // Clean up old markers
+              auto vw = guik::LightViewer::instance();
+              for (size_t i = 0; i < calib_pairs.size(); i++) vw->remove_drawable("calib_pt_" + std::to_string(i));
+              calib_pairs.clear();
+              for (const auto& jp : j["pairs"]) {
+                CalibPair p;
+                p.pt_3d = Eigen::Vector3d(jp["pt_3d"][0], jp["pt_3d"][1], jp["pt_3d"][2]);
+                p.pt_2d = Eigen::Vector2d(jp["pt_2d"][0], jp["pt_2d"][1]);
+                calib_pairs.push_back(p);
+                // Render 3D marker
+                Eigen::Affine3f mtf = Eigen::Affine3f::Identity();
+                mtf.translate(p.pt_3d.cast<float>());
+                mtf.scale(calib_sphere_size);
+                vw->update_drawable("calib_pt_" + std::to_string(calib_pairs.size() - 1),
+                  glk::Primitives::sphere(),
+                  guik::FlatColor(0.0f, 1.0f, 0.0f, 0.5f, mtf).make_transparent());
+              }
+              // Switch to the saved camera if available
+              if (j.contains("cam_src") && j.contains("cam_idx")) {
+                const int saved_src = j["cam_src"];
+                const int saved_idx = j["cam_idx"];
+                if (saved_src == calib_cam_src && saved_idx < static_cast<int>(image_sources[calib_cam_src].frames.size())) {
+                  switch_calib_cam(saved_idx);
+                }
+              }
+              calib_waiting_3d = true;
+              char buf[128]; std::snprintf(buf, sizeof(buf), "Loaded %zu pairs from file", calib_pairs.size());
+              calib_status = buf;
+              logger->info("[Calibrate] {}", calib_status);
+            }
+          } else {
+            calib_status = "No saved pairs found at " + load_path;
+          }
+        }
+
+        // Sphere size slider — update all existing markers when changed
+        ImGui::SetNextItemWidth(100);
+        if (ImGui::SliderFloat("Sphere size", &calib_sphere_size, 0.01f, 0.5f, "%.2f")) {
+          auto vw = guik::LightViewer::instance();
+          for (size_t i = 0; i < calib_pairs.size(); i++) {
+            Eigen::Affine3f mtf = Eigen::Affine3f::Identity();
+            mtf.translate(calib_pairs[i].pt_3d.cast<float>());
+            mtf.scale(calib_sphere_size);
+            vw->update_drawable("calib_pt_" + std::to_string(i),
+              glk::Primitives::sphere(),
+              guik::FlatColor(0.0f, 1.0f, 0.0f, 0.5f, mtf).make_transparent());
+          }
+        }
+        ImGui::TextDisabled("Short left-click = pick point. Drag = navigate.");
+        ImGui::TextDisabled("Hold Ctrl for super zoom in image.");
+      }
+    }
+    ImGui::End();
+    if (!show_image_viewer) {
+      if (image_viewer_texture) { glDeleteTextures(1, &image_viewer_texture); image_viewer_texture = 0; }
+      if (calib_active) {
+        calib_active = false;
+        auto vw = guik::LightViewer::instance();
+        for (size_t i = 0; i < calib_pairs.size(); i++) vw->remove_drawable("calib_pt_" + std::to_string(i));
+        calib_pairs.clear();
+      }
+    }
+  });
+
+  // Camera gizmo visibility manager (runs independently of Locate Cameras window)
+  viewer->register_ui_callback("camera_visibility", [this] {
+    static bool prev_cameras = false;
+    if (image_sources.empty()) { prev_cameras = draw_cameras; return; }
+    if (!draw_cameras && prev_cameras) {
+      auto vw = guik::LightViewer::instance();
+      for (size_t si = 0; si < image_sources.size(); si++) {
+        for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
+          vw->remove_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi));
+          vw->remove_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi));
+        }
+      }
+    } else if (draw_cameras && !prev_cameras) {
+      auto vw = guik::LightViewer::instance();
+      for (size_t si = 0; si < image_sources.size(); si++) {
+        for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
+          if (!image_sources[si].frames[fi].located) continue;
+          const auto& T = image_sources[si].frames[fi].T_world_cam;
+          const Eigen::Vector3f pos = T.translation().cast<float>();
+          const Eigen::Matrix3f R = T.rotation().cast<float>();
+          const Eigen::Vector3f fwd = R.col(0).normalized(), right = R.col(1).normalized(), up = R.col(2).normalized();
+          const float fl = 0.6f, fw = 0.3f, fh = 0.2f;
+          const Eigen::Vector3f bc = pos + fwd * fl;
+          std::vector<Eigen::Vector3f> verts = {
+            pos, bc+right*fw+up*fh, pos, bc-right*fw+up*fh, pos, bc-right*fw-up*fh, pos, bc+right*fw-up*fh,
+            bc+right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw-up*fh,
+            bc-right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw+up*fh
+          };
+          vw->update_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi),
+            std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false),
+            guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
+          Eigen::Affine3f btf = Eigen::Affine3f::Identity(); btf.translate(pos); btf.linear() = R;
+          btf = btf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+          vw->update_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi),
+            glk::Primitives::cube(),
+            guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, btf).add("info_values",
+              Eigen::Vector4i(static_cast<int>(PickType::CAMERA), static_cast<int>(si), 0, static_cast<int>(fi))));
+        }
+      }
+    }
+    prev_cameras = draw_cameras;
+  });
+
+  // 3D point picking for calibration (intercepts short left-click when calib is active)
+  viewer->register_ui_callback("calib_3d_pick", [this] {
+    if (!calib_active || !calib_waiting_3d) return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse) return;
+
+    // Track mouse down time to distinguish click from drag
+    static bool mouse_was_down = false;
+    static double mouse_down_time = 0.0;
+    if (ImGui::IsMouseDown(0) && !mouse_was_down) {
+      mouse_was_down = true;
+      mouse_down_time = ImGui::GetTime();
+    }
+    if (!ImGui::IsMouseReleased(0)) {
+      if (!ImGui::IsMouseDown(0)) mouse_was_down = false;
+      return;
+    }
+    mouse_was_down = false;
+    const double click_duration = ImGui::GetTime() - mouse_down_time;
+    if (click_duration > 0.25) return;  // was a drag, not a click
+
+    auto vw = guik::LightViewer::instance();
+    const auto mouse = ImGui::GetMousePos();
+    const Eigen::Vector2i mpos(static_cast<int>(mouse.x), static_cast<int>(mouse.y));
+    const float depth = vw->pick_depth(mpos);
+    if (depth >= 1.0f) return;  // clicked background
+
+    const Eigen::Vector3f point = vw->unproject(mpos, depth);
+    // Add a new pair with 3D point, waiting for 2D
+    CalibPair pair;
+    pair.pt_3d = point.cast<double>();
+    pair.pt_2d = Eigen::Vector2d::Zero();
+    calib_pairs.push_back(pair);
+    calib_waiting_3d = false;
+    calib_status = "Now click the same point in the image";
+
+    // Visual marker in 3D
+    Eigen::Affine3f marker_tf = Eigen::Affine3f::Identity();
+    marker_tf.translate(point);
+    marker_tf.scale(calib_sphere_size);
+    vw->update_drawable("calib_pt_" + std::to_string(calib_pairs.size() - 1),
+      glk::Primitives::sphere(),
+      guik::FlatColor(0.0f, 1.0f, 0.0f, 0.5f, marker_tf).make_transparent());
+
+    logger->info("[Calibrate] 3D point {}: ({:.3f}, {:.3f}, {:.3f})", calib_pairs.size(), point.x(), point.y(), point.z());
+  });
+
+  // Locate Cameras floating window
+  viewer->register_ui_callback("colorize_window", [this] {
+    if (!show_colorize_window) return;
+    ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Locate Cameras", &show_colorize_window)) {
+      if (image_sources.empty()) {
+        ImGui::Text("No image sources loaded.\nUse Colorize > Image folder > Add folder...");
+      } else {
+        // Source selector
+        std::vector<const char*> src_names;
+        for (const auto& s : image_sources) src_names.push_back(s.name.c_str());
+        ImGui::Combo("Source", &colorize_source_idx, src_names.data(), src_names.size());
+
+        auto& src = image_sources[colorize_source_idx];
+        ImGui::Text("%zu images (%zu located)", src.frames.size(),
+          std::count_if(src.frames.begin(), src.frames.end(), [](const CameraFrame& f) { return f.located; }));
+
+        ImGui::Separator();
+
+        // Location criteria
+        ImGui::Combo("Criteria", &colorize_locate_mode, "Time\0Coordinates\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Time: match image timestamp to trajectory.\nCoordinates: match GPS position to trajectory.");
+
+        // Time shift with +/- step buttons
+        bool time_changed = false;
+        float ts_f = static_cast<float>(src.time_shift);
+        ImGui::SetNextItemWidth(100);
+        if (ImGui::InputFloat("##ts", &ts_f, 0.0f, 0.0f, "%.3f")) { src.time_shift = ts_f; time_changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("<")) { src.time_shift -= colorize_time_step; time_changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button(">")) { src.time_shift += colorize_time_step; time_changed = true; }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(60);
+        ImGui::InputFloat("step##ts_step", &colorize_time_step, 0.0f, 0.0f, "%.3f");
+        ImGui::SameLine();
+        ImGui::Text("Time shift");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Offset in seconds. Use < > to step.\nAdjust to align camera timing with LiDAR.");
+
+        // Lever arm with per-axis step buttons
+        bool extrinsic_changed = false;
+        {
+          float la[3] = {static_cast<float>(src.lever_arm.x()), static_cast<float>(src.lever_arm.y()), static_cast<float>(src.lever_arm.z())};
+          const char* labels[] = {"X##la", "Y##la", "Z##la"};
+          for (int ax = 0; ax < 3; ax++) {
+            ImGui::SetNextItemWidth(70);
+            if (ImGui::InputFloat(labels[ax], &la[ax], 0, 0, "%.4f")) extrinsic_changed = true;
+            ImGui::SameLine();
+            char mb[16], pb[16]; std::snprintf(mb, 16, "-##la%d", ax); std::snprintf(pb, 16, "+##la%d", ax);
+            if (ImGui::SmallButton(mb)) { la[ax] -= colorize_lever_step; extrinsic_changed = true; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(pb)) { la[ax] += colorize_lever_step; extrinsic_changed = true; }
+            if (ax < 2) ImGui::SameLine();
+          }
+          src.lever_arm = Eigen::Vector3d(la[0], la[1], la[2]);
+          ImGui::SetNextItemWidth(50);
+          ImGui::InputFloat("step##la_step", &colorize_lever_step, 0, 0, "%.3f");
+          ImGui::SameLine(); ImGui::TextDisabled("Lever arm (m)");
+        }
+        // Rotation with per-axis step buttons
+        {
+          float rpy[3] = {static_cast<float>(src.rotation_rpy.x()), static_cast<float>(src.rotation_rpy.y()), static_cast<float>(src.rotation_rpy.z())};
+          const char* labels[] = {"R##rp", "P##rp", "Y##rp"};
+          for (int ax = 0; ax < 3; ax++) {
+            ImGui::SetNextItemWidth(70);
+            if (ImGui::InputFloat(labels[ax], &rpy[ax], 0, 0, "%.3f")) extrinsic_changed = true;
+            ImGui::SameLine();
+            char mb[16], pb[16]; std::snprintf(mb, 16, "-##rp%d", ax); std::snprintf(pb, 16, "+##rp%d", ax);
+            if (ImGui::SmallButton(mb)) { rpy[ax] -= colorize_rot_step; extrinsic_changed = true; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(pb)) { rpy[ax] += colorize_rot_step; extrinsic_changed = true; }
+            if (ax < 2) ImGui::SameLine();
+          }
+          src.rotation_rpy = Eigen::Vector3d(rpy[0], rpy[1], rpy[2]);
+          ImGui::SetNextItemWidth(50);
+          ImGui::InputFloat("step##rp_step", &colorize_rot_step, 0, 0, "%.2f");
+          ImGui::SameLine(); ImGui::TextDisabled("Rotation (deg)");
+        }
+        // Treat extrinsic changes like time changes for live preview
+        if (extrinsic_changed) time_changed = true;
+
+        // Live preview
+        ImGui::Checkbox("Live preview", &colorize_live_preview);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto-update colorize preview when time shift changes.\nUses last colorized camera or submap.");
+
+        ImGui::Separator();
+
+        // Auto re-colorize on time shift change with live preview
+        if (time_changed && colorize_live_preview) {
+          if (!trajectory_built) build_trajectory();
+          std::vector<TimedPose> timed_traj(trajectory_data.size());
+          for (size_t i = 0; i < trajectory_data.size(); i++)
+            timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+
+          // Re-locate only the preview cameras (not all)
+          if (colorize_last_cam_src >= 0 && colorize_last_cam_idx >= 0 &&
+              colorize_last_cam_src < static_cast<int>(image_sources.size())) {
+            // Single camera preview — re-locate just this camera (apply full extrinsic: lever + RPY)
+            auto& cam = image_sources[colorize_last_cam_src].frames[colorize_last_cam_idx];
+            if (cam.timestamp > 0.0) {
+              const double ts = cam.timestamp + src.time_shift;
+              const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(timed_traj, ts);
+              const Eigen::Isometry3d T_lidar_cam = Colorizer::build_extrinsic(src.lever_arm, src.rotation_rpy);
+              cam.T_world_cam = T_world_lidar * T_lidar_cam;
+              cam.located = true;
+            }
+            // Re-project — find submap by timestamp
+            const double lp_cam_time = cam.timestamp + src.time_shift;
+            int best_sm = -1; double best_dt = 1e9;
+            for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+              if (!submaps[si] || submaps[si]->frames.empty()) continue;
+              const double t0 = submaps[si]->frames.front()->stamp;
+              const double t1 = submaps[si]->frames.back()->stamp;
+              if (lp_cam_time >= t0 && lp_cam_time <= t1) { best_sm = si; break; }
+              const double dt = std::min(std::abs(lp_cam_time - t0), std::abs(lp_cam_time - t1));
+              if (dt < best_dt) { best_dt = dt; best_sm = si; }
+            }
+            if (best_sm >= 0) {
+              auto hd = load_hd_for_submap(best_sm, false);
+              if (hd && hd->size() > 0) {
+                const Eigen::Isometry3d T_wo = submaps[best_sm]->T_world_origin;
+                std::vector<Eigen::Vector3f> wpts(hd->size()); std::vector<float> ints(hd->size(), 0.0f);
+                for (size_t i = 0; i < hd->size(); i++) {
+                  wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
+                  if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                }
+                std::vector<CameraFrame> cams = {cam};
+                auto cr = Colorizer::project_colors(cams, src.intrinsics, wpts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
+                colorize_last_result = cr;
+                { auto vw = guik::LightViewer::instance();
+                  const size_t n = cr.points.size();
+                  float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
+                  for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
+                  if (imin >= imax) { imin = 0; imax = 255; }
+                  std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
+                  for (size_t i = 0; i < n; i++) {
+                    p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
+                    Eigen::Vector3f rgb = cr.colors[i];
+                    if (colorize_intensity_blend && i < cr.intensities.size()) {
+                      float inv = (cr.intensities[i] - imin) / (imax - imin);
+                      if (colorize_nonlinear_int) inv = std::sqrt(inv);
+                      rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
+                    }
+                    c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
+                  }
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
+                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+              }
+            }
+          } else if (colorize_last_submap >= 0) {
+            // Submap preview — re-locate all sources, then filter by submap's time range (matches right-click colorize)
+            for (auto& s : image_sources) Colorizer::locate_by_time(s, timed_traj);
+            const auto& sm = submaps[colorize_last_submap];
+            const double t_first = sm->frames.front()->stamp;
+            const double t_last = sm->frames.back()->stamp;
+            const double t_margin = 1.0;
+            std::vector<CameraFrame> nearby;
+            for (const auto& s : image_sources) {
+              for (const auto& c : s.frames) {
+                if (!c.located || c.timestamp <= 0.0) continue;
+                const double ct = c.timestamp + s.time_shift;
+                if (ct >= t_first - t_margin && ct <= t_last + t_margin) nearby.push_back(c);
+              }
+            }
+            if (!nearby.empty()) {
+              auto hd = load_hd_for_submap(colorize_last_submap, false);
+              if (hd && hd->size() > 0) {
+                const Eigen::Isometry3d T_wo = sm->T_world_origin;
+                std::vector<Eigen::Vector3f> wpts(hd->size()); std::vector<float> ints(hd->size(), 0.0f);
+                for (size_t i = 0; i < hd->size(); i++) {
+                  wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
+                  if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                }
+                auto cr = Colorizer::project_colors(nearby, src.intrinsics, wpts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
+                colorize_last_result = cr;
+                { auto vw = guik::LightViewer::instance();
+                  const size_t n = cr.points.size();
+                  float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
+                  for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
+                  if (imin >= imax) { imin = 0; imax = 255; }
+                  std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
+                  for (size_t i = 0; i < n; i++) {
+                    p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
+                    Eigen::Vector3f rgb = cr.colors[i];
+                    if (colorize_intensity_blend && i < cr.intensities.size()) {
+                      float inv = (cr.intensities[i] - imin) / (imax - imin);
+                      if (colorize_nonlinear_int) inv = std::sqrt(inv);
+                      rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
+                    }
+                    c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
+                  }
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
+                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+              }
+            }
+          }
+          // Update camera gizmo position for the preview camera
+          if (draw_cameras && colorize_last_cam_src >= 0 && colorize_last_cam_idx >= 0) {
+            const auto& cam = image_sources[colorize_last_cam_src].frames[colorize_last_cam_idx];
+            if (cam.located) {
+              auto vw = guik::LightViewer::instance();
+              const Eigen::Vector3f pos = cam.T_world_cam.translation().cast<float>();
+              const Eigen::Matrix3f R = cam.T_world_cam.rotation().cast<float>();
+              const Eigen::Vector3f fwd = R.col(0).normalized(), right = R.col(1).normalized(), up = R.col(2).normalized();
+              const float fl = 0.6f, fw = 0.3f, fh = 0.2f;
+              const Eigen::Vector3f bc = pos + fwd * fl;
+              std::vector<Eigen::Vector3f> verts = {
+                pos, bc+right*fw+up*fh, pos, bc-right*fw+up*fh, pos, bc-right*fw-up*fh, pos, bc+right*fw-up*fh,
+                bc+right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw-up*fh,
+                bc-right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw+up*fh
+              };
+              const int si = colorize_last_cam_src, fi = colorize_last_cam_idx;
+              vw->update_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi),
+                std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false),
+                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
+              Eigen::Affine3f btf = Eigen::Affine3f::Identity(); btf.translate(pos); btf.linear() = R;
+              btf = btf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+              vw->update_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi),
+                glk::Primitives::cube(),
+                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, btf).add("info_values",
+                  Eigen::Vector4i(static_cast<int>(PickType::CAMERA), si, 0, fi)));
+            }
+          }
+        }
+
+        // Locate button
+        if (ImGui::Button("Locate along path")) {
+          // Save colorize config on each locate
+          if (!loaded_map_path.empty()) {
+            nlohmann::json cfg; cfg["sources"] = nlohmann::json::array();
+            for (const auto& s : image_sources) {
+              nlohmann::json sj;
+              sj["path"] = s.path; sj["mask_path"] = s.mask_path; sj["time_shift"] = s.time_shift;
+              sj["lever_arm"] = {s.lever_arm.x(), s.lever_arm.y(), s.lever_arm.z()};
+              sj["rotation_rpy"] = {s.rotation_rpy.x(), s.rotation_rpy.y(), s.rotation_rpy.z()};
+              sj["fx"] = s.intrinsics.fx; sj["fy"] = s.intrinsics.fy;
+              sj["cx"] = s.intrinsics.cx; sj["cy"] = s.intrinsics.cy;
+              sj["width"] = s.intrinsics.width; sj["height"] = s.intrinsics.height;
+              sj["k1"] = s.intrinsics.k1; sj["k2"] = s.intrinsics.k2;
+              sj["p1"] = s.intrinsics.p1; sj["p2"] = s.intrinsics.p2; sj["k3"] = s.intrinsics.k3;
+              cfg["sources"].push_back(sj);
+            }
+            std::ofstream ofs(loaded_map_path + "/colorize_config.json");
+            ofs << std::setprecision(10) << cfg.dump(2);
+          }
+          if (!trajectory_built) build_trajectory();
+          // Build timed pose vector from trajectory
+          std::vector<TimedPose> timed_traj(trajectory_data.size());
+          for (size_t i = 0; i < trajectory_data.size(); i++) {
+            timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+          }
+
+          int count = 0;
+          if (colorize_locate_mode == 0) {
+            count = Colorizer::locate_by_time(src, timed_traj);
+          } else {
+            count = Colorizer::locate_by_coordinates(src, timed_traj,
+              gnss_utm_zone, gnss_utm_easting_origin, gnss_utm_northing_origin, gnss_datum_alt);
+          }
+          logger->info("[Colorize] Located {} / {} cameras", count, src.frames.size());
+          draw_cameras = true;
+
+          // Render camera gizmos
+          if (draw_cameras) {
+            auto vw = guik::LightViewer::instance();
+            int cam_count = 0;
+            for (size_t fi = 0; fi < src.frames.size(); fi++) {
+              if (!src.frames[fi].located) continue;
+              const auto& T = src.frames[fi].T_world_cam;
+              const Eigen::Vector3f pos = T.translation().cast<float>();
+              const Eigen::Matrix3f R = T.rotation().cast<float>();
+              const Eigen::Vector3f fwd = R.col(0).normalized();
+              const Eigen::Vector3f right = R.col(1).normalized();
+              const Eigen::Vector3f up = R.col(2).normalized();
+
+              // FOV pyramid: tip at camera pos, 4 lines to rectangle corners ahead
+              const float fov_len = 0.6f, fov_w = 0.3f, fov_h = 0.2f;
+              const Eigen::Vector3f base_center = pos + fwd * fov_len;
+              const Eigen::Vector3f c0 = base_center + right * fov_w + up * fov_h;
+              const Eigen::Vector3f c1 = base_center - right * fov_w + up * fov_h;
+              const Eigen::Vector3f c2 = base_center - right * fov_w - up * fov_h;
+              const Eigen::Vector3f c3 = base_center + right * fov_w - up * fov_h;
+
+              // 8 lines: 4 from tip to corners + 4 base edges (16 vertices, pairs)
+              std::vector<Eigen::Vector3f> verts = {
+                pos, c0, pos, c1, pos, c2, pos, c3,  // tip to corners
+                c0, c1, c1, c2, c2, c3, c3, c0       // base rectangle
+              };
+              // FOV lines
+              auto line_buf = std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false);
+              vw->update_drawable("cam_fov_" + std::to_string(colorize_source_idx) + "_" + std::to_string(fi),
+                line_buf, guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
+
+              // Camera body — solid pickable cube
+              Eigen::Affine3f box_tf = Eigen::Affine3f::Identity();
+              box_tf.translate(pos);
+              box_tf.linear() = R;
+              box_tf = box_tf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+              const Eigen::Vector4i cam_info(static_cast<int>(PickType::CAMERA), colorize_source_idx, 0, static_cast<int>(fi));
+              vw->update_drawable("cam_" + std::to_string(colorize_source_idx) + "_" + std::to_string(fi),
+                glk::Primitives::cube(),
+                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, box_tf).add("info_values", cam_info));
+              cam_count++;
+            }
+            logger->info("[Colorize] Rendered {} camera gizmos", cam_count);
+          }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Place cameras along the SLAM trajectory\nusing the selected criteria.");
+
+        ImGui::SameLine();
+        static bool prev_draw_cameras = false;
+        ImGui::Checkbox("Show", &draw_cameras);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show/hide camera gizmos in the 3D view.");
+
+        // Handle show/hide transitions
+        if (!draw_cameras && prev_draw_cameras) {
+          // Just turned off — remove all gizmos
+          auto vw = guik::LightViewer::instance();
+          for (size_t si = 0; si < image_sources.size(); si++) {
+            for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
+              vw->remove_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi));
+              vw->remove_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi));
+            }
+          }
+        } else if (draw_cameras && !prev_draw_cameras) {
+          // Just turned on — re-render all located cameras
+          auto vw = guik::LightViewer::instance();
+          for (size_t si = 0; si < image_sources.size(); si++) {
+            for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
+              if (!image_sources[si].frames[fi].located) continue;
+              const auto& T = image_sources[si].frames[fi].T_world_cam;
+              const Eigen::Vector3f pos = T.translation().cast<float>();
+              const Eigen::Matrix3f R = T.rotation().cast<float>();
+              const Eigen::Vector3f fwd = R.col(0).normalized();
+              const Eigen::Vector3f right = R.col(1).normalized();
+              const Eigen::Vector3f up = R.col(2).normalized();
+              const float fov_len = 0.6f, fov_w = 0.3f, fov_h = 0.2f;
+              const Eigen::Vector3f bc = pos + fwd * fov_len;
+              std::vector<Eigen::Vector3f> verts = {
+                pos, bc + right*fov_w + up*fov_h, pos, bc - right*fov_w + up*fov_h,
+                pos, bc - right*fov_w - up*fov_h, pos, bc + right*fov_w - up*fov_h,
+                bc + right*fov_w + up*fov_h, bc - right*fov_w + up*fov_h,
+                bc - right*fov_w + up*fov_h, bc - right*fov_w - up*fov_h,
+                bc - right*fov_w - up*fov_h, bc + right*fov_w - up*fov_h,
+                bc + right*fov_w - up*fov_h, bc + right*fov_w + up*fov_h
+              };
+              vw->update_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi),
+                std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false),
+                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
+              Eigen::Affine3f box_tf = Eigen::Affine3f::Identity();
+              box_tf.translate(pos); box_tf.linear() = R;
+              box_tf = box_tf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+              const Eigen::Vector4i cam_info(static_cast<int>(PickType::CAMERA), static_cast<int>(si), 0, static_cast<int>(fi));
+              vw->update_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi),
+                glk::Primitives::cube(),
+                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, box_tf).add("info_values", cam_info));
+            }
+          }
+        }
+        prev_draw_cameras = draw_cameras;
+
+        // Intrinsics (compact input fields)
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Camera Intrinsics")) {
+          float fx = static_cast<float>(src.intrinsics.fx), fy = static_cast<float>(src.intrinsics.fy);
+          float cxv = static_cast<float>(src.intrinsics.cx), cyv = static_cast<float>(src.intrinsics.cy);
+          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("fx##i", &fx, 0, 0, "%.0f")) src.intrinsics.fx = fx;
+          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("fy##i", &fy, 0, 0, "%.0f")) src.intrinsics.fy = fy;
+          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("cx##i", &cxv, 0, 0, "%.0f")) src.intrinsics.cx = cxv;
+          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("cy##i", &cyv, 0, 0, "%.0f")) src.intrinsics.cy = cyv;
+          int iw = src.intrinsics.width, ih = src.intrinsics.height;
+          ImGui::SetNextItemWidth(80); if (ImGui::InputInt("W##i", &iw)) src.intrinsics.width = iw;
+          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputInt("H##i", &ih)) src.intrinsics.height = ih;
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pinhole intrinsics. Default: Elgato Facecam Pro 90° FOV.");
+          ImGui::Separator();
+          ImGui::Text("Distortion (Brown-Conrady)");
+          float dk1 = static_cast<float>(src.intrinsics.k1), dk2 = static_cast<float>(src.intrinsics.k2);
+          float dp1 = static_cast<float>(src.intrinsics.p1), dp2 = static_cast<float>(src.intrinsics.p2);
+          float dk3 = static_cast<float>(src.intrinsics.k3);
+          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("k1##d", &dk1, 0, 0, "%.6f")) src.intrinsics.k1 = dk1;
+          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("k2##d", &dk2, 0, 0, "%.6f")) src.intrinsics.k2 = dk2;
+          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("p1##d", &dp1, 0, 0, "%.6f")) src.intrinsics.p1 = dp1;
+          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("p2##d", &dp2, 0, 0, "%.6f")) src.intrinsics.p2 = dp2;
+          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("k3##d", &dk3, 0, 0, "%.6f")) src.intrinsics.k3 = dk3;
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Radial (k1,k2,k3) and tangential (p1,p2) distortion.\nImport from Metashape or calibration tool.\nLeave zeros for no distortion.");
+        }
+
+        ImGui::DragFloat("Min range (m)", &colorize_min_range, 0.5f, 0.0f, 50.0f, "%.1f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip points closer than this to the camera.\nReduces close-up distortion artifacts.");
+        ImGui::DragFloat("Max range (m)", &colorize_max_range, 1.0f, 5.0f, 200.0f, "%.0f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max distance from camera to project points.\nCloser = faster, further = more coverage.");
+        ImGui::Checkbox("Blend cameras", &colorize_blend);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("On: average colors from all cameras seeing a point.\nOff: use only the closest camera's color.");
+
+        // Static mask
+        if (ImGui::Button("Load mask")) {
+          auto files = pfd::open_file("Select mask image", src.path, {"Image files", "*.png *.jpg *.bmp"}).result();
+          if (!files.empty()) {
+            colorize_mask = cv::imread(files[0], cv::IMREAD_UNCHANGED);
+            if (!colorize_mask.empty()) { src.mask_path = files[0]; logger->info("[Colorize] Loaded mask from {}", files[0]); }
+          }
+        }
+        // Simple: look for mask.png in the image source folder
+        if (colorize_mask.empty() && !src.path.empty()) {
+          const std::string auto_mask = src.path + "/mask.png";
+          if (boost::filesystem::exists(auto_mask)) {
+            colorize_mask = cv::imread(auto_mask, cv::IMREAD_UNCHANGED);
+            if (!colorize_mask.empty()) logger->info("[Colorize] Auto-loaded mask from {}", auto_mask);
+          }
+        }
+        if (!colorize_mask.empty()) {
+          ImGui::SameLine();
+          const bool mask_size_ok = (colorize_mask.cols == src.intrinsics.width && colorize_mask.rows == src.intrinsics.height);
+          if (mask_size_ok) ImGui::TextDisabled("Mask: %dx%d ch=%d", colorize_mask.cols, colorize_mask.rows, colorize_mask.channels());
+          else ImGui::TextColored(ImVec4(1,0.4f,0,1), "Mask: %dx%d (expected %dx%d!)", colorize_mask.cols, colorize_mask.rows, src.intrinsics.width, src.intrinsics.height);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Preview##mask")) {
+            // Overlay mask on first image: checkerboard where masked, image where not
+            if (!src.frames.empty()) {
+              auto img = cv::imread(src.frames[0].filepath);
+              if (!img.empty()) {
+                cv::Mat mask_resized;
+                if (colorize_mask.cols != img.cols || colorize_mask.rows != img.rows)
+                  cv::resize(colorize_mask, mask_resized, cv::Size(img.cols, img.rows));
+                else mask_resized = colorize_mask;
+                // Build display: image where mask is white, checkerboard where mask is black
+                for (int y = 0; y < img.rows; y++) {
+                  for (int x = 0; x < img.cols; x++) {
+                    bool is_masked = false;
+                    if (mask_resized.channels() == 1) is_masked = mask_resized.at<uint8_t>(y, x) == 0;
+                    else if (mask_resized.channels() == 3) { auto& p = mask_resized.at<cv::Vec3b>(y, x); is_masked = (p[0]==0 && p[1]==0 && p[2]==0); }
+                    else if (mask_resized.channels() == 4) { auto& p = mask_resized.at<cv::Vec4b>(y, x); is_masked = (p[3]==0) || (p[0]==0 && p[1]==0 && p[2]==0); }
+                    if (is_masked) {
+                      uint8_t c = ((x/16 + y/16) % 2 == 0) ? 180 : 80;
+                      img.at<cv::Vec3b>(y, x) = cv::Vec3b(c, c, c);
+                    }
+                  }
+                }
+                cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+                image_original_w = img.cols; image_original_h = img.rows;
+                if (img.cols > 1920) { double s = 1920.0 / img.cols; cv::resize(img, img, cv::Size(), s, s); }
+                if (image_viewer_texture) glDeleteTextures(1, &image_viewer_texture);
+                glGenTextures(1, &image_viewer_texture);
+                glBindTexture(GL_TEXTURE_2D, image_viewer_texture);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data);
+                glBindTexture(GL_TEXTURE_2D, 0);
+                image_viewer_w = img.cols; image_viewer_h = img.rows;
+                image_viewer_title = "Mask Preview";
+                show_image_viewer = true;
+              }
+            }
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Clear mask")) colorize_mask = cv::Mat();
+        } else {
+          ImGui::SameLine();
+          ImGui::TextDisabled("No mask (place mask.png in image folder)");
+        }
+
+        ImGui::Separator();
+        bool blend_changed = false;
+        if (ImGui::Checkbox("Intensity blend", &colorize_intensity_blend)) blend_changed = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blend projected RGB with LiDAR intensity.\nUseful for alignment verification using road markings.");
+        if (colorize_intensity_blend) {
+          if (ImGui::SliderFloat("Mix##intblend", &colorize_intensity_mix, 0.0f, 1.0f, "%.2f")) blend_changed = true;
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = pure RGB, 1 = pure intensity.");
+          if (ImGui::Checkbox("Non-linear intensity", &colorize_nonlinear_int)) blend_changed = true;
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Compress intensity range (sqrt) to boost\nroad marking contrast. Useful for Livox scanners.");
+        }
+        // Re-render preview with new blend without re-projecting
+        if (blend_changed && !colorize_last_result.points.empty()) {
+          auto vw = guik::LightViewer::instance();
+          const size_t n = colorize_last_result.points.size();
+          float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
+          for (size_t i = 0; i < n && i < colorize_last_result.intensities.size(); i++) {
+            imin = std::min(imin, colorize_last_result.intensities[i]);
+            imax = std::max(imax, colorize_last_result.intensities[i]);
+          }
+          if (imin >= imax) { imin = 0; imax = 255; }
+          std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
+          for (size_t i = 0; i < n; i++) {
+            p4[i] = Eigen::Vector4d(colorize_last_result.points[i].x(), colorize_last_result.points[i].y(), colorize_last_result.points[i].z(), 1.0);
+            Eigen::Vector3f rgb = colorize_last_result.colors[i];
+            if (colorize_intensity_blend && i < colorize_last_result.intensities.size()) {
+              float inv = (colorize_last_result.intensities[i] - imin) / (imax - imin);
+              if (colorize_nonlinear_int) inv = std::sqrt(inv);
+              rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
+            }
+            c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
+          }
+          auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size());
+          cb->add_color(c4);
+          vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR));
+        }
+
+        // Colorize all submaps + clear
+        static bool colorize_all_running = false;
+        static std::string colorize_all_status;
+        if (colorize_all_running) {
+          ImGui::TextColored(ImVec4(1, 1, 0, 1), "%s", colorize_all_status.c_str());
+        } else {
+          if (ImGui::Button("Colorize all submaps (preview)")) {
+            colorize_all_running = true;
+            colorize_all_status = "Starting...";
+            const auto& isrc = image_sources[colorize_source_idx];
+            std::thread([this, &isrc] {
+              if (!trajectory_built) build_trajectory();
+              std::vector<TimedPose> timed_traj(trajectory_data.size());
+              for (size_t i = 0; i < trajectory_data.size(); i++) timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+
+              std::vector<Eigen::Vector4d> all_pts;
+              std::vector<Eigen::Vector4f> all_cols;
+              ColorizeResult agg;  // store full-map result for blend re-render
+              size_t total_colored = 0;
+
+              for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+                const auto& sm = submaps[si];
+                if (!sm || sm->frames.empty()) continue;
+                if (hidden_sessions.count(sm->session_id)) continue;
+
+                char buf[64]; std::snprintf(buf, sizeof(buf), "Submap %d/%zu...", si + 1, submaps.size());
+                colorize_all_status = buf;
+
+                // Find cameras for this submap by timestamp
+                const double t0 = sm->frames.front()->stamp, t1 = sm->frames.back()->stamp;
+                std::vector<CameraFrame> cams;
+                for (const auto& src2 : image_sources) {
+                  for (const auto& cam : src2.frames) {
+                    if (!cam.located || cam.timestamp <= 0) continue;
+                    const double ct = cam.timestamp + src2.time_shift;
+                    if (ct >= t0 - 1.0 && ct <= t1 + 1.0) cams.push_back(cam);
+                  }
+                }
+                if (cams.empty()) continue;
+
+                // Load HD points
+                auto hd = load_hd_for_submap(si, false);
+                if (!hd || hd->size() == 0) continue;
+                const Eigen::Isometry3d T_wo = sm->T_world_origin;
+                std::vector<Eigen::Vector3f> wpts(hd->size());
+                std::vector<float> ints(hd->size(), 0.0f);
+                for (size_t i = 0; i < hd->size(); i++) {
+                  wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
+                  if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                }
+
+                auto cr = Colorizer::project_colors(cams, isrc.intrinsics, wpts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
+                for (size_t i = 0; i < cr.points.size(); i++) {
+                  if (cr.colors[i].x() == 0.5f && cr.colors[i].y() == 0.5f && cr.colors[i].z() == 0.5f) continue; // skip gray (uncolored)
+                  all_pts.push_back(Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0));
+                  all_cols.push_back(Eigen::Vector4f(cr.colors[i].x(), cr.colors[i].y(), cr.colors[i].z(), 1.0f));
+                  agg.points.push_back(cr.points[i]);
+                  agg.colors.push_back(cr.colors[i]);
+                  if (i < cr.intensities.size()) agg.intensities.push_back(cr.intensities[i]);
+                }
+                total_colored += cr.colored;
+              }
+
+              // Render — store in colorize_last_result so blend slider re-renders the full map
+              guik::LightViewer::instance()->invoke([this, all_pts, all_cols, agg, total_colored] {
+                auto vw = guik::LightViewer::instance();
+                lod_hide_all_submaps = true;
+                colorize_last_result = agg;
+                // Clear focused context so live preview won't swap back to a single submap/cam
+                colorize_last_submap = -1;
+                colorize_last_cam_src = -1;
+                colorize_last_cam_idx = -1;
+                if (!all_pts.empty()) {
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(all_pts.data(), all_pts.size());
+                  cb->add_color(all_cols);
+                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR));
+                }
+                char buf[128]; std::snprintf(buf, sizeof(buf), "Done: %zu colored points from %zu total", total_colored, all_pts.size());
+                colorize_all_status = buf;
+                colorize_all_running = false;
+                logger->info("[Colorize] {}", colorize_all_status);
+              });
+            }).detach();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Colorize ALL submaps using nearby cameras.\nRenders as preview overlay.");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear preview")) {
+          auto vw = guik::LightViewer::instance();
+          vw->remove_drawable("colorize_preview");
+          lod_hide_all_submaps = false;
+        }
+
+        // Apply colorize to HD (write aux_rgb.bin per frame)
+        static bool apply_rgb_running = false;
+        static std::string apply_rgb_status;
+        if (apply_rgb_running) {
+          ImGui::TextColored(ImVec4(1, 1, 0, 1), "%s", apply_rgb_status.c_str());
+        } else {
+          if (ImGui::Button("Apply colorize to HD")) {
+            apply_rgb_running = true;
+            apply_rgb_status = "Starting...";
+            const auto mask_copy = colorize_mask.clone();
+            std::thread([this, mask_copy] {
+              if (!trajectory_built) build_trajectory();
+              const auto start_time = std::chrono::steady_clock::now();
+              const auto& isrc = image_sources[colorize_source_idx];
+              int frames_written = 0;
+
+              for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+                const auto& sm = submaps[si];
+                if (!sm || sm->frames.empty() || hidden_sessions.count(sm->session_id)) continue;
+
+                char buf[64]; std::snprintf(buf, sizeof(buf), "Submap %d/%zu...", si + 1, submaps.size());
+                apply_rgb_status = buf;
+
+                // Find cameras by timestamp
+                const double t0 = sm->frames.front()->stamp, t1 = sm->frames.back()->stamp;
+                std::vector<CameraFrame> cams;
+                for (const auto& src2 : image_sources) {
+                  for (const auto& cam : src2.frames) {
+                    if (!cam.located || cam.timestamp <= 0) continue;
+                    const double ct = cam.timestamp + src2.time_shift;
+                    if (ct >= t0 - 1.0 && ct <= t1 + 1.0) cams.push_back(cam);
+                  }
+                }
+                if (cams.empty()) continue;
+
+                // Load full submap (same as preview) — project once, split by frame
+                auto hd = load_hd_for_submap(si, false);
+                if (!hd || hd->size() == 0) continue;
+                const Eigen::Isometry3d T_wo = sm->T_world_origin;
+                std::vector<Eigen::Vector3f> wpts(hd->size());
+                std::vector<float> ints(hd->size(), 0.0f);
+                for (size_t i = 0; i < hd->size(); i++) {
+                  wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
+                  if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                }
+
+                auto cr = Colorizer::project_colors(cams, isrc.intrinsics, wpts, ints,
+                  colorize_max_range, colorize_blend, colorize_min_range, mask_copy);
+                logger->info("[Apply] Submap {}: {} colored / {} total from {} cameras",
+                  si, cr.colored, cr.total, cams.size());
+
+                // Split colors back to per-frame aux_rgb.bin
+                const auto hd_it = session_hd_paths.find(sm->session_id);
+                if (hd_it == session_hd_paths.end()) continue;
+                const Eigen::Isometry3d T_odom0 = sm->frames.front()->T_world_imu;
+                size_t pt_offset = 0;  // tracks position in the merged submap
+
+                for (const auto& fr : sm->frames) {
+                  char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                  const std::string fd = hd_it->second + "/" + dn;
+                  auto fi = glim::frame_info_from_meta(fd,
+                    glim::compute_frame_world_pose(sm->T_world_origin, sm->T_origin_endpoint_L, T_odom0, fr->T_world_imu, fr->T_lidar_imu));
+                  if (fi.num_points == 0) continue;
+
+                  // Count how many points from this frame passed the range filter in load_hd_for_submap
+                  std::vector<float> rng;
+                  glim::load_bin(fd + "/range.bin", rng, fi.num_points);
+                  int frame_hd_pts = 0;
+                  for (int pi = 0; pi < fi.num_points; pi++) {
+                    const float r = (!rng.empty()) ? rng[pi] : 0.0f;
+                    if (r >= 1.5f || rng.empty()) frame_hd_pts++;
+                  }
+
+                  // Write aux_rgb.bin — map merged submap indices back to frame indices
+                  std::vector<float> rgb_data(fi.num_points * 3);
+                  int hd_idx = 0;
+                  for (int pi = 0; pi < fi.num_points; pi++) {
+                    const float r = (!rng.empty()) ? rng[pi] : 0.0f;
+                    if (r >= 1.5f || rng.empty()) {
+                      if (pt_offset + hd_idx < cr.colors.size()) {
+                        const auto& c = cr.colors[pt_offset + hd_idx];
+                        rgb_data[pi * 3 + 0] = c.x();
+                        rgb_data[pi * 3 + 1] = c.y();
+                        rgb_data[pi * 3 + 2] = c.z();
+                      }
+                      hd_idx++;
+                    } else {
+                      // Point filtered by range — use intensity fallback
+                      float gray = 0.5f;
+                      rgb_data[pi * 3 + 0] = gray;
+                      rgb_data[pi * 3 + 1] = gray;
+                      rgb_data[pi * 3 + 2] = gray;
+                    }
+                  }
+                  pt_offset += frame_hd_pts;
+
+                  std::ofstream f(fd + "/aux_rgb.bin", std::ios::binary);
+                  f.write(reinterpret_cast<const char*>(rgb_data.data()), sizeof(float) * rgb_data.size());
+                  frames_written++;
+                }
+              }
+
+              const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+              char buf[128]; std::snprintf(buf, sizeof(buf), "Done: %d frames colored (%.1f sec)", frames_written, elapsed);
+              apply_rgb_status = buf;
+              apply_rgb_running = false;
+              logger->info("[Colorize] {}", apply_rgb_status);
+            }).detach();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("WRITE aux_rgb.bin to every HD frame.\nPersistent — appears in color dropdown after HD reload.");
+        }
+
+        // Info about first/last timestamps
+        if (!src.frames.empty()) {
+          double min_ts = std::numeric_limits<double>::max(), max_ts = 0.0;
+          for (const auto& f : src.frames) {
+            if (f.timestamp > 0.0) { min_ts = std::min(min_ts, f.timestamp); max_ts = std::max(max_ts, f.timestamp); }
+          }
+          if (max_ts > 0.0) {
+            ImGui::Separator();
+            ImGui::Text("Time range: %.1f sec", max_ts - min_ts);
+            if (trajectory_built && !trajectory_data.empty()) {
+              ImGui::Text("Traj range: %.1f - %.1f", trajectory_data.front().stamp, trajectory_data.back().stamp);
+              ImGui::Text("Img range:  %.1f - %.1f", min_ts, max_ts);
+            }
+          }
+        }
+      }
+    }
+    ImGui::End();
+  });
+
+  // Alignment check window — image + projected LiDAR overlay, scale-aware
+  viewer->register_ui_callback("align_view", [this] {
+    if (!align_show) return;
+    ImGui::SetNextWindowSize(ImVec2(1000, 700), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Alignment check", &align_show)) {
+      if (image_sources.empty()) { ImGui::TextDisabled("No image sources loaded."); ImGui::End(); return; }
+      align_cam_src = std::clamp(align_cam_src, 0, static_cast<int>(image_sources.size()) - 1);
+      auto& src = image_sources[align_cam_src];
+      if (src.frames.empty()) { ImGui::TextDisabled("Selected source has no frames."); ImGui::End(); return; }
+      align_cam_idx = std::clamp(align_cam_idx, 0, static_cast<int>(src.frames.size()) - 1);
+
+      // --- Top controls ---
+      if (image_sources.size() > 1) {
+        std::vector<std::string> labels;
+        for (size_t i = 0; i < image_sources.size(); i++) labels.push_back("src " + std::to_string(i));
+        std::vector<const char*> lptrs; for (auto& s : labels) lptrs.push_back(s.c_str());
+        ImGui::SetNextItemWidth(100);
+        ImGui::Combo("Source", &align_cam_src, lptrs.data(), lptrs.size());
+        ImGui::SameLine();
+      }
+      ImGui::SetNextItemWidth(200);
+      if (ImGui::SliderInt("Image", &align_cam_idx, 0, static_cast<int>(src.frames.size()) - 1)) {}
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Camera image index (not LiDAR frame).");
+      ImGui::SameLine();
+      if (ImGui::ArrowButton("##align_prev", ImGuiDir_Left)) align_cam_idx = std::max(0, align_cam_idx - 1);
+      ImGui::SameLine();
+      if (ImGui::ArrowButton("##align_next", ImGuiDir_Right)) align_cam_idx = std::min(static_cast<int>(src.frames.size()) - 1, align_cam_idx + 1);
+      ImGui::SameLine();
+      ImGui::Text("%s", boost::filesystem::path(src.frames[align_cam_idx].filepath).filename().string().c_str());
+
+      ImGui::SetNextItemWidth(120); ImGui::SliderFloat("View scale", &align_display_scale, 0.05f, 4.0f, "%.2fx");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display scale vs native pixels.\nMath always runs at native resolution.");
+      ImGui::SameLine(); if (ImGui::Button("Fit")) {
+        // Will be computed below once we know window size
+        align_display_scale = -1.0f;  // sentinel
+      }
+      ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+      ImGui::SliderFloat("Pt size", &align_point_size, 0.5f, 6.0f, "%.1f");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+      ImGui::Combo("Color", &align_point_color_mode, "Intensity\0Range\0Depth\0");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+      ImGui::SliderFloat("Min bright", &align_bright_threshold, 0.0f, 1.0f, "%.2f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only show points with intensity above this threshold.\nUseful for comparing road markings.");
+
+      ImGui::SetNextItemWidth(120); ImGui::SliderFloat("Max range", &align_max_range, 2.0f, 100.0f, "%.1fm");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+      ImGui::SliderFloat("Min range", &align_min_range, 0.1f, 10.0f, "%.1fm");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+      ImGui::SliderFloat("Alpha", &align_point_alpha, 0.05f, 1.0f, "%.2f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overlay point transparency — blend dots with image.");
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Rectified", &align_rectified)) align_loaded_path.clear();  // force reload
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("OFF: raw image + distorted projection (matches colorize phase).\nON: undistorted image + pinhole projection (isolates extrinsic error).");
+      if (align_rectified) {
+        ImGui::TextDisabled("Mode: rectified image vs pinhole projection — residual = extrinsic only.");
+      } else {
+        ImGui::TextDisabled("Mode: raw image vs distorted projection — residual = extrinsic + distortion model.");
+      }
+
+      // --- Load image if needed ---
+      const auto& cam = src.frames[align_cam_idx];
+      if (cam.filepath != align_loaded_path || align_rect_applied != align_rectified) {
+        cv::Mat img = cv::imread(cam.filepath);
+        if (!img.empty()) {
+          align_img_w = img.cols; align_img_h = img.rows;
+          // Optional rectification: undistort at native resolution using source intrinsics
+          if (align_rectified) {
+            cv::Mat K = (cv::Mat_<double>(3, 3) <<
+              src.intrinsics.fx, 0, src.intrinsics.cx,
+              0, src.intrinsics.fy, src.intrinsics.cy,
+              0, 0, 1);
+            cv::Mat D = (cv::Mat_<double>(1, 5) <<
+              src.intrinsics.k1, src.intrinsics.k2,
+              src.intrinsics.p1, src.intrinsics.p2, src.intrinsics.k3);
+            cv::Mat rect;
+            cv::undistort(img, rect, K, D);
+            img = rect;
+          }
+          cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+          // Downscale texture if huge; display math uses native size
+          const int max_tex = 2048;
+          cv::Mat tex_img = img;
+          if (img.cols > max_tex) {
+            const double s = static_cast<double>(max_tex) / img.cols;
+            cv::resize(img, tex_img, cv::Size(), s, s);
+          }
+          if (align_texture) { glDeleteTextures(1, &align_texture); align_texture = 0; }
+          glGenTextures(1, &align_texture);
+          glBindTexture(GL_TEXTURE_2D, align_texture);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, tex_img.cols, tex_img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, tex_img.data);
+          glBindTexture(GL_TEXTURE_2D, 0);
+          align_tex_w = tex_img.cols; align_tex_h = tex_img.rows;
+          align_loaded_path = cam.filepath;
+          align_rect_applied = align_rectified;
+        }
+      }
+
+      // --- Locate camera using current colorize extrinsic (live-linked) ---
+      if (!trajectory_built) build_trajectory();
+      std::vector<TimedPose> timed_traj(trajectory_data.size());
+      for (size_t i = 0; i < trajectory_data.size(); i++) timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+      Eigen::Isometry3d T_world_cam = Eigen::Isometry3d::Identity();
+      bool cam_ok = false;
+      if (cam.timestamp > 0.0 && !timed_traj.empty()) {
+        const double ts = cam.timestamp + src.time_shift;
+        if (ts >= timed_traj.front().stamp - 2.0 && ts <= timed_traj.back().stamp + 2.0) {
+          const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(timed_traj, ts);
+          const Eigen::Isometry3d T_lidar_cam = Colorizer::build_extrinsic(src.lever_arm, src.rotation_rpy);
+          T_world_cam = T_world_lidar * T_lidar_cam;
+          cam_ok = true;
+        }
+      }
+
+      // --- Find submap at camera timestamp; cache its world points ---
+      int best_sm = -1;
+      if (cam_ok) {
+        double best_dt = 1e9;
+        const double ct = cam.timestamp + src.time_shift;
+        for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+          if (!submaps[si] || submaps[si]->frames.empty()) continue;
+          const double t0 = submaps[si]->frames.front()->stamp, t1 = submaps[si]->frames.back()->stamp;
+          if (ct >= t0 && ct <= t1) { best_sm = si; break; }
+          const double dt = std::min(std::abs(ct - t0), std::abs(ct - t1));
+          if (dt < best_dt) { best_dt = dt; best_sm = si; }
+        }
+      }
+      if (best_sm >= 0 && best_sm != align_last_submap_id) {
+        align_submap_world_pts.clear(); align_submap_ints.clear();
+        auto hd = load_hd_for_submap(best_sm, false);
+        if (hd && hd->size() > 0) {
+          const Eigen::Isometry3d T_wo = submaps[best_sm]->T_world_origin;
+          align_submap_world_pts.resize(hd->size());
+          align_submap_ints.assign(hd->size(), 0.0f);
+          for (size_t i = 0; i < hd->size(); i++) {
+            align_submap_world_pts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
+            if (hd->intensities) align_submap_ints[i] = static_cast<float>(hd->intensities[i]);
+          }
+        }
+        align_last_submap_id = best_sm;
+      }
+
+      // --- Identify nearest LiDAR frame to this camera (for frame-assignment check) ---
+      long nearest_frame_id = -1;
+      double nearest_frame_stamp = 0.0;
+      double nearest_dt = 0.0;
+      if (cam_ok && best_sm >= 0 && !submaps[best_sm]->frames.empty()) {
+        const double ct = cam.timestamp + src.time_shift;
+        double best_dt = 1e9;
+        for (const auto& f : submaps[best_sm]->frames) {
+          const double dt = std::abs(f->stamp - ct);
+          if (dt < best_dt) { best_dt = dt; nearest_frame_id = f->id; nearest_frame_stamp = f->stamp; nearest_dt = f->stamp - ct; }
+        }
+      }
+      // Info line
+      if (cam_ok) {
+        ImGui::TextDisabled("cam_t=%.3f  submap=%d  nearest_lidar_frame=%ld  lidar_t=%.3f  dt=%+.3fs",
+          cam.timestamp + src.time_shift, best_sm, nearest_frame_id, nearest_frame_stamp, nearest_dt);
+      } else {
+        ImGui::TextDisabled("Camera not locatable (timestamp out of trajectory range).");
+      }
+
+      // --- Compute canvas area ---
+      const ImVec2 avail = ImGui::GetContentRegionAvail();
+      if (align_display_scale < 0.0f && align_img_w > 0 && align_img_h > 0) {
+        const float fit_w = avail.x / static_cast<float>(align_img_w);
+        const float fit_h = (avail.y - 10.0f) / static_cast<float>(align_img_h);
+        align_display_scale = std::max(0.05f, std::min(fit_w, fit_h));
+      }
+      const float disp_w = align_img_w * align_display_scale;
+      const float disp_h = align_img_h * align_display_scale;
+
+      ImGui::BeginChild("align_canvas", avail, false, ImGuiWindowFlags_HorizontalScrollbar);
+      const ImVec2 cur = ImGui::GetCursorScreenPos();
+      if (align_texture && align_img_w > 0) {
+        ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(align_texture)), ImVec2(disp_w, disp_h));
+      } else {
+        ImGui::Dummy(ImVec2(disp_w > 0 ? disp_w : 400, disp_h > 0 ? disp_h : 300));
+      }
+
+      // --- Project and draw points ---
+      if (cam_ok && !align_submap_world_pts.empty()) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const Eigen::Isometry3d T_cw = T_world_cam.inverse();
+        const Eigen::Matrix3d R_cam = T_cw.rotation();
+        const Eigen::Vector3d t_cam = T_cw.translation();
+        const double fx = src.intrinsics.fx, fy = src.intrinsics.fy;
+        const double cx_d = src.intrinsics.cx, cy_d = src.intrinsics.cy;
+        const bool has_dist = !align_rectified && (src.intrinsics.k1 != 0 || src.intrinsics.k2 != 0 || src.intrinsics.p1 != 0 || src.intrinsics.p2 != 0);
+        const Eigen::Vector3f cam_pos = T_world_cam.translation().cast<float>();
+        const float max_r_sq = align_max_range * align_max_range;
+        const float min_r_sq = align_min_range * align_min_range;
+        // Intensity range for color mapping
+        float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
+        for (float v : align_submap_ints) { imin = std::min(imin, v); imax = std::max(imax, v); }
+        if (imin >= imax) { imin = 0; imax = 255; }
+        int drawn = 0;
+        for (size_t pi = 0; pi < align_submap_world_pts.size(); pi++) {
+          const float dsq = (align_submap_world_pts[pi] - cam_pos).squaredNorm();
+          if (dsq > max_r_sq || dsq < min_r_sq) continue;
+          const Eigen::Vector3d p_cam = R_cam * align_submap_world_pts[pi].cast<double>() + t_cam;
+          const double depth = p_cam.x();
+          if (depth <= 0.1) continue;
+          double xn = -p_cam.y() / depth;
+          double yn = -p_cam.z() / depth;
+          if (has_dist) {
+            const double r2 = xn * xn + yn * yn, r4 = r2 * r2, r6 = r4 * r2;
+            const double radial = 1.0 + src.intrinsics.k1 * r2 + src.intrinsics.k2 * r4 + src.intrinsics.k3 * r6;
+            const double xd = xn * radial + 2.0 * src.intrinsics.p1 * xn * yn + src.intrinsics.p2 * (r2 + 2.0 * xn * xn);
+            const double yd = yn * radial + src.intrinsics.p1 * (r2 + 2.0 * yn * yn) + 2.0 * src.intrinsics.p2 * xn * yn;
+            xn = xd; yn = yd;
+          }
+          const double u = fx * xn + cx_d;
+          const double v = fy * yn + cy_d;
+          if (u < 0 || u >= align_img_w || v < 0 || v >= align_img_h) continue;
+          // Intensity gate
+          const float in_norm = align_submap_ints.empty() ? 0.0f : std::clamp((align_submap_ints[pi] - imin) / (imax - imin), 0.0f, 1.0f);
+          if (align_bright_threshold > 0.0f && in_norm < align_bright_threshold) continue;
+          // Color
+          const int a8 = std::clamp(static_cast<int>(align_point_alpha * 255.0f), 0, 255);
+          ImU32 col;
+          if (align_point_color_mode == 0) {
+            const int g = static_cast<int>(in_norm * 255.0f);
+            col = IM_COL32(g, g, 0, a8);
+          } else if (align_point_color_mode == 1) {
+            const float rn = std::sqrt(dsq) / align_max_range;
+            const int r = static_cast<int>((1.0f - rn) * 255.0f);
+            const int b = static_cast<int>(rn * 255.0f);
+            col = IM_COL32(r, 80, b, a8);
+          } else {
+            const float dn = std::clamp(static_cast<float>(depth) / align_max_range, 0.0f, 1.0f);
+            const int g = static_cast<int>((1.0f - dn) * 255.0f);
+            col = IM_COL32(0, g, 255 - g, a8);
+          }
+          const ImVec2 sp(cur.x + static_cast<float>(u) * align_display_scale,
+                          cur.y + static_cast<float>(v) * align_display_scale);
+          dl->AddCircleFilled(sp, align_point_size, col);
+          drawn++;
+        }
+        // Status line on top of image
+        char buf[160]; std::snprintf(buf, sizeof(buf),
+          "sm=%d  pts_drawn=%d  native=%dx%d  scale=%.2fx  shift=%.2fs  RPY=(%.2f,%.2f,%.2f)",
+          best_sm, drawn, align_img_w, align_img_h, align_display_scale,
+          src.time_shift, src.rotation_rpy.x(), src.rotation_rpy.y(), src.rotation_rpy.z());
+        dl->AddText(ImVec2(cur.x + 6, cur.y + 6), IM_COL32(255, 255, 0, 255), buf);
+      } else if (!cam_ok) {
+        ImGui::GetWindowDrawList()->AddText(ImVec2(cur.x + 6, cur.y + 6),
+          IM_COL32(255, 80, 80, 255), "Camera not locatable (timestamp out of trajectory range).");
+      }
+      ImGui::EndChild();
     }
     ImGui::End();
   });
@@ -4021,6 +5784,54 @@ void OfflineViewer::main_menu() {
           fpv_smooth_init = false;
         }
         ImGui::Separator();
+        // Projection
+        if (ImGui::MenuItem("Perspective")) {
+          auto vw = guik::LightViewer::instance();
+          // Iridescence default is perspective — just reset orbit
+          vw->use_orbit_camera_control();
+          camera_mode_sel = 0;
+        }
+        if (ImGui::MenuItem("Orthographic")) {
+          auto vw = guik::LightViewer::instance();
+          vw->use_topdown_camera_control(200.0, 0.0);
+          camera_mode_sel = 0;
+        }
+        ImGui::Separator();
+        // Preset views
+        {
+          auto vw = guik::LightViewer::instance();
+          const Eigen::Matrix4f vm = vw->view_matrix();
+          const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
+          // Get a center point (current lookat target or map center)
+          Eigen::Vector3f center = Eigen::Vector3f::Zero();
+          if (!submaps.empty()) {
+            for (const auto& sm : submaps) { if (sm) center += sm->T_world_origin.translation().cast<float>(); }
+            center /= submaps.size();
+          }
+          const float dist = std::max(50.0f, (cam_pos - center).norm());
+
+          if (ImGui::MenuItem("Top")) {
+            auto fps = vw->use_fps_camera_control(60.0);
+            fps->set_pose(Eigen::Vector3f(center.x(), center.y(), center.z() + dist), 0.0f, -89.0f);
+            camera_mode_sel = 1;
+          }
+          if (ImGui::MenuItem("Front")) {
+            auto fps = vw->use_fps_camera_control(60.0);
+            fps->set_pose(Eigen::Vector3f(center.x() + dist, center.y(), center.z()), 180.0f, 0.0f);
+            camera_mode_sel = 1;
+          }
+          if (ImGui::MenuItem("Left")) {
+            auto fps = vw->use_fps_camera_control(60.0);
+            fps->set_pose(Eigen::Vector3f(center.x(), center.y() + dist, center.z()), -90.0f, 0.0f);
+            camera_mode_sel = 1;
+          }
+          if (ImGui::MenuItem("Right")) {
+            auto fps = vw->use_fps_camera_control(60.0);
+            fps->set_pose(Eigen::Vector3f(center.x(), center.y() - dist, center.z()), 90.0f, 0.0f);
+            camera_mode_sel = 1;
+          }
+        }
+        ImGui::Separator();
         if (ImGui::BeginMenu("Settings")) {
           if (ImGui::SliderFloat("FPV speed", &fpv_speed, 0.1f, 2.0f, "%.2f")) {
             if (camera_mode_sel == 1) {
@@ -4241,6 +6052,85 @@ void OfflineViewer::main_menu() {
       ImGui::EndMenu();
     }
 
+    // Colorize menu
+    if (ImGui::BeginMenu("Colorize")) {
+      if (ImGui::BeginMenu("Image folder")) {
+        if (ImGui::MenuItem("Add folder...")) {
+          const std::string folder = pfd::select_folder("Select image folder").result();
+          if (!folder.empty() && boost::filesystem::exists(folder)) {
+            logger->info("[Colorize] Loading images from {}", folder);
+            auto source = Colorizer::load_image_folder(folder);
+            int with_gps = 0, with_time = 0;
+            for (const auto& f : source.frames) {
+              if (f.lat != 0.0 || f.lon != 0.0) with_gps++;
+              if (f.timestamp > 0.0) with_time++;
+            }
+            logger->info("[Colorize] Loaded {} images ({} with GPS, {} with timestamp)", source.frames.size(), with_gps, with_time);
+            image_sources.push_back(std::move(source));
+            colorize_source_idx = static_cast<int>(image_sources.size()) - 1;
+            // Save colorize config to dump
+            if (!loaded_map_path.empty()) {
+              nlohmann::json cfg;
+              cfg["sources"] = nlohmann::json::array();
+              for (const auto& s : image_sources) {
+                nlohmann::json sj;
+                sj["path"] = s.path;
+                sj["time_shift"] = s.time_shift;
+                sj["lever_arm"] = {s.lever_arm.x(), s.lever_arm.y(), s.lever_arm.z()};
+                sj["rotation_rpy"] = {s.rotation_rpy.x(), s.rotation_rpy.y(), s.rotation_rpy.z()};
+                sj["fx"] = s.intrinsics.fx; sj["fy"] = s.intrinsics.fy;
+                sj["cx"] = s.intrinsics.cx; sj["cy"] = s.intrinsics.cy;
+                sj["width"] = s.intrinsics.width; sj["height"] = s.intrinsics.height;
+                sj["k1"] = s.intrinsics.k1; sj["k2"] = s.intrinsics.k2;
+                sj["p1"] = s.intrinsics.p1; sj["p2"] = s.intrinsics.p2;
+                sj["k3"] = s.intrinsics.k3;
+                cfg["sources"].push_back(sj);
+              }
+              std::ofstream ofs(loaded_map_path + "/colorize_config.json");
+              ofs << std::setprecision(10) << cfg.dump(2);
+              logger->info("[Colorize] Saved config to {}/colorize_config.json", loaded_map_path);
+            }
+          }
+        }
+        if (!image_sources.empty()) {
+          ImGui::Separator();
+          int remove_idx = -1;
+          for (size_t si = 0; si < image_sources.size(); si++) {
+            if (ImGui::BeginMenu(image_sources[si].name.c_str())) {
+              char info[128];
+              std::snprintf(info, sizeof(info), "%zu images", image_sources[si].frames.size());
+              ImGui::TextDisabled("%s", info);
+              ImGui::TextDisabled("%s", image_sources[si].path.c_str());
+              ImGui::Separator();
+              if (ImGui::MenuItem("Remove")) {
+                remove_idx = static_cast<int>(si);
+                // Clean up gizmos
+                auto vw = guik::LightViewer::instance();
+                for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
+                  vw->remove_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi));
+                  vw->remove_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi));
+                }
+              }
+              ImGui::EndMenu();
+            }
+          }
+          if (remove_idx >= 0) {
+            image_sources.erase(image_sources.begin() + remove_idx);
+            if (colorize_source_idx >= static_cast<int>(image_sources.size())) colorize_source_idx = std::max(0, static_cast<int>(image_sources.size()) - 1);
+          }
+        }
+        ImGui::EndMenu();
+      }
+      if (ImGui::MenuItem("Locate Cameras", nullptr, show_colorize_window)) {
+        show_colorize_window = !show_colorize_window;
+      }
+      if (ImGui::MenuItem("Alignment check", nullptr, align_show)) {
+        align_show = !align_show;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overlay image + projected LiDAR points to assess calibration.");
+      ImGui::EndMenu();
+    }
+
     ImGui::EndMainMenuBar();
   }
 
@@ -4419,6 +6309,41 @@ void OfflineViewer::main_menu() {
           sessions.back().hd_frames_path = hd_frames_path;
           session_hd_paths[latest.id] = hd_frames_path;
         }
+      }
+    }
+  }
+
+  // --- Auto-load colorize config after map load ---
+  if (!loaded_map_path.empty() && image_sources.empty()) {
+    const std::string cfg_path = loaded_map_path + "/colorize_config.json";
+    if (boost::filesystem::exists(cfg_path)) {
+      std::ifstream ifs(cfg_path);
+      auto cfg = nlohmann::json::parse(ifs, nullptr, false);
+      if (!cfg.is_discarded() && cfg.contains("sources")) {
+        for (const auto& sj : cfg["sources"]) {
+          const std::string path = sj.value("path", "");
+          if (path.empty() || !boost::filesystem::exists(path)) continue;
+          logger->info("[Colorize] Auto-loading images from {}", path);
+          auto source = Colorizer::load_image_folder(path);
+          source.time_shift = sj.value("time_shift", 0.0);
+          source.mask_path = sj.value("mask_path", "");
+          if (!source.mask_path.empty() && boost::filesystem::exists(source.mask_path)) {
+            colorize_mask = cv::imread(source.mask_path, cv::IMREAD_UNCHANGED);
+            if (!colorize_mask.empty()) logger->info("[Colorize] Auto-loaded mask from {}", source.mask_path);
+          }
+          if (sj.contains("lever_arm")) source.lever_arm = Eigen::Vector3d(sj["lever_arm"][0], sj["lever_arm"][1], sj["lever_arm"][2]);
+          if (sj.contains("rotation_rpy")) source.rotation_rpy = Eigen::Vector3d(sj["rotation_rpy"][0], sj["rotation_rpy"][1], sj["rotation_rpy"][2]);
+          source.intrinsics.fx = sj.value("fx", 1920.0); source.intrinsics.fy = sj.value("fy", 1920.0);
+          source.intrinsics.cx = sj.value("cx", 1920.0); source.intrinsics.cy = sj.value("cy", 1080.0);
+          source.intrinsics.width = sj.value("width", 3840); source.intrinsics.height = sj.value("height", 2160);
+          source.intrinsics.k1 = sj.value("k1", 0.0); source.intrinsics.k2 = sj.value("k2", 0.0);
+          source.intrinsics.p1 = sj.value("p1", 0.0); source.intrinsics.p2 = sj.value("p2", 0.0);
+          source.intrinsics.k3 = sj.value("k3", 0.0);
+          logger->info("[Colorize] Restored: {} images, time_shift={:.3f}, lever=[{:.3f},{:.3f},{:.3f}]",
+            source.frames.size(), source.time_shift, source.lever_arm.x(), source.lever_arm.y(), source.lever_arm.z());
+          image_sources.push_back(std::move(source));
+        }
+        if (!image_sources.empty()) colorize_source_idx = 0;
       }
     }
   }
