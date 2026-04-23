@@ -170,7 +170,13 @@ if(BUILD_WITH_VIEWER)
     src/glim/viewer/offline_viewer.cpp
     src/glim/util/map_cleaner.cpp
     src/glim/util/patchworkpp.cpp
-    src/glim/util/colorizer.cpp
+    src/glim/util/lidar_colorizer.cpp
+    src/glim/util/lidar_colorizer_simple.cpp
+    src/glim/util/lidar_colorizer_weighted.cpp
+    src/glim/util/auto_calibrate.cpp
+    src/glim/util/colmap_export.cpp
+    src/glim/util/virtual_cameras.cpp
+    src/glim/util/image_viewport.cpp
   )
   target_link_libraries(interactive_viewer
     glim

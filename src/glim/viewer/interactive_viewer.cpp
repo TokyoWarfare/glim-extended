@@ -43,6 +43,7 @@
 #include <guik/spdlog_sink.hpp>
 #include <guik/model_control.hpp>
 #include <guik/viewer/light_viewer.hpp>
+#include <guik/camera/fps_camera_control.hpp>
 
 namespace glim {
 using gtsam::symbol_shorthand::X;
@@ -102,9 +103,9 @@ InteractiveViewer::InteractiveViewer() : logger(create_module_logger("viewer")) 
   sphere_scale = 0.5f;
 
   draw_current = true;
-  draw_traj = false;
+  draw_traj = true;
   draw_points = true;
-  draw_factors = true;
+  draw_factors = false;
   draw_spheres = true;
   draw_coords = true;
 
@@ -177,6 +178,14 @@ void InteractiveViewer::viewer_loop() {
   auto viewer = guik::LightViewer::instance(Eigen::Vector2i(2560, 1440));
   viewer->enable_info_buffer();
   viewer->enable_vsync();
+  // Install FPV as the startup camera control -- iridescence's canvas defaults
+  // to OrbitCameraControlXY. OfflineViewer defaults camera_mode_sel to 1 (FPV)
+  // so the UI must match on first paint.
+  {
+    auto fps = viewer->use_fps_camera_control(60.0);
+    fps->set_pose(Eigen::Vector3f(0.0f, 0.0f, 20.0f), 0.0f, -45.0f);
+    fps->set_translation_speed(1.0f);
+  }
   viewer->shader_setting().add("z_range", z_range);
 
   viewer->shader_setting().set_point_size(point_size);
@@ -661,6 +670,23 @@ void InteractiveViewer::viewer_loop() {
 
       rs.current_lod = desired_lod;
     }
+
+    // First-paint refresh for auto-promoted scalar coloring. update_viewer() at
+    // insert-time ran before the LOD worker had created any drawable; fire once
+    // now that at least one submap drawable is live.
+    if (scalar_default_refresh_pending) {
+      for (const auto& rs : render_states) {
+        if (rs.current_lod == SubmapLOD::SD || rs.current_lod == SubmapLOD::HD) {
+          update_viewer();
+          if (color_mode >= 3 && color_mode - 3 < static_cast<int>(aux_attribute_names.size())) {
+            const int sel = scalar_colormap_per_attr[aux_attribute_names[color_mode - 3]];
+            guik::LightViewer::instance()->set_colormap(static_cast<glk::COLORMAP>(sel));
+          }
+          scalar_default_refresh_pending = false;
+          break;
+        }
+      }
+    }
   });
 
   // Memory Manager UI
@@ -926,9 +952,32 @@ void InteractiveViewer::drawable_selection() {
       }
     }
     was_rgb = switching_rgb;
+    // Apply the per-scalar remembered colormap for the new attr. For non-aux
+    // modes (RAINBOW/SESSION/NORMAL) the canvas colormap is unused so leave it.
+    if (aidx_new >= 0 && aidx_new < static_cast<int>(aux_attribute_names.size())) {
+      const int sel = scalar_colormap_per_attr[aux_attribute_names[aidx_new]];
+      guik::LightViewer::instance()->set_colormap(static_cast<glk::COLORMAP>(sel));
+    }
     update_viewer();
   }
   show_note("Color mode for rendering submaps.\n- RAINBOW=Altitude encoding color\n- SESSION=Session ID\n- NORMAL=Surface normal direction\n- others=Per-point attribute colormap");
+
+  // Color scale for the active scalar. Only meaningful for aux-attr modes;
+  // RAINBOW/SESSION/NORMAL don't consult the canvas colormap. Choice is stored
+  // per-attribute so switching scalars keeps each one's preferred scale.
+  if (color_mode >= 3) {
+    const int aidx = color_mode - 3;
+    if (aidx < static_cast<int>(aux_attribute_names.size())) {
+      int& sel = scalar_colormap_per_attr[aux_attribute_names[aidx]];
+      static const auto _cmap_names = glk::colormap_names();
+      if (ImGui::Combo("Scale", &sel, _cmap_names.data(), static_cast<int>(_cmap_names.size()))) {
+        guik::LightViewer::instance()->set_colormap(static_cast<glk::COLORMAP>(sel));
+      }
+      show_note("Color scale applied to the current scalar field.\n"
+                "Turbo = perceptually strong default; Cividis = colour-blind safe;\n"
+                "Ocean / Jet / Helix surface different contrast on LiDAR intensity.");
+    }
+  }
 
   ImGui::Checkbox("Trajectory", &draw_traj);
   ImGui::SameLine();
@@ -1154,6 +1203,8 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
   std::vector<Eigen::Vector4d> all_points;
   std::vector<double> all_intensities;
   std::vector<double> all_times;  // gps_time = frame_stamp + per-point time offset
+  std::vector<Eigen::Vector4d> all_normals_disk;  // populated when per-frame normals.bin exists; same filter/order as all_points
+  bool any_frame_had_normals = false;
   const Eigen::Isometry3d T_ep = submap->T_world_origin * submap->T_origin_endpoint_L;
   const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
 
@@ -1174,6 +1225,8 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
     std::vector<float> frame_times(npts, 0.0f);
     bool has_range = false;
     std::vector<float> range(npts);
+    std::vector<Eigen::Vector3f> normals_f(npts, Eigen::Vector3f::Zero());
+    bool has_normals = false;
     { std::ifstream f(frame_dir + "/points.bin", std::ios::binary);
       if (!f) continue;
       f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * npts); }
@@ -1183,6 +1236,8 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
       if (f) f.read(reinterpret_cast<char*>(intensity.data()), sizeof(float) * npts); }
     { std::ifstream f(frame_dir + "/times.bin", std::ios::binary);
       if (f) f.read(reinterpret_cast<char*>(frame_times.data()), sizeof(float) * npts); }
+    { std::ifstream f(frame_dir + "/normals.bin", std::ios::binary);
+      if (f) { f.read(reinterpret_cast<char*>(normals_f.data()), sizeof(Eigen::Vector3f) * npts); has_normals = true; any_frame_had_normals = true; } }
 
     // Transform to submap-local frame (NOT world frame — modal handles pose separately)
     const Eigen::Isometry3d T_w_imu = T_ep * T_odom0.inverse() * frame->T_world_imu;
@@ -1199,6 +1254,14 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
       all_points.push_back(Eigen::Vector4d(lp.x(), lp.y(), lp.z(), 1.0));
       all_intensities.push_back(static_cast<double>(intensity[pi]));
       all_times.push_back(frame_stamp + static_cast<double>(frame_times[pi]));
+      if (any_frame_had_normals) {
+        if (has_normals) {
+          const Eigen::Vector3d ln = (R * normals_f[pi].cast<double>()).normalized();
+          all_normals_disk.push_back(Eigen::Vector4d(ln.x(), ln.y(), ln.z(), 0.0));
+        } else {
+          all_normals_disk.push_back(Eigen::Vector4d::Zero());  // keep parallel sizing
+        }
+      }
     }
   }
 
@@ -1219,7 +1282,7 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
   cloud->times = cloud->times_storage.data();
 
   if (compute_covs) {
-    // Compute normals and covariances using k-NN
+    // Compute normals and covariances using k-NN (overrides any disk normals loaded above)
     const int k = 10;
     gtsam_points::KdTree tree(cloud->points, cloud->num_points);
     std::vector<int> neighbors(cloud->num_points * k);
@@ -1236,6 +1299,10 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
     cloud->add_normals(normals);
     cloud->add_covs(covs);
     logger->info("[HD] Loaded {} pts for submap {} (with covs)", cloud->num_points, submap_index);
+  } else if (any_frame_had_normals && all_normals_disk.size() == cloud->num_points) {
+    // Attach the pre-computed normals loaded from disk — cheap, parallel to points.
+    cloud->add_normals(all_normals_disk);
+    logger->info("[HD] Loaded {} pts for submap {} (points + disk normals)", cloud->num_points, submap_index);
   } else {
     logger->info("[HD] Loaded {} pts for submap {} (points only)", cloud->num_points, submap_index);
   }
@@ -1923,17 +1990,21 @@ void InteractiveViewer::detect_hd_frames(const std::string& map_path) {
   const std::string hd_path = map_path + "/hd_frames";
   if (!boost::filesystem::is_directory(hd_path)) {
     hd_available = false;
+    logger->warn("[HD] No hd_frames directory at {} (hd_path='{}', map_path='{}')", hd_path, hd_path, map_path);
     return;
   }
 
   hd_frames_path = hd_path;
   size_t total_pts = 0;
   int frame_count = 0;
+  int subdir_count = 0;
+  int missing_meta = 0;
 
   for (boost::filesystem::directory_iterator it(hd_path), end; it != end; ++it) {
     if (!boost::filesystem::is_directory(it->path())) continue;
+    subdir_count++;
     const std::string meta_path = it->path().string() + "/frame_meta.json";
-    if (!boost::filesystem::exists(meta_path)) continue;
+    if (!boost::filesystem::exists(meta_path)) { missing_meta++; continue; }
 
     std::ifstream ifs(meta_path);
     const auto j = nlohmann::json::parse(ifs, nullptr, false);
@@ -1948,6 +2019,9 @@ void InteractiveViewer::detect_hd_frames(const std::string& map_path) {
     total_hd_points = total_pts;
     logger->info("[HD] Found {} HD frames, {:.1f} M total points in {}",
                  frame_count, static_cast<double>(total_pts) / 1e6, hd_path);
+  } else {
+    logger->warn("[HD] {} has {} subdirs but {} missing frame_meta.json (no HD loaded)",
+                 hd_path, subdir_count, missing_meta);
   }
 }
 
@@ -1992,6 +2066,7 @@ void InteractiveViewer::lod_worker_task() {
         std::vector<Eigen::Vector4f> all_rgb_colors;
         size_t hd_point_count = 0;
         int frames_found = 0, frames_missing = 0;
+        bool any_frame_had_normals_hd = false;  // must stay parallel with all_points
 
         for (const auto& frame : submap->frames) {
           char dir_name[16];
@@ -2022,6 +2097,7 @@ void InteractiveViewer::lod_worker_task() {
             if (nrm_ifs) {
               frame_normals.resize(num_pts);
               nrm_ifs.read(reinterpret_cast<char*>(frame_normals.data()), sizeof(Eigen::Vector3f) * num_pts);
+              any_frame_had_normals_hd = true;
             }
           }
 
@@ -2091,9 +2167,14 @@ void InteractiveViewer::lod_worker_task() {
             if (!lod_use_voxelized && r < HD_MIN_RANGE) continue;  // skip range filter for voxelized
 
             all_points.push_back(R * frame_points[pi] + t_vec);
+            // Keep all_normal_colors in lockstep with all_points:
+            //   - if ANY frame so far had normals, every accepted point gets an entry (zero if frame missing)
+            //   - until the first normals.bin is seen, no entries are pushed (mirroring unavailability)
             if (!frame_normals.empty()) {
               const Eigen::Vector3f wn = (R * frame_normals[pi]).normalized();
               all_normal_colors.push_back(((wn + Eigen::Vector3f::Ones()) * 0.5f).homogeneous());
+            } else if (any_frame_had_normals_hd) {
+              all_normal_colors.push_back(Eigen::Vector4f(0.5f, 0.5f, 0.5f, 1.0f));
             }
             if (!frame_intensities.empty()) all_intensities.push_back(frame_intensities[pi]);
             if (!frame_range.empty()) all_range.push_back(frame_range[pi]);
@@ -2150,11 +2231,17 @@ void InteractiveViewer::lod_worker_task() {
             if (aidx >= 0 && aidx < static_cast<int>(aux_attribute_names.size()) && aux_attribute_names[aidx] == "RGB")
               rgb_mode_active = true;
           }
-          // Upload vertex colors: RGB if available and active, otherwise normals
+          // Upload vertex colors: RGB if available and active, otherwise normals.
+          // Guard on exact size match — if only some HD frames had normals.bin,
+          // normals_buf will be shorter than n_pts and uploading would under-populate
+          // a GPU attribute buffer (-> crash at draw time).
           if (rgb_mode_active && rgb_colors_buf->size() == static_cast<size_t>(n_pts)) {
             cloud_buffer->add_color(*rgb_colors_buf);
-          } else if (!normals_buf->empty()) {
+          } else if (normals_buf->size() == static_cast<size_t>(n_pts)) {
             cloud_buffer->add_color(*normals_buf);
+          } else if (!normals_buf->empty()) {
+            logger->warn("[HD worker] submap {}: normals buffer size mismatch ({} vs {} points) — skipping normal-color upload",
+                         submap_id, normals_buf->size(), n_pts);
           }
 
           // Upload aux attribute buffers for colormap rendering
@@ -2866,6 +2953,23 @@ void InteractiveViewer::globalmap_on_insert_submap(const SubMap::ConstPtr& subma
         const size_t elem_size = attrib.second.first;
         if (elem_size == sizeof(float) || elem_size == sizeof(double)) {
           aux_attribute_names.push_back(attrib.first);
+        }
+      }
+      // Auto-promote default ColorMode to "intensity" if present. Only fires on
+      // first submap; user edits from the ColorMode combo are preserved.
+      if (color_mode == 0) {
+        for (size_t i = 0; i < aux_attribute_names.size(); i++) {
+          if (aux_attribute_names[i] == "intensity") {
+            color_mode = 3 + static_cast<int>(i);
+            const int sel = scalar_colormap_per_attr[aux_attribute_names[i]];
+            guik::LightViewer::instance()->set_colormap(static_cast<glk::COLORMAP>(sel));
+            // Defer a re-apply until at least one SD drawable is live: the
+            // update_viewer() at the end of this insert runs before the LOD
+            // worker uploads the first drawable, so the color_mode switch
+            // wouldn't otherwise propagate to the initial render.
+            scalar_default_refresh_pending = true;
+            break;
+          }
         }
       }
     }

@@ -1,0 +1,102 @@
+Mobile Mapper EULA v1
+======================
+
+Copyright (c) 2026 Pablo Vidaurre Sanz
+
+This End User License Agreement ("EULA") governs the use of the "Mobile Mapper"
+extensions and post-processing tooling added on top of the GLIM framework.
+This EULA applies to all files authored as part of this fork — see the About
+menu (built into the viewer application) for the per-feature attribution of
+components NOT covered by this EULA.
+
+1. Scope
+--------
+
+This EULA applies to source files and binary artifacts authored by the
+copyright holder(s) as part of this fork's extensions, including but not
+limited to:
+
+  - The colorize pipeline (view selectors, correctness filters, alignment
+    check viewer, auto-calibrate integration, COLMAP exporter, Livox intensity
+    filter, post-colorize band smoothing, photometric exposure normalization)
+  - The data filter tools (SOR, Range, Scalar, Dynamic reimplementation,
+    chunk-based apply)
+  - Voxelize HD, Regenerate SD, Camera modes, Coordinates / GNSS tooling
+  - The UI code added to the GLIM offline viewer for the above
+  - Any documentation added under this fork
+
+Files that originate from the upstream GLIM project (https://github.com/koide3/glim)
+retain their original MIT License. Third-party components (PatchWork++,
+LightGlue, OpenCV, Eigen, GTSAM, Boost, Dear ImGui, etc.) retain their
+respective upstream licenses.
+
+2. Permitted Use
+----------------
+
+You MAY:
+
+  a) Use the software for any purpose, including commercial operations
+     (e.g., mobile-mapping services, survey work, 3DGS training pipelines).
+  b) Run the software to produce OUTPUT DATA (colored point clouds,
+     3DGS models, COLMAP datasets, voxelized maps, ground/dynamic
+     classification scalars, aux_rgb.bin files, etc.). All such output data
+     is UNRESTRICTED and belongs to the user. No license obligation attaches
+     to the output data by virtue of this EULA.
+  c) View the source code for understanding, audit, or debugging purposes.
+
+3. Restrictions
+---------------
+
+You MAY NOT, without prior written permission from the copyright holder:
+
+  a) Modify, adapt, or create derivative works of this software FOR COMMERCIAL
+     PURPOSES — whether directly (reselling the modified software) or
+     indirectly (incorporating it in whole or in part into a product, service,
+     or derivative software that is sold, rented, licensed, or otherwise
+     commercialized). Non-commercial modification for personal, academic,
+     or internal evaluation use is permitted.
+  b) Redistribute the software in source or binary form, modified or
+     unmodified, to third parties for commercial gain.
+  c) Sublicense, sell, rent, lease, or otherwise commercially distribute
+     the software itself.
+  d) Remove or alter any copyright or license notice in the software.
+
+4. Output Data Is Unrestricted
+------------------------------
+
+The data produced BY running the software — point clouds, textured meshes,
+Gaussian splat exports, COLMAP datasets, aux_*.bin attribute files, voxelized
+outputs, and any derivative data — is NOT subject to this EULA. The user
+owns this output data and may sell, license, or distribute it freely,
+subject only to the licenses of the input data (raw bags, camera images, etc.)
+and the licenses of any third-party models used to produce the output
+(e.g., SuperPoint weights used by LightGlue carry their own CC-BY-NC-SA-4.0
+restriction for non-commercial research use only; see About menu for details).
+
+5. No Warranty
+--------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM THE USE OF THIS SOFTWARE.
+
+6. Termination
+--------------
+
+This EULA terminates automatically if you breach any of its terms.
+Upon termination, you must cease all use of the software.
+
+7. Contact
+----------
+
+For permission requests (modification, redistribution, commercial resale
+of the software itself), contact the copyright holder.
+
+---
+
+Note: This EULA draft is a starting point. Before distributing the software
+or entering commercial arrangements, consult a lawyer to tailor the
+language to your jurisdiction and intent. Copyright notices on individual
+files should be updated to reflect the actual authoring parties.

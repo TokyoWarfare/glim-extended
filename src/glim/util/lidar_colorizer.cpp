@@ -1,11 +1,14 @@
-#include <glim/util/colorizer.hpp>
+#include <glim/util/lidar_colorizer.hpp>
 #include <glim/util/geodetic.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
+#include <vector>
 
 #include <boost/filesystem.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -14,6 +17,127 @@
 #include <libexif/exif-data.h>
 
 namespace glim {
+
+// -----------------------------------------------------------------------------
+// Equirectangular <-> cube face slicing
+// -----------------------------------------------------------------------------
+
+// 6 fixed rotations that take a face-local frame (X fwd, Y left, Z up) into
+// the parent equirect's camera frame. Face forward axis lands on one of the
+// six cube directions in that frame.
+Eigen::Matrix3d cube_face_rotation(int face_idx) {
+  Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+  switch (face_idx) {
+    case 0: /* +X (forward) */  R = Eigen::Matrix3d::Identity();                                              break;
+    case 1: /* -X (back)    */  R = Eigen::AngleAxisd( M_PI,       Eigen::Vector3d::UnitZ()).toRotationMatrix(); break;
+    case 2: /* +Y (left)    */  R = Eigen::AngleAxisd( M_PI / 2.0, Eigen::Vector3d::UnitZ()).toRotationMatrix(); break;
+    case 3: /* -Y (right)   */  R = Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitZ()).toRotationMatrix(); break;
+    case 4: /* +Z (up)      */  R = Eigen::AngleAxisd(-M_PI / 2.0, Eigen::Vector3d::UnitY()).toRotationMatrix(); break;
+    case 5: /* -Z (down)    */  R = Eigen::AngleAxisd( M_PI / 2.0, Eigen::Vector3d::UnitY()).toRotationMatrix(); break;
+    default: break;
+  }
+  return R;
+}
+
+PinholeIntrinsics cube_face_intrinsics(int face_size) {
+  PinholeIntrinsics k;
+  k.fx = k.fy = 0.5 * static_cast<double>(face_size);  // 90 deg FOV cube face
+  k.cx = k.cy = 0.5 * static_cast<double>(face_size);
+  k.width = k.height = face_size;
+  k.k1 = k.k2 = k.k3 = k.p1 = k.p2 = 0.0;
+  return k;
+}
+
+namespace {
+
+// Build (and cache) the 6 remap tables for a given (equirect size, face size).
+// Each face gets two maps (mapx, mapy) of size face_size x face_size in CV_32FC1
+// that directly index into the equirect image via cv::remap.
+struct FaceRemap {
+  std::array<cv::Mat, 6> mapx;
+  std::array<cv::Mat, 6> mapy;
+};
+
+FaceRemap build_face_remap(int eq_w, int eq_h, int face_size) {
+  FaceRemap out;
+  for (int f = 0; f < 6; f++) {
+    out.mapx[f] = cv::Mat(face_size, face_size, CV_32FC1);
+    out.mapy[f] = cv::Mat(face_size, face_size, CV_32FC1);
+  }
+  // Face forward axes in the equirect (parent) camera frame.
+  // Parent convention used here for sampling the equirect: (X fwd, Y left, Z up).
+  const Eigen::Matrix3d Rf[6] = {
+    cube_face_rotation(0), cube_face_rotation(1), cube_face_rotation(2),
+    cube_face_rotation(3), cube_face_rotation(4), cube_face_rotation(5),
+  };
+  // For each output face pixel (u, v), produce a 3D ray in the face's local
+  // frame, rotate into the parent frame, then sample equirect at the matching
+  // (longitude, latitude). Longitude = atan2(-Y, X), Latitude = atan2(Z, sqrt(X^2+Y^2))
+  // in our X-fwd, Y-left, Z-up convention. Equirect pixel: u = w * (lon + pi) / (2*pi),
+  // v = h * (pi/2 - lat) / pi.
+  const double inv_f = 2.0 / static_cast<double>(face_size);   // face fx = face_size/2 so 1/fx = 2/face_size
+  for (int f = 0; f < 6; f++) {
+    for (int yy = 0; yy < face_size; yy++) {
+      for (int xx = 0; xx < face_size; xx++) {
+        // Pinhole face-local ray. Face-local convention: X fwd, Y left, Z up.
+        // Image pixel -> normalized face plane (pinhole):
+        //   xn = (cx - u) / fx   (Y_face = left, so positive Y maps to -xn)  [matching existing proj]
+        //   yn = (cy - v) / fy   (Z_face = up  , so positive Z maps to -yn)
+        // Face-local ray = (1, xn, yn) normalized.
+        const double xn = (0.5 * face_size - (xx + 0.5)) * inv_f;
+        const double yn = (0.5 * face_size - (yy + 0.5)) * inv_f;
+        Eigen::Vector3d ray_face(1.0, xn, yn);
+        ray_face.normalize();
+        // Rotate into parent (equirect camera) frame.
+        Eigen::Vector3d ray = Rf[f] * ray_face;
+        // Equirect pixel from ray in parent frame (X fwd, Y left, Z up).
+        const double lon = std::atan2(-ray.y(), ray.x());
+        const double lat = std::atan2(ray.z(), std::sqrt(ray.x() * ray.x() + ray.y() * ray.y()));
+        double eu = (lon + M_PI) / (2.0 * M_PI) * eq_w - 0.5;
+        double ev = (0.5 - lat / M_PI) * eq_h - 0.5;
+        // Wrap longitude so cv::remap doesn't clamp across the seam.
+        if (eu < 0)    eu += eq_w;
+        if (eu >= eq_w) eu -= eq_w;
+        out.mapx[f].at<float>(yy, xx) = static_cast<float>(eu);
+        out.mapy[f].at<float>(yy, xx) = static_cast<float>(ev);
+      }
+    }
+  }
+  return out;
+}
+
+std::unordered_map<uint64_t, FaceRemap>& face_remap_cache() {
+  static std::unordered_map<uint64_t, FaceRemap> cache;
+  return cache;
+}
+
+uint64_t remap_key(int eq_w, int eq_h, int face_size) {
+  return (static_cast<uint64_t>(eq_w) << 42) | (static_cast<uint64_t>(eq_h) << 21) | static_cast<uint64_t>(face_size);
+}
+
+}  // anonymous namespace
+
+std::array<std::shared_ptr<cv::Mat>, 6> slice_equirect_cubemap(const cv::Mat& equirect, int face_size) {
+  std::array<std::shared_ptr<cv::Mat>, 6> out;
+  if (equirect.empty() || face_size <= 0) return out;
+  const uint64_t key = remap_key(equirect.cols, equirect.rows, face_size);
+  auto& cache = face_remap_cache();
+  auto it = cache.find(key);
+  if (it == cache.end()) {
+    it = cache.emplace(key, build_face_remap(equirect.cols, equirect.rows, face_size)).first;
+  }
+  const FaceRemap& rm = it->second;
+  for (int f = 0; f < 6; f++) {
+    out[f] = std::make_shared<cv::Mat>();
+    cv::remap(equirect, *out[f], rm.mapx[f], rm.mapy[f], cv::INTER_LINEAR, cv::BORDER_WRAP);
+  }
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// End of cube face slicing
+// -----------------------------------------------------------------------------
+
 
 namespace {
 
@@ -192,14 +316,16 @@ int Colorizer::locate_by_time(ImageSource& source, const std::vector<TimedPose>&
   for (auto& frame : source.frames) {
     if (frame.timestamp <= 0.0) continue;
 
-    const double ts = frame.timestamp + source.time_shift;
+    // Per-frame effective calibration -- anchors (if any) give linear drift
+    // correction so a long track can stay aligned at both ends; baseline
+    // scalars are used when the anchors vector is empty.
+    const auto c = effective_calib(source, frame.timestamp);
+    const double ts = frame.timestamp + c.time_shift;
     // Check if timestamp is within trajectory range (with 1s tolerance)
     if (ts < trajectory.front().stamp - 1.0 || ts > trajectory.back().stamp + 1.0) continue;
 
     Eigen::Isometry3d T_world_lidar = interpolate_pose(trajectory, ts);
-
-    // Build extrinsic: T_lidar_cam from lever arm + rotation
-    const Eigen::Isometry3d T_lidar_cam = build_extrinsic(source.lever_arm, source.rotation_rpy);
+    const Eigen::Isometry3d T_lidar_cam = build_extrinsic(c.lever_arm, c.rotation_rpy);
 
     // T_world_cam = T_world_lidar * T_lidar_cam
     frame.T_world_cam = T_world_lidar * T_lidar_cam;
@@ -237,8 +363,10 @@ int Colorizer::locate_by_coordinates(ImageSource& source, const std::vector<Time
     Eigen::Isometry3d T_world_lidar = trajectory[best_idx].pose;
     T_world_lidar.translation() = world_pos;
 
-    // Apply extrinsic
-    const Eigen::Isometry3d T_lidar_cam = build_extrinsic(source.lever_arm, source.rotation_rpy);
+    // Apply anchor-aware extrinsic. Coordinate-located frames still have a
+    // timestamp; if it's zero, effective_extrinsic will clamp to the first
+    // anchor (or use the baseline scalars when no anchors are set).
+    const Eigen::Isometry3d T_lidar_cam = effective_extrinsic(source, frame.timestamp);
     frame.T_world_cam = T_world_lidar * T_lidar_cam;
     frame.located = true;
     located++;
@@ -246,136 +374,112 @@ int Colorizer::locate_by_coordinates(ImageSource& source, const std::vector<Time
   return located;
 }
 
-ColorizeResult Colorizer::project_colors(
-    const std::vector<CameraFrame>& cameras,
-    const PinholeIntrinsics& intrinsics,
-    const std::vector<Eigen::Vector3f>& world_points,
-    const std::vector<float>& intensities,
-    double max_range,
-    bool blend,
-    double min_range,
-    const cv::Mat& mask) {
-
-  ColorizeResult result;
-  result.total = world_points.size();
-  result.points = world_points;
-  result.intensities = intensities;
-  result.colors.resize(world_points.size(), Eigen::Vector3f::Zero());
-
-  // Per-point accumulation: sum of RGB + count + closest distance
-  std::vector<Eigen::Vector3f> color_sum(world_points.size(), Eigen::Vector3f::Zero());
-  std::vector<int> color_count(world_points.size(), 0);
-  std::vector<float> closest_dist(world_points.size(), std::numeric_limits<float>::max());
-  std::vector<Eigen::Vector3f> closest_color(world_points.size(), Eigen::Vector3f::Zero());
-
-  const double max_range_sq = max_range * max_range;
-  const double min_range_sq = min_range * min_range;
-
-  // Compute point cloud centroid for quick camera rejection
-  Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
-  for (const auto& p : world_points) centroid += p;
-  if (!world_points.empty()) centroid /= static_cast<float>(world_points.size());
-
-  for (const auto& cam : cameras) {
-    if (!cam.located) continue;
-
-    // Quick rejection: check if camera is roughly near the point cloud
-    const Eigen::Vector3f cam_pos = cam.T_world_cam.translation().cast<float>();
-    const float dist_to_centroid_sq = (centroid - cam_pos).squaredNorm();
-    if (dist_to_centroid_sq > max_range_sq * 9.0) continue;  // 3x margin, skip if way too far
-
-    // Load image
-    cv::Mat img = cv::imread(cam.filepath);
-    if (img.empty()) continue;
-
-    // Camera transform: world → camera local
-    // T_world_cam already includes extrinsic (T_world_lidar * T_lidar_cam)
-    const Eigen::Isometry3d T_cam_world_d = cam.T_world_cam.inverse();
-    const Eigen::Matrix3d R_cam = T_cam_world_d.rotation();
-    const Eigen::Vector3d t_cam = T_cam_world_d.translation();
-
-    const double fx = intrinsics.fx, fy = intrinsics.fy;
-    const double cx_d = intrinsics.cx, cy_d = intrinsics.cy;
-    const bool has_distortion = (intrinsics.k1 != 0 || intrinsics.k2 != 0 || intrinsics.p1 != 0 || intrinsics.p2 != 0);
-
-    int projected = 0;
-    for (size_t pi = 0; pi < world_points.size(); pi++) {
-      // Quick range check
-      const float dist_sq = (world_points[pi] - cam_pos).squaredNorm();
-      if (dist_sq > max_range_sq || dist_sq < min_range_sq) continue;
-
-      // Transform to camera local frame
-      // Convention: camera looks along +X (lidar frame), Y=left, Z=up
-      // For pinhole: depth = X, project Y and Z
-      const Eigen::Vector3d p_cam = R_cam * world_points[pi].cast<double>() + t_cam;
-
-      // Depth = X (forward in our frame)
-      const double depth = p_cam.x();
-      if (depth <= 0.1) continue;  // behind camera
-
-      // Normalized coordinates (in camera's YZ plane)
-      double xn = -p_cam.y() / depth;  // negate Y: LiDAR Y=left → camera right
-      double yn = -p_cam.z() / depth;  // negate Z: LiDAR Z=up → camera down
-
-      // Apply Brown-Conrady distortion if present
-      if (has_distortion) {
-        const double r2 = xn * xn + yn * yn;
-        const double r4 = r2 * r2;
-        const double r6 = r4 * r2;
-        const double radial = 1.0 + intrinsics.k1 * r2 + intrinsics.k2 * r4 + intrinsics.k3 * r6;
-        const double xd = xn * radial + 2.0 * intrinsics.p1 * xn * yn + intrinsics.p2 * (r2 + 2.0 * xn * xn);
-        const double yd = yn * radial + intrinsics.p1 * (r2 + 2.0 * yn * yn) + 2.0 * intrinsics.p2 * xn * yn;
-        xn = xd;
-        yn = yd;
-      }
-
-      // Project to pixel
-      const double u = fx * xn + cx_d;
-      const double v = fy * yn + cy_d;
-
-      // Check bounds
-      const int iu = static_cast<int>(std::round(u));
-      const int iv = static_cast<int>(std::round(v));
-      if (iu < 0 || iu >= img.cols || iv < 0 || iv >= img.rows) continue;
-
-      // Sample color (BGR → RGB)
-      // Check mask (if provided) — skip black pixels
-      if (!mask.empty()) {
-        const int mu = mask.cols == img.cols ? iu : static_cast<int>(iu * static_cast<double>(mask.cols) / img.cols);
-        const int mv = mask.rows == img.rows ? iv : static_cast<int>(iv * static_cast<double>(mask.rows) / img.rows);
-        if (mu >= 0 && mu < mask.cols && mv >= 0 && mv < mask.rows) {
-          bool masked = false;
-          if (mask.channels() == 1) { masked = mask.at<uint8_t>(mv, mu) == 0; }
-          else if (mask.channels() == 3) { const auto& mp = mask.at<cv::Vec3b>(mv, mu); masked = (mp[0] == 0 && mp[1] == 0 && mp[2] == 0); }
-          else if (mask.channels() == 4) { const auto& mp = mask.at<cv::Vec4b>(mv, mu); masked = (mp[3] == 0) || (mp[0] == 0 && mp[1] == 0 && mp[2] == 0); }
-          if (masked) continue;
-        }
-      }
-      const cv::Vec3b bgr = img.at<cv::Vec3b>(iv, iu);
-      const Eigen::Vector3f rgb(bgr[2] / 255.0f, bgr[1] / 255.0f, bgr[0] / 255.0f);
-      color_sum[pi] += rgb;
-      color_count[pi]++;
-      const float dist = std::sqrt(dist_sq);
-      if (dist < closest_dist[pi]) { closest_dist[pi] = dist; closest_color[pi] = rgb; }
-      projected++;
-    }
-    std::cerr << "[Colorize] Camera " << boost::filesystem::path(cam.filepath).filename().string()
-              << ": " << projected << " points projected" << std::endl;
+void build_camera_trajectory(ImageSource& src,
+                              int utm_zone,
+                              double easting_origin,
+                              double northing_origin,
+                              double alt_origin) {
+  src.camera_trajectory.clear();
+  struct Entry { double stamp; Eigen::Vector3d world_pos; };
+  std::vector<Entry> entries;
+  entries.reserve(src.frames.size());
+  for (const auto& f : src.frames) {
+    if (f.timestamp <= 0.0) continue;
+    if (f.lat == 0.0 && f.lon == 0.0) continue;
+    const Eigen::Vector2d utm = glim::wgs84_to_utm_xy(f.lat, f.lon, utm_zone);
+    const Eigen::Vector3d world_pos(utm.x() - easting_origin,
+                                     utm.y() - northing_origin,
+                                     f.alt - alt_origin);
+    entries.push_back({f.timestamp, world_pos});
   }
+  if (entries.size() < 2) return;  // need at least 2 points to fit a path
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry& a, const Entry& b) { return a.stamp < b.stamp; });
 
-  // Final colors
-  for (size_t pi = 0; pi < world_points.size(); pi++) {
-    if (color_count[pi] > 0) {
-      result.colors[pi] = blend ? (color_sum[pi] / static_cast<float>(color_count[pi])) : closest_color[pi];
-      result.colored++;
+  src.camera_trajectory.reserve(entries.size());
+  for (size_t i = 0; i < entries.size(); i++) {
+    // Yaw from velocity vector (forward = next - prev, flattened on XY).
+    // Edges use one-sided differences.
+    Eigen::Vector3d fwd;
+    if (i == 0) {
+      fwd = entries[1].world_pos - entries[0].world_pos;
+    } else if (i + 1 == entries.size()) {
+      fwd = entries[i].world_pos - entries[i - 1].world_pos;
     } else {
-      // Uncolored: use intensity as grayscale fallback
-      const float gray = (pi < intensities.size()) ? std::clamp(intensities[pi] / 255.0f, 0.0f, 1.0f) : 0.5f;
-      result.colors[pi] = Eigen::Vector3f(gray, gray, gray);
+      fwd = entries[i + 1].world_pos - entries[i - 1].world_pos;
     }
-  }
+    fwd.z() = 0.0;
+    if (fwd.norm() < 1e-6) fwd = Eigen::Vector3d::UnitX();
+    fwd.normalize();
+    const double yaw = std::atan2(fwd.y(), fwd.x());
 
-  return result;
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    pose.linear() = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    pose.translation() = entries[i].world_pos;
+    src.camera_trajectory.push_back({entries[i].stamp, pose});
+  }
+}
+
+const std::vector<TimedPose>& trajectory_for(const ImageSource& src,
+                                              const std::vector<TimedPose>& slam_trajectory) {
+  if (src.params.locate_mode == 2 && !src.camera_trajectory.empty()) {
+    return src.camera_trajectory;
+  }
+  return slam_trajectory;
+}
+
+// Strategy factory implementations live in their own .cpp files.
+std::unique_ptr<ILidarColorizer> make_simple_colorizer();
+std::unique_ptr<ILidarColorizer> make_weighted_colorizer_top1();
+std::unique_ptr<ILidarColorizer> make_weighted_colorizer_topK();
+// Future: make_matched_colorizer()
+
+std::unique_ptr<ILidarColorizer> make_colorizer(ViewSelectorMode mode) {
+  switch (mode) {
+    case ViewSelectorMode::SimpleNearest:
+      return make_simple_colorizer();
+    case ViewSelectorMode::WeightedTop1:
+      return make_weighted_colorizer_top1();
+    case ViewSelectorMode::WeightedTopK:
+      return make_weighted_colorizer_topK();
+    case ViewSelectorMode::Matched:
+    default:
+      // Not implemented yet — fall back to simple so callers don't break.
+      return make_simple_colorizer();
+  }
+}
+
+EffectiveCalib effective_calib(const ImageSource& src, double cam_time) {
+  // Lever + rpy always come from source scalars (no per-anchor extrinsic yet).
+  // Only time_shift interpolates across anchors.
+  EffectiveCalib out{src.time_shift, src.lever_arm, src.rotation_rpy};
+  // < 2 anchors: scalar baseline rules. A single anchor is an inert BOOKMARK
+  // -- you can pin "this config worked here" without changing runtime behavior
+  // for any other frame. Interpolation requires at least 2 anchors to bracket
+  // the query time and produce a meaningful drift curve. The alternative
+  // (1 anchor = constant everywhere) clobbers previously-correct sections the
+  // moment you place an anchor, which is the opposite of what drift-correction
+  // should do.
+  if (src.anchors.size() < 2) return out;
+  // 2+ anchors. Expected sorted by cam_time; lower_bound finds the first
+  // anchor whose cam_time >= query. Neighbors (prev, curr) bracket the query.
+  const auto& anchors = src.anchors;
+  auto it = std::lower_bound(anchors.begin(), anchors.end(), cam_time,
+    [](const CalibAnchor& a, double t) { return a.cam_time < t; });
+  if (it == anchors.begin()) { out.time_shift = anchors.front().time_shift; return out; }
+  if (it == anchors.end())   { out.time_shift = anchors.back().time_shift;  return out; }
+  const CalibAnchor& prev = *(it - 1);
+  const CalibAnchor& curr = *it;
+  const double span = curr.cam_time - prev.cam_time;
+  const double u = (span > 1e-9) ? (cam_time - prev.cam_time) / span : 0.0;
+  out.time_shift = prev.time_shift + u * (curr.time_shift - prev.time_shift);
+  return out;
+}
+
+Eigen::Isometry3d Colorizer::effective_extrinsic(const ImageSource& src, double /*cam_time*/) {
+  // Scalar pass-through today. When per-anchor lever_arm / rotation_rpy drift
+  // lands, re-thread this through effective_calib() to interpolate those too.
+  return build_extrinsic(src.lever_arm, src.rotation_rpy);
 }
 
 Eigen::Isometry3d Colorizer::build_extrinsic(const Eigen::Vector3d& lever_arm, const Eigen::Vector3d& rotation_rpy) {

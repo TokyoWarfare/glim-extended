@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <queue>
+#include <regex>
 #include <sstream>
 #include <unordered_set>
 #include <boost/format.hpp>
@@ -16,6 +18,9 @@
 #include <glim/util/geodetic.hpp>
 #include <glim/util/post_processing.hpp>
 #include <glim/util/map_cleaner.hpp>
+#include <glim/util/auto_calibrate.hpp>
+#include <glim/util/colmap_export.hpp>
+#include <glim/util/image_viewport.hpp>
 #include <gtsam_points/ann/kdtree.hpp>
 #include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <gtsam_points/ann/kdtree.hpp>
@@ -30,6 +35,7 @@
 
 #include <spdlog/spdlog.h>
 #include <portable-file-dialogs.h>
+#include <glk/colormap.hpp>
 #include <glk/pointcloud_buffer.hpp>
 #include <glk/primitives/primitives.hpp>
 #include <GL/gl3w.h>
@@ -39,6 +45,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 #include <guik/camera/fps_camera_control.hpp>
+#include <guik/camera/basic_projection_control.hpp>
 #include <glk/io/ply_io.hpp>
 #include <guik/recent_files.hpp>
 #include <guik/progress_modal.hpp>
@@ -47,21 +54,394 @@
 namespace glim {
 
 // ---------------------------------------------------------------------------
-// Geoid undulation lookup — EGM2008 table files
+// Geoid undulation lookup -- EGM2008 table files
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// Locate the submap index whose first..last frame stamp range contains `cam_time`,
+// falling back to the closest boundary by |dt|. Returns -1 when no submap has
+// any frames. Previously duplicated across single-cam right-click, live-preview
+// single-cam and the Alignment-check submap loader.
+int find_submap_for_timestamp(const std::vector<glim::SubMap::ConstPtr>& submaps, double cam_time) {
+  int best = -1;
+  double best_dt = std::numeric_limits<double>::max();
+  for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+    if (!submaps[si] || submaps[si]->frames.empty()) continue;
+    const double t0 = submaps[si]->frames.front()->stamp;
+    const double t1 = submaps[si]->frames.back()->stamp;
+    if (cam_time >= t0 && cam_time <= t1) return si;  // inside range -- exact match
+    const double dt = std::min(std::abs(cam_time - t0), std::abs(cam_time - t1));
+    if (dt < best_dt) { best_dt = dt; best = si; }
+  }
+  return best;
+}
+
+// Lookup-table-free bridge from Iridescence colormaps to ImGui ImU32.
+// Takes a [0, 1] scalar and the numeric index of a glk::COLORMAP (as
+// surfaced to the UI via glk::colormap_names()). Useful anywhere we render
+// overlay points via ImGui draw list instead of going through a drawable.
+// Keep local for now; lift to a shared util the day we repeat this pattern
+// in a second non-drawable overlay.
+// Cube-face expansion cache for spherical sources. Keyed by equirect file path.
+// Slicing an 7680x3840 equirect into 6 faces via cv::remap is ~40-80 ms; caching
+// means we pay it once per frame, not per colorize invocation. Memory: each face
+// is ~1920x1920 RGB = ~11 MB, so 6 faces ~= 66 MB per equirect. Long sessions
+// with hundreds of spherical frames easily pass 10+ GB -- the cap below evicts
+// FIFO when total bytes exceed it. Bump via the UI knob (viewer::preview_cache_cap_gb).
+static std::unordered_map<std::string, std::array<std::shared_ptr<cv::Mat>, 6>> g_cube_face_cache;
+static std::deque<std::string> g_cube_face_cache_order;   // insertion order -- FIFO eviction
+static size_t g_cube_face_cache_bytes = 0;                // sum of 6 Mats' bytes per entry
+static std::mutex g_cube_face_cache_mtx;
+
+// Runtime-settable cap (bytes). UI writes here; get_or_build_cube_faces reads.
+// 0 means no cap (previous behavior -- grow unbounded).
+static std::atomic<size_t> g_cube_face_cache_cap_bytes{size_t{8} * 1024 * 1024 * 1024};  // 8 GB default
+
+// Sum bytes across the 6 face Mats (nullptr entries count as 0).
+static size_t face_set_bytes(const std::array<std::shared_ptr<cv::Mat>, 6>& faces) {
+  size_t b = 0;
+  for (int f = 0; f < 6; f++) if (faces[f]) b += faces[f]->total() * faces[f]->elemSize();
+  return b;
+}
+
+// Load equirect file into 6 cube faces (with cache). Returns a shared_ptr array
+// -- empty slots (nullptr) on imread failure. FIFO-evicts when cache exceeds cap.
+static std::array<std::shared_ptr<cv::Mat>, 6> get_or_build_cube_faces(
+    const std::string& equirect_path, int face_size) {
+  std::lock_guard<std::mutex> lock(g_cube_face_cache_mtx);
+  auto it = g_cube_face_cache.find(equirect_path);
+  if (it != g_cube_face_cache.end()) return it->second;
+  cv::Mat img = cv::imread(equirect_path);
+  if (img.empty()) return {};
+  auto faces = slice_equirect_cubemap(img, face_size);
+  const size_t new_bytes = face_set_bytes(faces);
+  g_cube_face_cache.emplace(equirect_path, faces);
+  g_cube_face_cache_order.push_back(equirect_path);
+  g_cube_face_cache_bytes += new_bytes;
+  // Evict oldest entries until under cap. Keep AT LEAST the just-inserted one
+  // even if it alone exceeds the cap (single huge frame still works, just
+  // uncached; cache effectively disabled for that pathological case).
+  const size_t cap = g_cube_face_cache_cap_bytes.load(std::memory_order_relaxed);
+  while (cap > 0 && g_cube_face_cache_bytes > cap && g_cube_face_cache_order.size() > 1) {
+    const std::string& old_key = g_cube_face_cache_order.front();
+    auto oit = g_cube_face_cache.find(old_key);
+    if (oit != g_cube_face_cache.end()) {
+      g_cube_face_cache_bytes -= face_set_bytes(oit->second);
+      g_cube_face_cache.erase(oit);
+    }
+    g_cube_face_cache_order.pop_front();
+  }
+  return faces;
+}
+
+// Stats helper for the UI ("X / Y GB, N frames cached").
+static void get_cube_face_cache_stats(size_t& bytes, size_t& frames) {
+  std::lock_guard<std::mutex> lock(g_cube_face_cache_mtx);
+  bytes  = g_cube_face_cache_bytes;
+  frames = g_cube_face_cache.size();
+}
+
+// Expansion output: pinhole cams ready to pass to ILidarColorizer::project(),
+// plus the (shared) intrinsics to feed alongside.
+struct ExpandedCams {
+  std::vector<CameraFrame> cams;
+  PinholeIntrinsics intrinsics;
+};
+
+// Per-(mask_path, face_size) cache of the 6 cube-face slices of an equirect
+// mask. Keyed by path so re-selecting the same mask across preview runs reuses
+// the slice. Size cap is unlimited (masks are ~MB each, usually one per source).
+static std::mutex g_mask_face_cache_mutex;
+static std::unordered_map<std::string, std::array<std::shared_ptr<cv::Mat>, 6>> g_mask_face_cache;
+
+// Build (or reuse cached) 6 cube-face slices of an equirect mask. Accepts the
+// mask as a cv::Mat (runtime-loaded) and a stable key (usually the mask file
+// path). Returns all-null shared_ptrs when mask is empty.
+static std::array<std::shared_ptr<cv::Mat>, 6> get_or_build_mask_faces(
+    const std::string& key, const cv::Mat& mask, int face_size) {
+  std::array<std::shared_ptr<cv::Mat>, 6> out;
+  if (mask.empty() || key.empty()) return out;
+  const std::string full_key = key + "#" + std::to_string(face_size) + "x" + std::to_string(mask.cols) + "x" + std::to_string(mask.rows);
+  {
+    std::lock_guard<std::mutex> lk(g_mask_face_cache_mutex);
+    auto it = g_mask_face_cache.find(full_key);
+    if (it != g_mask_face_cache.end()) return it->second;
+  }
+  // Miss -- slice now. slice_equirect_cubemap reuses the face_remap_cache built
+  // for images (same size pair), so this is just 6 cv::remap calls.
+  auto sliced = slice_equirect_cubemap(mask, face_size);
+  std::lock_guard<std::mutex> lk(g_mask_face_cache_mutex);
+  g_mask_face_cache[full_key] = sliced;
+  return sliced;
+}
+
+// Turn a list of cams belonging to a single source into "pinhole-ready" cams.
+// For Pinhole sources: passthrough (cams + src.intrinsics).
+// For Spherical sources: each equirect frame becomes 6 virtual pinhole frames
+//   (one per cube face) with image_override pointing into the per-path cache;
+//   intrinsics become cube_face_intrinsics(face_size).
+// A face_size of 1920 gives a 90 deg FOV face with sub-pixel sampling consistent
+// with a 7680-wide equirect; bump to 2560-3840 on higher-density LiDAR if needed.
+//
+// The src_mask param lets Spherical sources get PER-FACE masks: without it, the
+// colorizer would try to linearly-rescale a 2:1 equirect mask to a square cube
+// face, producing X-axis tiling (a 4x-wide mask resamples 4 times across a face).
+// Pass cv::Mat() when you don't have a mask; pinhole sources ignore it.
+static ExpandedCams expand_source_cams_for_projection(
+    const ImageSource& src,
+    const std::vector<CameraFrame>& cams_in,
+    const cv::Mat& src_mask = cv::Mat(),
+    int face_size = 1920) {
+  if (src.camera_type != CameraType::Spherical) {
+    return { cams_in, src.intrinsics };
+  }
+  ExpandedCams out;
+  out.intrinsics = cube_face_intrinsics(face_size);
+  out.cams.reserve(cams_in.size() * 6);
+  // Slice the equirect mask to 6 face-sized masks up front (once per expand
+  // call). Cached by mask_path, so repeat calls with the same mask are free.
+  auto mask_faces = get_or_build_mask_faces(src.mask_path, src_mask, face_size);
+  for (const auto& cam : cams_in) {
+    auto faces = get_or_build_cube_faces(cam.filepath, face_size);
+    for (int f = 0; f < 6; f++) {
+      if (!faces[f]) continue;   // imread failed or face missing
+      CameraFrame vc;
+      vc.filepath = cam.filepath;  // kept for logging/debug; image_override is what's read
+      vc.timestamp = cam.timestamp;
+      vc.lat = cam.lat; vc.lon = cam.lon; vc.alt = cam.alt;
+      Eigen::Isometry3d T_face = Eigen::Isometry3d::Identity();
+      T_face.linear() = cube_face_rotation(f);
+      vc.T_world_cam = cam.T_world_cam * T_face;  // world = cam * face-local
+      vc.located = cam.located;
+      vc.image_override = faces[f];
+      // Per-face mask override so the colorizer samples the right region of
+      // the equirect mask for this face (square mask, matches face image dims).
+      // Falls back to cam's own override if the caller didn't pass a mask,
+      // then to params.mask in the colorizer (linear-scale path, pinhole only).
+      vc.mask_override = mask_faces[f] ? mask_faces[f] : cam.mask_override;
+      out.cams.push_back(std::move(vc));
+    }
+  }
+  return out;
+}
+
+// Round-trip helpers for colorize_config.json. One function writes, one reads,
+// both cover every persisted field of ImageSource + nested ColorizeParams. New
+// tunables added to ColorizeParams go here once; every save/load site stays in
+// sync automatically. `.value(...)` calls fall back to struct defaults when a
+// key is missing, so old configs keep loading cleanly.
+static nlohmann::json image_source_to_json(const glim::ImageSource& s) {
+  nlohmann::json sj;
+  sj["path"]        = s.path;
+  sj["mask_path"]   = s.mask_path;
+  sj["time_shift"]  = s.time_shift;
+  sj["lever_arm"]   = {s.lever_arm.x(), s.lever_arm.y(), s.lever_arm.z()};
+  sj["rotation_rpy"]= {s.rotation_rpy.x(), s.rotation_rpy.y(), s.rotation_rpy.z()};
+  sj["fx"] = s.intrinsics.fx; sj["fy"] = s.intrinsics.fy;
+  sj["cx"] = s.intrinsics.cx; sj["cy"] = s.intrinsics.cy;
+  sj["width"] = s.intrinsics.width; sj["height"] = s.intrinsics.height;
+  sj["k1"] = s.intrinsics.k1; sj["k2"] = s.intrinsics.k2;
+  sj["p1"] = s.intrinsics.p1; sj["p2"] = s.intrinsics.p2; sj["k3"] = s.intrinsics.k3;
+  sj["camera_type"] = static_cast<int>(s.camera_type);
+  if (s.tm_anchor1_idx >= 0) {
+    sj["tm_anchor1_idx"]  = s.tm_anchor1_idx;
+    sj["tm_anchor1_time"] = s.tm_anchor1_time;
+    sj["tm_anchor2_idx"]  = s.tm_anchor2_idx;
+    sj["tm_anchor2_time"] = s.tm_anchor2_time;
+    sj["tm_fps"]          = s.tm_fps;
+  }
+  // Time-shift anchors (linear-interp checkpoints across the track).
+  // Persisted only when non-empty so configs for single-calib sources stay clean.
+  // Schema is open for extension: when extrinsic drift anchors land, append
+  // lever_arm / rotation_rpy fields here and the loader's .value() calls still
+  // work on old files.
+  if (!s.anchors.empty()) {
+    nlohmann::json aj = nlohmann::json::array();
+    for (const auto& a : s.anchors) {
+      aj.push_back({
+        {"cam_time",   a.cam_time},
+        {"time_shift", a.time_shift}
+      });
+    }
+    sj["calib_anchors"] = aj;
+  }
+  // Per-source ColorizeParams as a sub-object so it's easy to spot / edit by hand.
+  const auto& p = s.params;
+  nlohmann::json pj;
+  pj["locate_mode"]         = p.locate_mode;
+  pj["min_range"]           = p.min_range;
+  pj["max_range"]           = p.max_range;
+  pj["blend"]               = p.blend;
+  pj["intensity_blend"]     = p.intensity_blend;
+  pj["intensity_mix"]       = p.intensity_mix;
+  pj["nonlinear_int"]       = p.nonlinear_int;
+  pj["view_selector_mode"]  = static_cast<int>(p.view_selector_mode);
+  pj["range_tau"]           = p.range_tau;
+  pj["center_exp"]          = p.center_exp;
+  pj["incidence_exp"]       = p.incidence_exp;
+  pj["topK"]                = p.topK;
+  pj["use_incidence_hard"]  = p.use_incidence_hard;
+  pj["incidence_hard_deg"]  = p.incidence_hard_deg;
+  pj["use_ncc"]             = p.use_ncc;
+  pj["ncc_threshold"]       = p.ncc_threshold;
+  pj["ncc_half"]            = p.ncc_half;
+  pj["use_occlusion"]       = p.use_occlusion;
+  pj["occlusion_tolerance"] = p.occlusion_tolerance;
+  pj["occlusion_downscale"] = p.occlusion_downscale;
+  pj["time_slice_hard"]     = p.time_slice_hard;
+  pj["time_slice_soft"]     = p.time_slice_soft;
+  pj["time_slice_sigma"]    = p.time_slice_sigma;
+  pj["use_exposure_norm"]   = p.use_exposure_norm;
+  pj["exposure_target"]     = p.exposure_target;
+  pj["exposure_simple"]     = p.exposure_simple;
+  sj["params"] = pj;
+  return sj;
+}
+
+// Read the non-image-loading bits (the caller still calls
+// Colorizer::load_image_folder for `path`, then hands the source in here).
+static void image_source_apply_json(glim::ImageSource& source, const nlohmann::json& sj) {
+  source.time_shift = sj.value("time_shift", 0.0);
+  source.mask_path  = sj.value("mask_path", "");
+  if (sj.contains("lever_arm"))
+    source.lever_arm = Eigen::Vector3d(sj["lever_arm"][0], sj["lever_arm"][1], sj["lever_arm"][2]);
+  if (sj.contains("rotation_rpy"))
+    source.rotation_rpy = Eigen::Vector3d(sj["rotation_rpy"][0], sj["rotation_rpy"][1], sj["rotation_rpy"][2]);
+  source.intrinsics.fx = sj.value("fx", 1920.0); source.intrinsics.fy = sj.value("fy", 1920.0);
+  source.intrinsics.cx = sj.value("cx", 1920.0); source.intrinsics.cy = sj.value("cy", 1080.0);
+  source.intrinsics.width = sj.value("width", 3840); source.intrinsics.height = sj.value("height", 2160);
+  source.intrinsics.k1 = sj.value("k1", 0.0); source.intrinsics.k2 = sj.value("k2", 0.0);
+  source.intrinsics.p1 = sj.value("p1", 0.0); source.intrinsics.p2 = sj.value("p2", 0.0);
+  source.intrinsics.k3 = sj.value("k3", 0.0);
+  if (sj.contains("camera_type"))
+    source.camera_type = static_cast<glim::CameraType>(sj["camera_type"].get<int>());
+  if (sj.contains("tm_anchor1_idx") && sj["tm_anchor1_idx"].get<int>() >= 0) {
+    source.tm_anchor1_idx  = sj.value("tm_anchor1_idx", -1);
+    source.tm_anchor1_time = sj.value("tm_anchor1_time", 0.0);
+    source.tm_anchor2_idx  = sj.value("tm_anchor2_idx", -1);
+    source.tm_anchor2_time = sj.value("tm_anchor2_time", 0.0);
+    source.tm_fps          = sj.value("tm_fps", 30.0f);
+  }
+  // Time-shift anchors. Missing key -> empty vector -> scalar baseline
+  // behavior preserved (old configs load cleanly). Extra keys on each anchor
+  // (lever_arm/rotation_rpy from a future schema) are tolerated and ignored.
+  source.anchors.clear();
+  if (sj.contains("calib_anchors") && sj["calib_anchors"].is_array()) {
+    source.anchors.reserve(sj["calib_anchors"].size());
+    for (const auto& aj : sj["calib_anchors"]) {
+      glim::CalibAnchor a;
+      a.cam_time   = aj.value("cam_time", 0.0);
+      a.time_shift = aj.value("time_shift", 0.0);
+      source.anchors.push_back(a);
+    }
+    // Enforce sort invariant on load (tolerant of hand-edited configs that
+    // might list anchors in insertion order rather than time order).
+    std::sort(source.anchors.begin(), source.anchors.end(),
+      [](const glim::CalibAnchor& x, const glim::CalibAnchor& y) { return x.cam_time < y.cam_time; });
+  }
+  // ColorizeParams: if missing entirely, seed camera-type-aware defaults; otherwise
+  // read each field with struct-default fallback (additive / removable safely).
+  auto& p = source.params;
+  p = glim::default_colorize_params_for(source.camera_type);  // sensible baseline
+  if (sj.contains("params")) {
+    const auto& pj = sj["params"];
+    p.locate_mode         = pj.value("locate_mode",         p.locate_mode);
+    p.min_range           = pj.value("min_range",           p.min_range);
+    p.max_range           = pj.value("max_range",           p.max_range);
+    p.blend               = pj.value("blend",               p.blend);
+    p.intensity_blend     = pj.value("intensity_blend",     p.intensity_blend);
+    p.intensity_mix       = pj.value("intensity_mix",       p.intensity_mix);
+    p.nonlinear_int       = pj.value("nonlinear_int",       p.nonlinear_int);
+    if (pj.contains("view_selector_mode"))
+      p.view_selector_mode = static_cast<glim::ViewSelectorMode>(pj["view_selector_mode"].get<int>());
+    p.range_tau           = pj.value("range_tau",           p.range_tau);
+    p.center_exp          = pj.value("center_exp",          p.center_exp);
+    p.incidence_exp       = pj.value("incidence_exp",       p.incidence_exp);
+    p.topK                = pj.value("topK",                p.topK);
+    p.use_incidence_hard  = pj.value("use_incidence_hard",  p.use_incidence_hard);
+    p.incidence_hard_deg  = pj.value("incidence_hard_deg",  p.incidence_hard_deg);
+    p.use_ncc             = pj.value("use_ncc",             p.use_ncc);
+    p.ncc_threshold       = pj.value("ncc_threshold",       p.ncc_threshold);
+    p.ncc_half            = pj.value("ncc_half",            p.ncc_half);
+    p.use_occlusion       = pj.value("use_occlusion",       p.use_occlusion);
+    p.occlusion_tolerance = pj.value("occlusion_tolerance", p.occlusion_tolerance);
+    p.occlusion_downscale = pj.value("occlusion_downscale", p.occlusion_downscale);
+    p.time_slice_hard     = pj.value("time_slice_hard",     p.time_slice_hard);
+    p.time_slice_soft     = pj.value("time_slice_soft",     p.time_slice_soft);
+    p.time_slice_sigma    = pj.value("time_slice_sigma",    p.time_slice_sigma);
+    p.use_exposure_norm   = pj.value("use_exposure_norm",   p.use_exposure_norm);
+    p.exposure_target     = pj.value("exposure_target",     p.exposure_target);
+    p.exposure_simple     = pj.value("exposure_simple",     p.exposure_simple);
+  }
+}
+
+inline ImU32 scalar_to_imu32(int colormap_idx, float t, int alpha) {
+  // glk::colormapf takes t in [0, 1] and does `int x = t * 255` internally to
+  // index the 256-entry table. Pass the normalized value directly -- any extra
+  // *255 here double-scales and collapses every non-trivial value to the top
+  // of the table, producing a two-tone blob.
+  const int max_idx = static_cast<int>(glk::COLORMAP::NUM_COLORMAPS) - 1;
+  const auto cm = static_cast<glk::COLORMAP>(std::clamp(colormap_idx, 0, max_idx));
+  const Eigen::Vector4f c = glk::colormapf(cm, std::clamp(t, 0.0f, 1.0f));
+  const int r = std::clamp(static_cast<int>(c.x() * 255.0f), 0, 255);
+  const int g = std::clamp(static_cast<int>(c.y() * 255.0f), 0, 255);
+  const int b = std::clamp(static_cast<int>(c.z() * 255.0f), 0, 255);
+  return IM_COL32(r, g, b, std::clamp(alpha, 0, 255));
+}
 
 // Intensity to blue-cyan-white color ramp (for intensity blend visualization)
 inline Eigen::Vector3f intensity_to_color(float t) {
   // t in [0,1]: 0=dark blue, 0.5=cyan, 1.0=white
   if (t < 0.5f) {
     const float s = t * 2.0f;
-    return Eigen::Vector3f(0.05f, 0.1f + 0.7f * s, 0.3f + 0.7f * s);  // dark blue → cyan
+    return Eigen::Vector3f(0.05f, 0.1f + 0.7f * s, 0.3f + 0.7f * s);  // dark blue -> cyan
   } else {
     const float s = (t - 0.5f) * 2.0f;
-    return Eigen::Vector3f(s, 0.8f + 0.2f * s, 1.0f);  // cyan → white
+    return Eigen::Vector3f(s, 0.8f + 0.2f * s, 1.0f);  // cyan -> white
   }
+}
+
+// Build the named "colorize_preview" PointCloudBuffer drawable from a
+// ColorizeResult, folding in ColorizeParams' intensity-blend knobs.
+// Previously duplicated across 5 Colorize entry points (right-click per-camera,
+// right-click per-submap, live-preview single-cam, live-preview submap,
+// intensity-blend refresh). The submap-preview copy used a grayscale ramp
+// instead of intensity_to_color(); the `use_grayscale_intensity` flag
+// preserves that variant so pulling this out doesn't silently change behavior.
+void push_colorize_preview_drawable(
+    guik::LightViewer* vw,
+    const glim::ColorizeResult& cr,
+    const glim::ColorizeParams& cp,
+    bool use_grayscale_intensity = false) {
+  const size_t n = cr.points.size();
+  float imin = std::numeric_limits<float>::max();
+  float imax = std::numeric_limits<float>::lowest();
+  for (size_t i = 0; i < n && i < cr.intensities.size(); i++) {
+    imin = std::min(imin, cr.intensities[i]);
+    imax = std::max(imax, cr.intensities[i]);
+  }
+  if (imin >= imax) { imin = 0.0f; imax = 255.0f; }
+
+  std::vector<Eigen::Vector4d> p4(n);
+  std::vector<Eigen::Vector4f> c4(n);
+  for (size_t i = 0; i < n; i++) {
+    p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
+    Eigen::Vector3f rgb = cr.colors[i];
+    if (cp.intensity_blend && i < cr.intensities.size()) {
+      float inv = (cr.intensities[i] - imin) / (imax - imin);
+      if (!use_grayscale_intensity && cp.nonlinear_int) inv = std::sqrt(inv);
+      const Eigen::Vector3f ramp = use_grayscale_intensity
+                                      ? Eigen::Vector3f(inv, inv, inv)
+                                      : intensity_to_color(inv);
+      rgb = rgb * (1.0f - cp.intensity_mix) + ramp * cp.intensity_mix;
+    }
+    c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
+  }
+  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size());
+  cb->add_color(c4);
+  vw->update_drawable("colorize_preview", cb,
+                       guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR));
 }
 
 // Parsed contents of one .geoid file.
@@ -117,7 +497,7 @@ bool load_geoid_table(const std::string& path, GeoidTable& out) {
     // Must be a data row.
     if (!have_lat_min || !have_lat_max || !have_lon_min ||
         !have_lon_max || !have_lat_step || !have_lon_step) {
-      return false;  // data before all headers — malformed
+      return false;  // data before all headers -- malformed
     }
 
     // Derive expected dimensions on first data row encounter.
@@ -260,7 +640,7 @@ std::string tile_name_for_point(
 }
 
 // ---------------------------------------------------------------------------
-// JGD2011 prefecture → zone mapping
+// JGD2011 prefecture -> zone mapping
 // ---------------------------------------------------------------------------
 
 struct PrefZoneEntry { const char* jp; const char* en; int zone; };
@@ -366,6 +746,285 @@ std::vector<Eigen::Vector2d> parse_ring(const nlohmann::json& coords) {
 OfflineViewer::OfflineViewer(const std::string& init_map_path) : init_map_path(init_map_path) {}
 
 OfflineViewer::~OfflineViewer() {}
+
+void OfflineViewer::render_camera_gizmo(int src_idx, int frame_idx) {
+  if (src_idx < 0 || src_idx >= static_cast<int>(image_sources.size())) return;
+  const auto& source = image_sources[src_idx];
+  if (frame_idx < 0 || frame_idx >= static_cast<int>(source.frames.size())) return;
+  const auto& frame = source.frames[frame_idx];
+  if (!frame.located) return;
+
+  auto vw = guik::LightViewer::instance();
+  const Eigen::Vector3f pos = frame.T_world_cam.translation().cast<float>();
+  const Eigen::Matrix3f R   = frame.T_world_cam.rotation().cast<float>();
+  const Eigen::Vector3f fwd   = R.col(0).normalized();
+  const Eigen::Vector3f right = R.col(1).normalized();
+  const Eigen::Vector3f up    = R.col(2).normalized();
+  const bool is_spherical = (source.camera_type == CameraType::Spherical);
+  const std::string fov_name = "cam_fov_" + std::to_string(src_idx) + "_" + std::to_string(frame_idx);
+  const std::string body_name = "cam_" + std::to_string(src_idx) + "_" + std::to_string(frame_idx);
+
+  // FOV indicator: pinhole gets a 4-edge frustum; spherical gets a single
+  // forward-ray line (no frustum, 360 has no FOV).
+  if (!is_spherical) {
+    const float fov_len = 0.6f, fov_w = 0.3f, fov_h = 0.2f;
+    const Eigen::Vector3f bc = pos + fwd * fov_len;
+    std::vector<Eigen::Vector3f> v = {
+      pos, bc + right*fov_w + up*fov_h, pos, bc - right*fov_w + up*fov_h,
+      pos, bc - right*fov_w - up*fov_h, pos, bc + right*fov_w - up*fov_h,
+      bc + right*fov_w + up*fov_h, bc - right*fov_w + up*fov_h,
+      bc - right*fov_w + up*fov_h, bc - right*fov_w - up*fov_h,
+      bc - right*fov_w - up*fov_h, bc + right*fov_w - up*fov_h,
+      bc + right*fov_w - up*fov_h, bc + right*fov_w + up*fov_h
+    };
+    vw->update_drawable(fov_name,
+      std::make_shared<glk::ThinLines>(v.data(), static_cast<int>(v.size()), false),
+      guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
+  } else {
+    std::vector<Eigen::Vector3f> v = { pos, pos + fwd * 0.8f };
+    vw->update_drawable(fov_name,
+      std::make_shared<glk::ThinLines>(v.data(), static_cast<int>(v.size()), false),
+      guik::FlatColor(0.4f, 0.7f, 1.0f, 0.9f));
+  }
+
+  // Body: cube for pinhole (white), sphere for spherical (blue).
+  Eigen::Affine3f btf = Eigen::Affine3f::Identity();
+  btf.translate(pos); btf.linear() = R;
+  btf = btf * Eigen::Scaling(is_spherical ? Eigen::Vector3f(0.14f, 0.14f, 0.14f)
+                                          : Eigen::Vector3f(0.12f, 0.18f, 0.12f));
+  const Eigen::Vector4i info(static_cast<int>(PickType::CAMERA), src_idx, 0, frame_idx);
+  if (is_spherical) {
+    vw->update_drawable(body_name, glk::Primitives::sphere(),
+      guik::FlatColor(0.35f, 0.65f, 1.0f, 0.9f, btf).add("info_values", info));
+  } else {
+    vw->update_drawable(body_name, glk::Primitives::cube(),
+      guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, btf).add("info_values", info));
+  }
+}
+
+void OfflineViewer::render_anchor_panel(int src_idx, double cam_time, bool have_time,
+                                         const char* id_suffix) {
+  if (src_idx < 0 || src_idx >= static_cast<int>(image_sources.size())) return;
+  auto& src = image_sources[src_idx];
+  const size_t na = src.anchors.size();
+  // Dedup tolerance: if a new anchor is within this many seconds of an
+  // existing one, the existing one is UPDATED instead of a near-duplicate
+  // being inserted. 0.5s = typically 15 frames at 30fps -- plenty of room to
+  // re-land on the same anchor to re-tune it.
+  constexpr double kAnchorMergeTol = 0.5;
+
+  ImGui::TextDisabled("Time anchors (%zu)", na);
+  ImGui::SameLine();
+  {
+    char btn_label[48]; std::snprintf(btn_label, sizeof(btn_label), "Anchor here##ca_%s", id_suffix);
+    ImGui::BeginDisabled(!have_time);
+    if (ImGui::SmallButton(btn_label)) {
+      CalibAnchor a;
+      a.cam_time   = cam_time;        // source-local; stable under time_shift tweaks
+      a.time_shift = src.time_shift;
+      // Keep anchors sorted by cam_time so effective_time_shift's
+      // lower_bound lookup works without re-sorting on every query.
+      auto it = std::lower_bound(src.anchors.begin(), src.anchors.end(), a.cam_time,
+        [](const CalibAnchor& x, double t) { return x.cam_time < t; });
+      // Find the closest neighbor on either side within merge tolerance;
+      // update it instead of creating a near-duplicate anchor.
+      int merge_idx = -1;
+      if (it != src.anchors.end() && std::abs(it->cam_time - a.cam_time) < kAnchorMergeTol)
+        merge_idx = static_cast<int>(it - src.anchors.begin());
+      if (it != src.anchors.begin()) {
+        auto prev = it - 1;
+        if (std::abs(prev->cam_time - a.cam_time) < kAnchorMergeTol) {
+          if (merge_idx < 0 || std::abs(prev->cam_time - a.cam_time) < std::abs(it->cam_time - a.cam_time))
+            merge_idx = static_cast<int>(prev - src.anchors.begin());
+        }
+      }
+      if (merge_idx >= 0) {
+        src.anchors[merge_idx] = a;
+        align_anchor_selected = merge_idx;
+        logger->info("[Anchor] Updated existing anchor #{} at cam_t={:.6f} shift={:+.6f}s (src {})",
+          merge_idx, a.cam_time, a.time_shift, src_idx);
+      } else {
+        const int new_idx = static_cast<int>(it - src.anchors.begin());
+        src.anchors.insert(it, a);
+        align_anchor_selected = new_idx;
+        logger->info("[Anchor] Added anchor #{} at cam_t={:.6f} shift={:+.6f}s (src {})",
+          new_idx, a.cam_time, a.time_shift, src_idx);
+      }
+      align_anchor_selected_src = src_idx;
+    }
+    ImGui::EndDisabled();
+  }
+  if (ImGui::IsItemHovered()) {
+    if (have_time) {
+      ImGui::SetTooltip(
+        "Snapshot current time_shift (%+.6f s) as an anchor at cam_t=%.3f.\n"
+        "With 2+ anchors, effective_time_shift() linearly interpolates per frame.\n"
+        "\n"
+        "Click within 0.5 s of an existing anchor UPDATES it instead of placing\n"
+        "a near-duplicate. Order-independent: anchors always sort by cam_time.",
+        src.time_shift, cam_time);
+    } else {
+      ImGui::SetTooltip(
+        "No current frame to anchor. Scrub a frame in Alignment check, or\n"
+        "right-click a camera / submap in the 3D view to seed a preview first.");
+    }
+  }
+  // "Apply to #N": overwrites the selected anchor's time_shift with whatever
+  // is currently in the widget (src.time_shift). Different from "Anchor here":
+  //   - "Anchor here" places at the CURRENT preview frame (uses merge-tol).
+  //   - "Apply to #N" targets the SELECTED anchor directly, keeping its cam_time.
+  // Use after: click a row (pulls anchor's current value into widget), drag
+  // widget to tune, click Apply. Live preview updates during drag via scratch.
+  const bool have_sel = (align_anchor_selected_src == src_idx &&
+                         align_anchor_selected >= 0 &&
+                         align_anchor_selected < static_cast<int>(src.anchors.size()));
+  if (have_sel) {
+    const auto& target_ro = src.anchors[align_anchor_selected];
+    ImGui::SameLine();
+    char load_label[64];
+    std::snprintf(load_label, sizeof(load_label), "Load #%d##ca_load_%s",
+                  align_anchor_selected, id_suffix);
+    if (ImGui::SmallButton(load_label)) {
+      src.time_shift = target_ro.time_shift;
+      logger->info("[Anchor] Loaded #{} (cam_t={:.3f}, shift={:+.6f}) into time_shift widget",
+        align_anchor_selected, target_ro.cam_time, target_ro.time_shift);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Pull selected anchor #%d's time_shift (%+.6f s) into the widget so you\n"
+      "can edit it. Live preview is scratch-driven, so the next frame reflects\n"
+      "the loaded value. Drag the widget to tune, then hit 'Apply to #%d' to\n"
+      "write it back.",
+      align_anchor_selected, target_ro.time_shift, align_anchor_selected);
+
+    ImGui::SameLine();
+    char apply_label[64];
+    std::snprintf(apply_label, sizeof(apply_label), "Apply to #%d##ca_apply_%s",
+                  align_anchor_selected, id_suffix);
+    if (ImGui::SmallButton(apply_label)) {
+      auto& target = src.anchors[align_anchor_selected];
+      const double old_ts = target.time_shift;
+      target.time_shift = src.time_shift;
+      logger->info("[Anchor] Applied time_shift {:+.6f}s -> {:+.6f}s on anchor #{} at cam_t={:.3f} (src {})",
+        old_ts, target.time_shift, align_anchor_selected, target.cam_time, src_idx);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Write current time_shift (%+.6f s) into selected anchor #%d (cam_t=%.3f).\n"
+      "Anchor's cam_time stays put -- only its time_shift value updates.\n"
+      "\n"
+      "Refine-an-anchor workflow:\n"
+      "  1. Click the anchor row (highlights the 3D pin; widget unchanged).\n"
+      "  2. Click 'Load #%d' to pull its value into the widget.\n"
+      "  3. Drag time_shift -- live preview updates via scratch.\n"
+      "  4. Click this to commit.",
+      src.time_shift, align_anchor_selected, src.anchors[align_anchor_selected].cam_time,
+      align_anchor_selected);
+  }
+  if (na >= 1) {
+    ImGui::SameLine();
+    char clr_label[48]; std::snprintf(clr_label, sizeof(clr_label), "Clear all##ca_%s", id_suffix);
+    if (ImGui::SmallButton(clr_label)) {
+      src.anchors.clear();
+      if (align_anchor_selected_src == src_idx) align_anchor_selected = -1;
+      logger->info("[Anchor] Cleared all anchors (src {})", src_idx);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Remove all anchors. The source reverts to its scalar time_shift baseline.");
+  }
+  // State badge. Below 2 anchors, interpolation is INERT -- scalar baseline
+  // rules everywhere. Makes it obvious that a single anchor is a bookmark, not
+  // an active override. Historically we clamped 1 anchor to a constant, which
+  // unexpectedly nuked previously-correct sections.
+  if (na == 1) {
+    ImGui::TextColored(ImVec4(0.90f, 0.80f, 0.35f, 1.0f),
+      "Bookmark only -- place a 2nd anchor elsewhere to activate interpolation.");
+  } else if (na >= 2) {
+    double ts_lo = src.anchors.front().time_shift, ts_hi = ts_lo;
+    double ct_lo = src.anchors.front().cam_time,   ct_hi = ct_lo;
+    for (const auto& a : src.anchors) {
+      ts_lo = std::min(ts_lo, a.time_shift); ts_hi = std::max(ts_hi, a.time_shift);
+      ct_lo = std::min(ct_lo, a.cam_time);   ct_hi = std::max(ct_hi, a.cam_time);
+    }
+    ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+      "Drift: %+.6f .. %+.6f s across %.1f s of track",
+      ts_lo, ts_hi, ct_hi - ct_lo);
+  }
+  // Compact anchor table. Clicking a row selects it -- the 3D gizmo for that
+  // anchor stretches Z x10 so it's easy to locate in the viewer.
+  if (na > 0) {
+    char hdr_label[48]; std::snprintf(hdr_label, sizeof(hdr_label), "Anchor list##ca_%s", id_suffix);
+    if (ImGui::CollapsingHeader(hdr_label, ImGuiTreeNodeFlags_DefaultOpen)) {
+      int remove_idx = -1;
+      char tbl_id[48]; std::snprintf(tbl_id, sizeof(tbl_id), "anchors_table_%s", id_suffix);
+      if (ImGui::BeginTable(tbl_id, 4,
+            ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("#");
+        ImGui::TableSetupColumn("cam_t(s)");
+        ImGui::TableSetupColumn("shift(s)");
+        ImGui::TableSetupColumn("");
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < src.anchors.size(); i++) {
+          const auto& a = src.anchors[i];
+          ImGui::TableNextRow();
+          const bool is_sel = (align_anchor_selected == static_cast<int>(i) &&
+                                align_anchor_selected_src == src_idx);
+          ImGui::TableSetColumnIndex(0);
+          char sel_lbl[32]; std::snprintf(sel_lbl, sizeof(sel_lbl), "%zu##ca_sel_%s_%zu", i, id_suffix, i);
+          if (ImGui::Selectable(sel_lbl, is_sel, ImGuiSelectableFlags_SpanAllColumns)) {
+            align_anchor_selected = static_cast<int>(i);
+            align_anchor_selected_src = src_idx;
+            // Pure selection: highlights the 3D gizmo only. Does NOT alter the
+            // time_shift widget -- the user may be mid-drag on an unrelated
+            // tuning and shouldn't have their scratch clobbered. An explicit
+            // "Load #N" button (next to Apply) pulls the anchor's value into
+            // the widget when the user decides to edit it.
+          }
+          ImGui::TableSetColumnIndex(1); ImGui::Text("%.3f", a.cam_time);
+          ImGui::TableSetColumnIndex(2); ImGui::Text("%+.6f", a.time_shift);
+          ImGui::TableSetColumnIndex(3);
+          char btn[32]; std::snprintf(btn, sizeof(btn), "x##ca_%s_%zu", id_suffix, i);
+          if (ImGui::SmallButton(btn)) remove_idx = static_cast<int>(i);
+        }
+        ImGui::EndTable();
+      }
+      if (remove_idx >= 0 && remove_idx < static_cast<int>(src.anchors.size())) {
+        src.anchors.erase(src.anchors.begin() + remove_idx);
+        if (align_anchor_selected_src == src_idx) {
+          if (align_anchor_selected == remove_idx) align_anchor_selected = -1;
+          else if (align_anchor_selected > remove_idx) align_anchor_selected--;
+        }
+        logger->info("[Anchor] Removed anchor #{} (src {}). {} remain.", remove_idx, src_idx, src.anchors.size());
+      }
+    }
+  }
+}
+
+BlendParams OfflineViewer::current_blend_params(const ImageSource& src) const {
+  // Pulls every tunable from the passed source's ColorizeParams so that every
+  // preview / apply / assignment call site lands on the same strategy. Single
+  // construction site means adding/removing a BlendParams field touches one
+  // place.
+  const auto& p = src.params;
+  return BlendParams{
+    p.max_range, p.min_range, p.blend, colorize_mask,
+    p.range_tau, p.center_exp, p.incidence_exp, p.topK,
+    p.use_incidence_hard ? static_cast<float>(std::cos(p.incidence_hard_deg * M_PI / 180.0)) : -1.0f,
+    p.use_ncc ? p.ncc_threshold : -2.0f, p.ncc_half,
+    p.use_occlusion, p.occlusion_tolerance, p.occlusion_downscale,
+    p.time_slice_hard, p.time_slice_soft, p.time_slice_sigma,
+    p.use_exposure_norm, p.exposure_target, p.exposure_simple
+  };
+}
+
+BlendParams OfflineViewer::current_blend_params() const {
+  // Convenience overload: use the Colorize window's active source. Falls back
+  // to a default ColorizeParams if no sources exist yet (UI can run early).
+  if (image_sources.empty()) {
+    static const ImageSource empty_src;
+    return current_blend_params(empty_src);
+  }
+  const int idx = std::clamp(colorize_source_idx, 0, static_cast<int>(image_sources.size()) - 1);
+  return current_blend_params(image_sources[idx]);
+}
 
 void OfflineViewer::load_gnss_datum() {
   gnss_datum_available = false;
@@ -474,6 +1133,112 @@ void OfflineViewer::build_trajectory() {
   trajectory_built = true;
   logger->info("[Trajectory] Built: {} points, {:.0f} m", trajectory_data.size(), trajectory_total_dist);
 }
+
+void OfflineViewer::vc_pcam_seed_factory_presets() {
+  if (vc_pcam_presets_initialised) return;
+  vc_pcam_presets_initialised = true;
+
+  // --- Livox Horizon ---
+  // Forward-facing, sparse outside the narrow swath. Wide time window so the
+  // camera looking forward still has side/back context from nearby frames as
+  // the platform drives past. Linear ramp of 2 px (close) to 1 px (15 m+).
+  VcamPreset horizon;
+  horizon.name = "Livox Horizon";
+  horizon.ctx_opts.use_time_window = true;
+  horizon.ctx_opts.time_before_s   = 80.0;
+  horizon.ctx_opts.time_after_s    = 80.0;
+  horizon.ctx_opts.directional_filter = false;
+  horizon.ctx_opts.min_range = 6.0f;
+  horizon.ctx_opts.max_range = 150.0f;
+  horizon.render_opts.splat_mode = IntensityRenderOptions::SplatMode::LinearRamp;
+  horizon.render_opts.splat_ranges = { {0.0, 2}, {15.0, 1} };
+  horizon.render_opts.non_linear_intensity = false;  // user reports linear has better road-marking contrast
+  horizon.face_enabled[0] = true;  horizon.face_enabled[1] = true;
+  horizon.face_enabled[2] = true;  horizon.face_enabled[3] = true;
+  horizon.face_enabled[4] = false; horizon.face_enabled[5] = false;
+  horizon.face_size = 4096;
+  horizon.format = 1;           // JPG
+  horizon.jpg_quality = 95;
+  vc_pcam_presets.push_back(horizon);
+
+  // --- Hesai XT32 ---
+  // 32-beam mechanical -- denser than Horizon; slightly tighter window,
+  // can pull in closer points. Placeholder values, expect tuning.
+  VcamPreset xt32;
+  xt32.name = "Hesai XT32";
+  xt32.ctx_opts.use_time_window = true;
+  xt32.ctx_opts.time_before_s   = 15.0;
+  xt32.ctx_opts.time_after_s    = 15.0;
+  xt32.ctx_opts.directional_filter = false;
+  xt32.ctx_opts.min_range = 4.0f;
+  xt32.ctx_opts.max_range = 150.0f;
+  xt32.render_opts.splat_mode = IntensityRenderOptions::SplatMode::LinearRamp;
+  xt32.render_opts.splat_ranges = { {0.0, 2}, {15.0, 1} };
+  xt32.render_opts.non_linear_intensity = false;
+  xt32.face_enabled[0] = true;  xt32.face_enabled[1] = true;
+  xt32.face_enabled[2] = true;  xt32.face_enabled[3] = true;
+  xt32.face_enabled[4] = false; xt32.face_enabled[5] = false;
+  xt32.face_size = 4096;
+  xt32.format = 1;
+  xt32.jpg_quality = 95;
+  vc_pcam_presets.push_back(xt32);
+
+  // --- Pandar 128 ---
+  // 128-beam, densest of the three. Tighter window acceptable because each
+  // frame already carries a lot of data. Placeholder values.
+  VcamPreset pandar;
+  pandar.name = "Pandar 128";
+  pandar.ctx_opts.use_time_window = true;
+  pandar.ctx_opts.time_before_s   = 10.0;
+  pandar.ctx_opts.time_after_s    = 10.0;
+  pandar.ctx_opts.directional_filter = false;
+  pandar.ctx_opts.min_range = 3.0f;
+  pandar.ctx_opts.max_range = 200.0f;
+  pandar.render_opts.splat_mode = IntensityRenderOptions::SplatMode::LinearRamp;
+  pandar.render_opts.splat_ranges = { {0.0, 2}, {15.0, 1} };
+  pandar.render_opts.non_linear_intensity = false;
+  pandar.face_enabled[0] = true;  pandar.face_enabled[1] = true;
+  pandar.face_enabled[2] = true;  pandar.face_enabled[3] = true;
+  pandar.face_enabled[4] = false; pandar.face_enabled[5] = false;
+  pandar.face_size = 4096;
+  pandar.format = 1;
+  pandar.jpg_quality = 95;
+  vc_pcam_presets.push_back(pandar);
+}
+
+void OfflineViewer::vc_pcam_apply_preset(const VcamPreset& p) {
+  vc_pcam_ctx_opts = p.ctx_opts;
+  vc_pcam_render_opts = p.render_opts;
+  vc_pcam_render_w = p.render_w;
+  vc_pcam_render_h = p.render_h;
+  for (int i = 0; i < 6; i++) vc_face_enabled[i] = p.face_enabled[i];
+  vc_face_size = p.face_size;
+  vc_pcam_format = p.format;
+  vc_pcam_jpg_quality = p.jpg_quality;
+  // Force a re-render with the new values the next time the UI ticks.
+  vc_pcam_preview_dirty = true;
+}
+
+const char* OfflineViewer::vc_face_label(int face_idx) {
+  switch (face_idx) {
+    case 0: return "Front";
+    case 1: return "Back";
+    case 2: return "Left";
+    case 3: return "Right";
+    case 4: return "Up";
+    case 5: return "Down";
+    default: return "Face";
+  }
+}
+
+std::vector<TimedPose> OfflineViewer::timed_traj_snapshot() const {
+  std::vector<TimedPose> snap(trajectory_data.size());
+  for (size_t i = 0; i < trajectory_data.size(); i++) {
+    snap[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+  }
+  return snap;
+}
+
 void OfflineViewer::ensure_prefectures_loaded() {
   if (prefectures_loaded) return;
   prefectures_loaded = true;  // mark even on failure to avoid retrying
@@ -531,7 +1296,7 @@ void OfflineViewer::ensure_prefectures_loaded() {
           detected_pref_jp = pref.name_jp;
           detected_pref_en = pref.name_en;
           detected_jgd_zone = pref.jgd_zone;
-          logger->info("[JGD2011] Datum in {} ({}) — Zone {} ({})",
+          logger->info("[JGD2011] Datum in {} ({}) -- Zone {} ({})",
                        detected_pref_jp, detected_pref_en,
                        jgd2011_zone_name(detected_jgd_zone), detected_jgd_zone);
           goto detection_done;
@@ -548,7 +1313,48 @@ void OfflineViewer::setup_ui() {
   auto viewer = guik::LightViewer::instance();
   viewer->register_ui_callback("main_menu", [this] { main_menu(); });
 
-  // Session visibility filter — hides submaps and spheres for disabled sessions
+  // World-axis gizmo (bottom-right). Always-on indicator that updates as the
+  // camera rotates so the user can confirm the world's orientation. X red,
+  // Y green, Z blue. Useful for sanity-checking exports vs other tools that
+  // may use a different up-axis convention (e.g. LichtFeld defaults to Y-up
+  // while we are Z-up).
+  viewer->register_ui_callback("axis_gizmo", [this] {
+    if (!show_axis_gizmo) return;
+    auto vw = guik::LightViewer::instance();
+    const Eigen::Matrix4f vm = vw->view_matrix();
+    const Eigen::Matrix3f R = vm.block<3, 3>(0, 0);  // world -> view rotation
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    const ImVec2 origin(disp.x - 70.0f, disp.y - 70.0f);
+    const float L = 36.0f;
+    auto* dl = ImGui::GetForegroundDrawList();
+    dl->AddCircleFilled(origin, L + 14.0f, IM_COL32(15, 15, 15, 170));
+    dl->AddCircle(origin, L + 14.0f, IM_COL32(80, 80, 80, 200), 0, 1.5f);
+
+    struct Axis { Eigen::Vector3f v; ImU32 color; const char* label; };
+    Axis axes[3] = {
+      {{1.0f, 0.0f, 0.0f}, IM_COL32(235, 75, 75, 255), "X"},
+      {{0.0f, 1.0f, 0.0f}, IM_COL32(80, 210, 80, 255), "Y"},
+      {{0.0f, 0.0f, 1.0f}, IM_COL32(85, 140, 235, 255), "Z"},
+    };
+    // Draw back-facing axes first so front-facing labels overlap them on top.
+    std::sort(axes, axes + 3, [&R](const Axis& a, const Axis& b) {
+      return (R * a.v).z() > (R * b.v).z();   // larger z (deeper into -view) first
+    });
+    for (const auto& a : axes) {
+      const Eigen::Vector3f v = R * a.v;
+      const ImVec2 endp(origin.x + v.x() * L, origin.y - v.y() * L);
+      dl->AddLine(origin, endp, a.color, 2.0f);
+      dl->AddCircleFilled(endp, 4.0f, a.color);
+      Eigen::Vector2f dir(v.x(), -v.y());
+      const float dn = dir.norm();
+      if (dn > 0.05f) dir /= dn;
+      else dir = Eigen::Vector2f(0.0f, 0.0f);
+      const ImVec2 lbl(endp.x + dir.x() * 9.0f - 4.0f, endp.y + dir.y() * 9.0f - 7.0f);
+      dl->AddText(lbl, a.color, a.label);
+    }
+  });
+
+  // Session visibility filter -- hides submaps and spheres for disabled sessions
   viewer->register_drawable_filter("session_filter", [this](const std::string& name) {
     if (sessions.size() <= 1) return true;  // no filtering for single session
 
@@ -602,7 +1408,7 @@ void OfflineViewer::setup_ui() {
     // Smooth FPV position
     const Eigen::Matrix4f vm = fps->view_matrix();
     const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
-    // Smooth position only — rotation stays crisp (Iridescence handles it natively)
+    // Smooth position only -- rotation stays crisp (Iridescence handles it natively)
     const Eigen::Vector3f fwd = -vm.block<1, 3>(2, 0).transpose();
     const float yaw = std::atan2(fwd.y(), fwd.x()) * 180.0f / M_PI;
     const float pitch = std::asin(std::clamp(fwd.z(), -1.0f, 1.0f)) * 180.0f / M_PI;
@@ -635,7 +1441,7 @@ void OfflineViewer::setup_ui() {
       follow_speed_kmh = std::max(follow_speed_kmh - accel * static_cast<float>(dt), -500.0f);
     }
 
-    // Space toggles play/pause — pause sets speed to 0, unpause recovers last speed
+    // Space toggles play/pause -- pause sets speed to 0, unpause recovers last speed
     static float follow_saved_speed = 30.0f;
     if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
       if (follow_playing) {
@@ -653,15 +1459,19 @@ void OfflineViewer::setup_ui() {
       const double speed_ms = follow_speed_kmh / 3.6;  // km/h to m/s
       const double advance = speed_ms * dt;
       const double current_dist = follow_progress * follow_total_dist;
-      const double new_dist = std::clamp(current_dist + advance, 0.0, follow_total_dist);
+      const double unclamped = current_dist + advance;
+      const double new_dist = std::clamp(unclamped, 0.0, follow_total_dist);
       follow_progress = static_cast<float>(new_dist / follow_total_dist);
-      if (follow_progress >= 1.0f || follow_progress <= 0.0f) {
+      // Only stop when we actually tried to move past a boundary -- checking
+      // follow_progress against 0 / 1 directly would fire on the very first
+      // frame after mode switch (progress starts at 0.0 before motion).
+      if (unclamped > follow_total_dist || unclamped < 0.0) {
         follow_speed_kmh = 0.0f;
         follow_playing = false;
       }
     }
 
-    // Mouse drag for turret rotation (right-click drag — smooth, no UI conflict)
+    // Mouse drag for turret rotation (right-click drag -- smooth, no UI conflict)
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.0f)) {
       const ImVec2 delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Right, 1.0f);
       follow_yaw_offset -= delta.x * 0.3f;
@@ -699,11 +1509,14 @@ void OfflineViewer::setup_ui() {
     const double t2 = t * t, t3 = t2 * t;
 
     // Catmull-Rom spline interpolation (standard tau=0.5)
-    const Eigen::Vector3d pos = 0.5 * (
+    Eigen::Vector3d pos = 0.5 * (
       (2.0 * p1) +
       (-p0 + p2) * t +
       (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
       (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+    // Vertical shift ("drone view"): lift the camera above the trajectory
+    // without changing yaw/pitch so the view still tracks the heading.
+    pos.z() += static_cast<double>(follow_height_offset_m);
 
     // Heading from spline tangent (derivative of Catmull-Rom)
     Eigen::Vector3d heading = 0.5 * (
@@ -875,7 +1688,7 @@ void OfflineViewer::setup_ui() {
           ImGui::SetTooltip("Requires aux_ground.bin per frame.\nGenerate with Data Filter > Dynamic > Classify ground to scalar.");
       } else {
         if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("Keep only ground-classified points.\nOne point per XY column — removes ground noise.\nRequires aux_ground.bin from Dynamic filter.");
+          ImGui::SetTooltip("Keep only ground-classified points.\nOne point per XY column -- removes ground noise.\nRequires aux_ground.bin from Dynamic filter.");
       }
       if (vox_ground_only) {
         ImGui::SameLine();
@@ -884,6 +1697,18 @@ void OfflineViewer::setup_ui() {
 
       ImGui::DragFloat("Chunk size (m)", &vox_chunk_size, 5.0f, 20.0f, 200.0f, "%.0f");
       ImGui::DragFloat("Chunk spacing (m)", &vox_chunk_spacing, 5.0f, 10.0f, 100.0f, "%.0f");
+      ImGui::Checkbox("Include intensity", &vox_include_intensity);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Carry per-point intensity into each voxel (average) and write\n"
+        "intensities.bin in the output frames. Off = no intensity file is\n"
+        "emitted; downstream tools that rely on intensity will fall back.");
+      ImGui::SameLine();
+      ImGui::Checkbox("Include RGB", &vox_include_rgb);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Carry per-point RGB (from aux_rgb.bin, produced by Colorize > Apply) into\n"
+        "each voxel (average) and write aux_rgb.bin in the output frames. Off =\n"
+        "no RGB file is emitted. If a source frame is missing aux_rgb.bin the\n"
+        "voxel is skipped for that file -- intensity (if on) still lands.");
       ImGui::Separator();
 
       if (vox_processing) {
@@ -919,7 +1744,7 @@ void OfflineViewer::setup_ui() {
             // Load all frames overlapping chunk
             vox_status = "Loading frames...";
             const float inv_vox = 1.0f / vox_size;
-            std::unordered_map<uint64_t, std::vector<std::pair<Eigen::Vector3f, float>>> voxel_data;  // key → (pos, intensity)
+            std::unordered_map<uint64_t, std::vector<std::pair<Eigen::Vector3f, float>>> voxel_data;  // key -> (pos, intensity)
             int total_input = 0;
 
             const bool ground_only = vox_ground_only;
@@ -960,7 +1785,7 @@ void OfflineViewer::setup_ui() {
               }
             }
 
-            logger->info("[Voxelize preview] {} input points → {} voxels (size={:.3f}m, ground_only={})", total_input, voxel_data.size(), vox_size, ground_only);
+            logger->info("[Voxelize preview] {} input points -> {} voxels (size={:.3f}m, ground_only={})", total_input, voxel_data.size(), vox_size, ground_only);
             vox_status = "Voxelizing " + std::to_string(voxel_data.size()) + " voxels from " + std::to_string(total_input) + " points...";
 
             // Build voxelized output
@@ -1094,8 +1919,10 @@ void OfflineViewer::setup_ui() {
               std::vector<Eigen::Vector3f> points;
               std::vector<float> intensities;
               std::vector<float> ranges;
+              std::vector<Eigen::Vector3f> rgbs;      // only populated when rgb_present
+              std::vector<uint8_t> rgb_present;        // 1 = voxel had any RGB source
             };
-            std::unordered_map<std::string, FrameOutput> frame_outputs;  // frame_dir → output
+            std::unordered_map<std::string, FrameOutput> frame_outputs;  // frame_dir -> output
             // Initialize empty outputs for all frames
             for (const auto& fi : all_frames) frame_outputs[fi.dir] = {};
 
@@ -1107,6 +1934,8 @@ void OfflineViewer::setup_ui() {
               std::vector<Eigen::Vector3f> world_pts;
               std::vector<float> intensities;
               std::vector<float> ranges;
+              std::vector<Eigen::Vector3f> rgbs;   // empty unless source aux_rgb.bin existed
+              bool has_rgb = false;
               std::string dir;
             };
             std::unordered_map<std::string, std::shared_ptr<CachedFrame>> frame_cache;
@@ -1144,26 +1973,50 @@ void OfflineViewer::setup_ui() {
                 std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints(fi->num_points, 0.0f);
                 if (!glim::load_bin(fi->dir + "/points.bin", pts, fi->num_points)) continue;
                 glim::load_bin(fi->dir + "/range.bin", rng, fi->num_points);
-                glim::load_bin(fi->dir + "/intensities.bin", ints, fi->num_points);
+                if (vox_include_intensity) {
+                  glim::load_bin(fi->dir + "/intensities.bin", ints, fi->num_points);
+                }
                 // Load ground mask if ground-only mode
                 std::vector<float> ground;
                 if (ground_only) glim::load_bin(fi->dir + "/aux_ground.bin", ground, fi->num_points);
+                // Load RGB if the feature is on and the file exists for this frame.
+                std::vector<Eigen::Vector3f> rgbs;
+                bool frame_has_rgb = false;
+                if (vox_include_rgb && boost::filesystem::exists(fi->dir + "/aux_rgb.bin")) {
+                  rgbs.resize(fi->num_points, Eigen::Vector3f::Zero());
+                  std::ifstream rgbf(fi->dir + "/aux_rgb.bin", std::ios::binary);
+                  if (rgbf) {
+                    rgbf.read(reinterpret_cast<char*>(rgbs.data()),
+                              sizeof(Eigen::Vector3f) * fi->num_points);
+                    frame_has_rgb = static_cast<bool>(rgbf);
+                  }
+                  if (!frame_has_rgb) rgbs.clear();
+                }
                 const Eigen::Matrix3f R = fi->T_world_lidar.rotation().cast<float>();
                 const Eigen::Vector3f t = fi->T_world_lidar.translation().cast<float>();
                 auto cf = std::make_shared<CachedFrame>();
                 cf->dir = fi->dir;
+                cf->has_rgb = frame_has_rgb;
                 for (int i = 0; i < fi->num_points; i++) {
                   if (!rng.empty() && rng[i] < 1.5f) continue;
                   if (ground_only && (ground.empty() || ground[i] < 0.5f)) continue;
                   cf->world_pts.push_back(R * pts[i] + t);
                   cf->intensities.push_back(ints[i]);
                   cf->ranges.push_back(rng.empty() ? 0.0f : rng[i]);
+                  if (frame_has_rgb) cf->rgbs.push_back(rgbs[i]);
                 }
                 frame_cache[fi->dir] = cf;
               }
 
               // Build voxel grid from cached frames
-              struct VoxPt { Eigen::Vector3f wp; float intensity; float range; std::string dir; };
+              struct VoxPt {
+                Eigen::Vector3f wp;
+                float intensity;
+                float range;
+                Eigen::Vector3f rgb;
+                bool has_rgb;
+                std::string dir;
+              };
               std::unordered_map<uint64_t, std::vector<VoxPt>> voxels;
               for (const auto* fi : chunk_frame_infos) {
                 auto it = frame_cache.find(fi->dir);
@@ -1175,19 +2028,23 @@ void OfflineViewer::setup_ui() {
                     static_cast<int>(std::floor(cf->world_pts[i].x() * inv_vox)),
                     static_cast<int>(std::floor(cf->world_pts[i].y() * inv_vox)), 0)
                     : glim::voxel_key(cf->world_pts[i], inv_vox);
-                  voxels[key].push_back({cf->world_pts[i], cf->intensities[i], cf->ranges[i], cf->dir});
+                  VoxPt vp;
+                  vp.wp = cf->world_pts[i];
+                  vp.intensity = cf->intensities[i];
+                  vp.range = cf->ranges[i];
+                  vp.has_rgb = cf->has_rgb;
+                  vp.rgb = cf->has_rgb ? cf->rgbs[i] : Eigen::Vector3f::Zero();
+                  vp.dir = cf->dir;
+                  voxels[key].push_back(std::move(vp));
                 }
               }
 
-              // Process only core area voxels — assign to frames round-robin
+              // Process only core area voxels -- assign to frames round-robin
               int voxel_idx = 0;
-              // Collect contributing frame dirs for round-robin
+              // Reuse the already-computed chunk_frame_infos instead of re-scanning all_frames
               std::vector<std::string> contributing_dirs;
-              for (const auto& fi : all_frames) {
-                if (fi.num_points > 0 && chunk_aabb.intersects(fi.world_bbox)) {
-                  contributing_dirs.push_back(fi.dir);
-                }
-              }
+              contributing_dirs.reserve(chunk_frame_infos.size());
+              for (const auto* fi : chunk_frame_infos) contributing_dirs.push_back(fi->dir);
 
               for (const auto& [key, pts_in_voxel] : voxels) {
                 // Compute voxel position
@@ -1221,16 +2078,26 @@ void OfflineViewer::setup_ui() {
                 // Only include core area voxels
                 if (!core.contains(pos)) continue;
 
-                // Average attributes
+                // Average attributes. RGB averaged only over points that had RGB
+                // (source frames missing aux_rgb.bin don't contribute); the flag
+                // gates whether the voxel carries RGB at all.
                 float avg_int = 0.0f, avg_rng = 0.0f;
-                for (const auto& p : pts_in_voxel) { avg_int += p.intensity; avg_rng += p.range; }
+                Eigen::Vector3f avg_rgb = Eigen::Vector3f::Zero();
+                int rgb_n = 0;
+                for (const auto& p : pts_in_voxel) {
+                  avg_int += p.intensity; avg_rng += p.range;
+                  if (p.has_rgb) { avg_rgb += p.rgb; rgb_n++; }
+                }
                 avg_int /= pts_in_voxel.size(); avg_rng /= pts_in_voxel.size();
+                if (rgb_n > 0) avg_rgb /= static_cast<float>(rgb_n);
 
-                // Assign to a frame — round-robin across contributing frames
+                // Assign to a frame -- round-robin across contributing frames
                 const std::string& target_dir = contributing_dirs[voxel_idx % contributing_dirs.size()];
                 frame_outputs[target_dir].points.push_back(pos);
                 frame_outputs[target_dir].intensities.push_back(avg_int);
                 frame_outputs[target_dir].ranges.push_back(avg_rng);
+                frame_outputs[target_dir].rgbs.push_back(avg_rgb);
+                frame_outputs[target_dir].rgb_present.push_back(rgb_n > 0 ? 1 : 0);
                 voxel_idx++;
                 total_voxels++;
               }
@@ -1247,14 +2114,27 @@ void OfflineViewer::setup_ui() {
               boost::filesystem::create_directories(out_dir);
 
               const int n = output.points.size();
-              // Write points as sensor-local (identity transform — points are already in world space)
+              // Write points as sensor-local (identity transform -- points are already in world space)
               // For the frame structure, store world-space points directly
               { std::ofstream f(out_dir + "/points.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(output.points.data()), sizeof(Eigen::Vector3f) * n); }
               { std::ofstream f(out_dir + "/range.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(output.ranges.data()), sizeof(float) * n); }
-              { std::ofstream f(out_dir + "/intensities.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(output.intensities.data()), sizeof(float) * n); }
+              if (vox_include_intensity) {
+                std::ofstream f(out_dir + "/intensities.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(output.intensities.data()), sizeof(float) * n);
+              }
+              // Only emit aux_rgb.bin if the flag is on AND at least one voxel
+              // in this frame carried real RGB -- prevents a file of all-zero
+              // fake colours downstream tools would happily paint on.
+              if (vox_include_rgb) {
+                bool any_rgb = false;
+                for (uint8_t v : output.rgb_present) if (v) { any_rgb = true; break; }
+                if (any_rgb) {
+                  std::ofstream f(out_dir + "/aux_rgb.bin", std::ios::binary);
+                  f.write(reinterpret_cast<const char*>(output.rgbs.data()), sizeof(Eigen::Vector3f) * n);
+                }
+              }
 
               // Write frame_meta.json with identity transform (points are world-space)
               { std::ofstream ofs(out_dir + "/frame_meta.json");
@@ -1291,6 +2171,630 @@ void OfflineViewer::setup_ui() {
     ImGui::End();
   });
 
+  // Livox intensity-0 filter tool
+  viewer->register_ui_callback("livox_tool", [this] {
+    if (!show_livox_tool) return;
+    ImGui::SetNextWindowSize(ImVec2(380, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Livox Intensity-0 Filter", &show_livox_tool)) {
+      ImGui::TextDisabled("Livox Horizon 2nd-return detection via intensity == 0.");
+      ImGui::Separator();
+
+      const char* modes[] = {
+        "Delete intensity 0",
+        "Intensity 0 as 2nd return (write aux_second_return.bin)",
+        "Intensity 0 interpolate (kNN from non-zero neighbors)"
+      };
+      ImGui::SetNextItemWidth(-1);
+      ImGui::Combo("##livox_mode", &livox_mode, modes, IM_ARRAYSIZE(modes));
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Delete: removes intensity-0 points entirely (points.bin + parallel files shrink).\n"
+        "Mark 2nd return: writes aux_second_return.bin per frame (1/0 flags). Keeps points.\n"
+        "  Becomes a color-mode attribute on HD reload.\n"
+        "Interpolate: replaces intensity of 0-points with kNN mean of non-zero neighbors.\n"
+        "  Fills the intensity image; points stay in place.");
+      if (livox_mode == 2) {
+        ImGui::SetNextItemWidth(120);
+        ImGui::DragFloat("kNN radius (m)##livox", &livox_interp_radius_m, 0.05f, 0.05f, 2.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Radius within which non-zero neighbors are averaged.");
+      }
+
+      ImGui::Separator();
+      if (livox_running) {
+        ImGui::TextColored(ImVec4(1, 1, 0, 1), "%s", livox_status.c_str());
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.25f, 0.25f, 1.0f));
+        if (ImGui::Button(livox_cancel_requested ? "Stopping...##lv" : "Stop##lv")) livox_cancel_requested = true;
+        ImGui::PopStyleColor();
+        ImGui::End();
+        return;
+      }
+
+      // ---- Preview on visible chunk ----
+      if (ImGui::Button("Preview")) {
+        livox_running = true; livox_cancel_requested = false;
+        livox_status = "Loading frames near view center...";
+        const int mode = livox_mode; const float radius = livox_interp_radius_m;
+        livox_preview_data.clear();
+        livox_preview_frame_dirs.clear();
+        std::thread([this, mode, radius] {
+          auto vw = guik::LightViewer::instance();
+          const Eigen::Matrix4f vm = vw->view_matrix();
+          const Eigen::Vector3f cam_pos = -(vm.block<3, 3>(0, 0).transpose() * vm.block<3, 1>(0, 3));
+          if (!trajectory_built) build_trajectory();
+          double min_d = 1e9; size_t best = 0;
+          for (size_t k = 0; k < trajectory_data.size(); k++) {
+            const double d = (trajectory_data[k].pose.translation().cast<float>() - cam_pos).cast<double>().norm();
+            if (d < min_d) { min_d = d; best = k; }
+          }
+          const Eigen::Vector3d c = trajectory_data[best].pose.translation();
+          const size_t next = std::min(best + 1, trajectory_data.size() - 1);
+          Eigen::Vector3d fwd = trajectory_data[next].pose.translation() - c;
+          fwd.z() = 0; if (fwd.norm() < 0.01) fwd = Eigen::Vector3d::UnitX(); else fwd.normalize();
+          const Eigen::Vector3d up = Eigen::Vector3d::UnitZ(), right = fwd.cross(up).normalized();
+          Eigen::Matrix3d R; R.col(0) = fwd; R.col(1) = right; R.col(2) = up;
+          glim::Chunk chunk{c, R, R.transpose(), 60.0, 50.0};  // 60m half-size chunk
+          const auto chunk_aabb = chunk.world_aabb();
+
+          std::vector<Eigen::Vector3f> kept_pts, removed_pts;
+          std::vector<float> kept_ints, interp_ints;
+          std::vector<uint8_t> kept_was_zero;  // parallel to kept_pts; 1 = was interpolated from zero
+          std::vector<std::string> touched_dirs;
+          size_t total_input = 0, total_zero = 0;
+
+          for (const auto& submap : submaps) {
+            if (livox_cancel_requested) break;
+            if (!submap) continue;
+            if (hidden_sessions.count(submap->session_id)) continue;
+            std::string shd = hd_frames_path;
+            for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+            const Eigen::Isometry3d T0 = submap->frames.front()->T_world_imu;
+            for (const auto& fr : submap->frames) {
+              if (livox_cancel_requested) break;
+              char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+              const std::string fd = shd + "/" + dn;
+              auto fi = glim::frame_info_from_meta(fd,
+                glim::compute_frame_world_pose(submap->T_world_origin, submap->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu));
+              if (fi.num_points == 0 || !chunk_aabb.intersects(fi.world_bbox)) continue;
+              std::vector<Eigen::Vector3f> pts; std::vector<float> ints(fi.num_points, 0.0f), rng;
+              if (!glim::load_bin(fd + "/points.bin", pts, fi.num_points)) continue;
+              glim::load_bin(fd + "/intensities.bin", ints, fi.num_points);
+              glim::load_bin(fd + "/range.bin", rng, fi.num_points);
+              const Eigen::Matrix3f Rf = fi.T_world_lidar.rotation().cast<float>();
+              const Eigen::Vector3f t = fi.T_world_lidar.translation().cast<float>();
+              touched_dirs.push_back(fd);
+
+              // Per-frame processing depending on mode
+              if (mode == 2) {
+                // Build voxel hash of ONLY non-zero-intensity points -- interpolation
+                // must never pick up another zero-intensity neighbor (or zeros would
+                // propagate into the replacement value).
+                const float inv = 1.0f / std::max(0.05f, radius);
+                std::unordered_map<uint64_t, std::vector<int>> vmap;
+                for (int i = 0; i < fi.num_points; i++) {
+                  if (ints[i] == 0.0f) continue;  // EXCLUDE zeros from neighbor set
+                  const int vx = static_cast<int>(std::floor(pts[i].x() * inv));
+                  const int vy = static_cast<int>(std::floor(pts[i].y() * inv));
+                  const int vz = static_cast<int>(std::floor(pts[i].z() * inv));
+                  vmap[glim::voxel_key(vx, vy, vz)].push_back(i);
+                }
+                const float r2 = radius * radius;
+                for (int i = 0; i < fi.num_points; i++) {
+                  if (!rng.empty() && rng[i] < 1.5f) continue;
+                  const Eigen::Vector3f wp = Rf * pts[i] + t;
+                  if (!chunk.contains(wp)) continue;
+                  total_input++;
+                  if (ints[i] != 0.0f) { kept_pts.push_back(wp); kept_ints.push_back(ints[i]); kept_was_zero.push_back(0); continue; }
+                  total_zero++;
+                  // kNN interpolate in FRAME-local space
+                  const int vx = static_cast<int>(std::floor(pts[i].x() * inv));
+                  const int vy = static_cast<int>(std::floor(pts[i].y() * inv));
+                  const int vz = static_cast<int>(std::floor(pts[i].z() * inv));
+                  double sum = 0; int cnt = 0;
+                  for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+                    auto it2 = vmap.find(glim::voxel_key(vx + dx, vy + dy, vz + dz));
+                    if (it2 == vmap.end()) continue;
+                    for (int nj : it2->second) {
+                      if (ints[nj] == 0.0f) continue;  // defensive -- vmap already filtered, but keep explicit
+                      if ((pts[nj] - pts[i]).squaredNorm() > r2) continue;
+                      sum += ints[nj]; cnt++;
+                    }
+                  }
+                  const float new_int = (cnt > 0) ? static_cast<float>(sum / cnt) : 0.0f;
+                  interp_ints.push_back(new_int);
+                  kept_pts.push_back(wp);
+                  kept_ints.push_back(new_int);
+                  kept_was_zero.push_back(1);
+                }
+              } else {
+                for (int i = 0; i < fi.num_points; i++) {
+                  if (!rng.empty() && rng[i] < 1.5f) continue;
+                  const Eigen::Vector3f wp = Rf * pts[i] + t;
+                  if (!chunk.contains(wp)) continue;
+                  total_input++;
+                  const bool is_zero = (ints[i] == 0.0f);
+                  if (is_zero) total_zero++;
+                  if (mode == 0) {
+                    if (is_zero) removed_pts.push_back(wp);
+                    else { kept_pts.push_back(wp); kept_ints.push_back(ints[i]); kept_was_zero.push_back(0); }
+                  } else {  // mode == 1: mark but keep all in preview
+                    if (is_zero) removed_pts.push_back(wp);
+                    else { kept_pts.push_back(wp); kept_ints.push_back(ints[i]); kept_was_zero.push_back(0); }
+                  }
+                }
+              }
+            }
+          }
+
+          // Cache preview data for intensity toggle + Apply filter
+          {
+            std::vector<LivoxPreviewPoint> preview_data;
+            preview_data.reserve(kept_pts.size());
+            for (size_t i = 0; i < kept_pts.size(); i++) {
+              preview_data.push_back({kept_pts[i], kept_ints[i], kept_was_zero[i] != 0});
+            }
+            livox_preview_data = std::move(preview_data);
+            livox_preview_frame_dirs = std::move(touched_dirs);
+            livox_intensity_mode = false;  // reset toggle on new preview
+          }
+
+          // Render
+          vw->invoke([this, mode, kept_pts, removed_pts, kept_ints, total_input, total_zero] {
+            auto v = guik::LightViewer::instance();
+            lod_hide_all_submaps = true; rf_preview_active = true;
+            v->remove_drawable("rf_preview_kept");
+            v->remove_drawable("rf_preview_removed");
+            if (!kept_pts.empty()) {
+              const int n = kept_pts.size();
+              std::vector<Eigen::Vector4d> p4(n);
+              for (int i = 0; i < n; i++) p4[i] = Eigen::Vector4d(kept_pts[i].x(), kept_pts[i].y(), kept_pts[i].z(), 1.0);
+              auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size());
+              cb->add_buffer("intensity", kept_ints);
+              cb->set_colormap_buffer("intensity");
+              v->update_drawable("rf_preview_kept", cb, guik::FlatColor(0.0f, 0.8f, 0.2f, 1.0f));
+            }
+            if (!removed_pts.empty() && mode != 2) {
+              const int n = removed_pts.size();
+              std::vector<Eigen::Vector4d> p4(n);
+              for (int i = 0; i < n; i++) p4[i] = Eigen::Vector4d(removed_pts[i].x(), removed_pts[i].y(), removed_pts[i].z(), 1.0);
+              auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size());
+              v->update_drawable("rf_preview_removed", cb,
+                guik::FlatColor(mode == 0 ? 1.0f : 0.9f, mode == 0 ? 0.0f : 0.4f, mode == 0 ? 0.0f : 0.1f, 0.7f).make_transparent());
+            }
+          });
+          char buf[192]; std::snprintf(buf, sizeof(buf), "Preview: %zu points in chunk, %zu had intensity 0 (%.1f%%)",
+            total_input, total_zero, total_input > 0 ? 100.0 * total_zero / total_input : 0.0);
+          livox_status = buf;
+          logger->info("[Livox] {}", livox_status);
+          livox_running = false;
+        }).detach();
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Preview the filter on the chunk around the current camera center.\n"
+        "Green = kept (after filter), red/orange = intensity-0 (removed / flagged).");
+
+      ImGui::SameLine();
+      if (ImGui::Button("Apply filter##lv")) {
+        // In-memory only -- hide the removed drawable so the preview shows the post-filter result.
+        // Zero disk writes. To commit, use "Apply to all HD" below.
+        auto v = guik::LightViewer::instance();
+        v->remove_drawable("rf_preview_removed");
+        livox_status = "Preview now showing post-filter result (removed points hidden).";
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Hide the red/orange (removed/flagged) points from the preview so you see what the\n"
+        "post-filter cloud would look like. IN-MEMORY ONLY -- no disk writes.\n"
+        "Use 'Apply to all HD' below to commit the filter to disk.");
+
+      ImGui::SameLine();
+      if (ImGui::Button("Intensity##lv")) {
+        livox_intensity_mode = !livox_intensity_mode;
+        auto v = guik::LightViewer::instance();
+        auto drawable = v->find_drawable("rf_preview_kept");
+        if (drawable.first) {
+          if (livox_intensity_mode) {
+            float imn = std::numeric_limits<float>::max(), imx = std::numeric_limits<float>::lowest();
+            for (const auto& p : livox_preview_data) { imn = std::min(imn, p.intensity); imx = std::max(imx, p.intensity); }
+            if (imn >= imx) { imn = 0.0f; imx = 255.0f; }
+            v->shader_setting().add<Eigen::Vector2f>("cmap_range", Eigen::Vector2f(imn, imx));
+            drawable.first->set_color_mode(guik::ColorMode::VERTEX_COLORMAP);
+          } else {
+            drawable.first->set_color_mode(guik::ColorMode::FLAT_COLOR);
+          }
+        }
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Toggle between flat green and intensity colormap on the kept preview points.\n"
+        "Use this to see the effect of interpolation (Mode 2) or just inspect intensity distribution.");
+
+      ImGui::SameLine();
+      if (ImGui::Button("Clear preview##lv")) {
+        auto v = guik::LightViewer::instance();
+        v->remove_drawable("rf_preview_kept");
+        v->remove_drawable("rf_preview_removed");
+        rf_preview_active = false;
+        livox_intensity_mode = false;
+        livox_preview_data.clear();
+        livox_preview_frame_dirs.clear();
+        lod_hide_all_submaps = false;
+        livox_status.clear();
+      }
+
+      ImGui::Separator();
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.3f, 0.2f, 1.0f));
+      if (ImGui::Button("Apply to all HD (destructive)")) {
+        if (pfd::message("Confirm Apply",
+            "This will modify HD frames on disk:\n"
+            "  Mode 0: delete intensity-0 points in points.bin + all parallel .bin files\n"
+            "  Mode 1: write aux_second_return.bin per frame (no existing data altered)\n"
+            "  Mode 2: overwrite intensities.bin with kNN-interpolated values\n\n"
+            "Backup first! Proceed?",
+            pfd::choice::ok_cancel, pfd::icon::warning).result() == pfd::button::ok) {
+          livox_running = true; livox_cancel_requested = false;
+          livox_status = "Applying to all HD frames...";
+          const int mode = livox_mode; const float radius = livox_interp_radius_m;
+          std::thread([this, mode, radius] {
+            const auto start_time = std::chrono::steady_clock::now();
+            int frames_touched = 0;
+            size_t total_zero = 0, total_pts = 0;
+
+            for (const auto& submap : submaps) {
+              if (livox_cancel_requested) break;
+              if (!submap) continue;
+              if (hidden_sessions.count(submap->session_id)) continue;
+              std::string shd = hd_frames_path;
+              for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+              for (const auto& fr : submap->frames) {
+                if (livox_cancel_requested) break;
+                char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                const std::string fd = shd + "/" + dn;
+                const std::string meta = fd + "/frame_meta.json";
+                if (!boost::filesystem::exists(meta)) continue;
+                std::ifstream ifs(meta);
+                const auto j = nlohmann::json::parse(ifs, nullptr, false);
+                if (j.is_discarded()) continue;
+                const int np = j.value("num_points", 0);
+                if (np == 0) continue;
+
+                std::vector<float> ints(np, 0.0f);
+                if (!glim::load_bin(fd + "/intensities.bin", ints, np)) continue;
+
+                if (mode == 0) {
+                  // Delete: compute kept indices, rewrite all .bin files
+                  std::vector<int> kept;
+                  kept.reserve(np);
+                  for (int i = 0; i < np; i++) if (ints[i] != 0.0f) kept.push_back(i);
+                  const int new_count = static_cast<int>(kept.size());
+                  total_zero += (np - new_count);
+                  total_pts += np;
+                  if (new_count == np) continue;  // nothing to delete
+                  glim::filter_bin_file(fd + "/points.bin",      sizeof(Eigen::Vector3f), np, kept, new_count);
+                  glim::filter_bin_file(fd + "/intensities.bin", sizeof(float),           np, kept, new_count);
+                  glim::filter_bin_file(fd + "/range.bin",       sizeof(float),           np, kept, new_count);
+                  glim::filter_bin_file(fd + "/times.bin",       sizeof(float),           np, kept, new_count);
+                  glim::filter_bin_file(fd + "/normals.bin",     sizeof(Eigen::Vector3f), np, kept, new_count);
+                  glim::filter_bin_file(fd + "/aux_ground.bin",  sizeof(float),           np, kept, new_count);
+                  glim::filter_bin_file(fd + "/aux_rgb.bin",     sizeof(Eigen::Vector3f), np, kept, new_count);
+                  // Update frame_meta.json num_points
+                  nlohmann::json jm = j; jm["num_points"] = new_count;
+                  std::ofstream om(meta); om << jm.dump(2);
+                  frames_touched++;
+                } else if (mode == 1) {
+                  // Mark 2nd rebound: write aux_second_return.bin (float 0/1 per point)
+                  std::vector<float> sec(np, 0.0f);
+                  size_t z = 0;
+                  for (int i = 0; i < np; i++) { if (ints[i] == 0.0f) { sec[i] = 1.0f; z++; } }
+                  std::ofstream f(fd + "/aux_second_return.bin", std::ios::binary);
+                  if (f) { f.write(reinterpret_cast<const char*>(sec.data()), sizeof(float) * np); }
+                  total_zero += z; total_pts += np;
+                  frames_touched++;
+                } else {
+                  // Interpolate: in-frame kNN replace of intensity-0 values
+                  std::vector<Eigen::Vector3f> pts;
+                  if (!glim::load_bin(fd + "/points.bin", pts, np)) continue;
+                  const float inv = 1.0f / std::max(0.05f, radius);
+                  std::unordered_map<uint64_t, std::vector<int>> vmap;
+                  for (int i = 0; i < np; i++) {
+                    if (ints[i] == 0.0f) continue;
+                    const int vx = static_cast<int>(std::floor(pts[i].x() * inv));
+                    const int vy = static_cast<int>(std::floor(pts[i].y() * inv));
+                    const int vz = static_cast<int>(std::floor(pts[i].z() * inv));
+                    vmap[glim::voxel_key(vx, vy, vz)].push_back(i);
+                  }
+                  const float r2 = radius * radius;
+                  size_t z = 0, filled = 0;
+                  for (int i = 0; i < np; i++) {
+                    if (ints[i] != 0.0f) continue;
+                    z++;
+                    const int vx = static_cast<int>(std::floor(pts[i].x() * inv));
+                    const int vy = static_cast<int>(std::floor(pts[i].y() * inv));
+                    const int vz = static_cast<int>(std::floor(pts[i].z() * inv));
+                    double sum = 0; int cnt = 0;
+                    for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+                      auto it2 = vmap.find(glim::voxel_key(vx + dx, vy + dy, vz + dz));
+                      if (it2 == vmap.end()) continue;
+                      for (int nj : it2->second) {
+                        if (ints[nj] == 0.0f) continue;  // defensive -- vmap already filtered, but keep explicit
+                        if ((pts[nj] - pts[i]).squaredNorm() > r2) continue;
+                        sum += ints[nj]; cnt++;
+                      }
+                    }
+                    if (cnt > 0) { ints[i] = static_cast<float>(sum / cnt); filled++; }
+                  }
+                  std::ofstream f(fd + "/intensities.bin", std::ios::binary);
+                  f.write(reinterpret_cast<const char*>(ints.data()), sizeof(float) * np);
+                  total_zero += z; total_pts += np;
+                  frames_touched++;
+                }
+                if (frames_touched % 25 == 0) {
+                  char b[128]; std::snprintf(b, sizeof(b), "Processed %d frames (%zu/%zu pts zero)...", frames_touched, total_zero, total_pts);
+                  livox_status = b;
+                }
+              }
+            }
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+            char buf[192]; std::snprintf(buf, sizeof(buf), "Done: %d frames, %zu/%zu pts zero (%.1f%%), %.1f sec",
+              frames_touched, total_zero, total_pts, total_pts > 0 ? 100.0 * total_zero / total_pts : 0.0, elapsed);
+            livox_status = buf;
+            logger->info("[Livox] {}", livox_status);
+            livox_running = false;
+          }).detach();
+        }
+      }
+      ImGui::PopStyleColor();
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Apply to all HD frames in place. DESTRUCTIVE for Mode 0 (shrinks .bin files)\n"
+        "and Mode 2 (overwrites intensities.bin). Mode 1 is purely additive.\n"
+        "Backup HD frames first (Tools -> Utils -> Backup HD frames).");
+
+      if (!livox_status.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", livox_status.c_str());
+      }
+    }
+    ImGui::End();
+  });
+
+  // Batch processor window -- queue + reorder + run
+  viewer->register_ui_callback("batch_process_window", [this] {
+    if (!show_batch_window) return;
+    ImGui::SetNextWindowSize(ImVec2(480, 420), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Batch Process", &show_batch_window)) {
+      ImGui::TextDisabled("Queue apply-to-HD tasks. Each runs with current UI defaults.");
+      ImGui::Separator();
+
+      // Tool dropdown + Add button
+      static const char* tool_names[] = {
+        "SOR",
+        "Range filter",
+        "Dynamic (MapCleaner)",
+        "Scalar filter",
+        "Voxelize HD",
+        "Livox: Delete intensity 0",
+        "Livox: Mark 2nd return",
+        "Livox: Interpolate",
+      };
+      ImGui::SetNextItemWidth(260);
+      ImGui::Combo("##batchtool", &batch_selected_tool, tool_names, IM_ARRAYSIZE(tool_names));
+      ImGui::SameLine();
+      if (ImGui::Button("Add task##batch")) {
+        batch_queue.push_back(static_cast<BatchTool>(batch_selected_tool));
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Append the selected tool to the queue.");
+
+      ImGui::Separator();
+
+      // Queue table
+      if (batch_queue.empty()) {
+        ImGui::TextDisabled("Queue is empty. Select a tool and click 'Add task'.");
+      } else if (ImGui::BeginTable("##batchqueue", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInner | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("#", 0, 30.0f);
+        ImGui::TableSetupColumn("Tool", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Move", 0, 70.0f);
+        ImGui::TableSetupColumn("", 0, 60.0f);
+        ImGui::TableHeadersRow();
+        int to_remove = -1;
+        int move_from = -1, move_to = -1;
+        for (int i = 0; i < static_cast<int>(batch_queue.size()); i++) {
+          ImGui::TableNextRow();
+          if (batch_running && i == batch_current_task) {
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(70, 90, 40, 180));
+          }
+          ImGui::TableSetColumnIndex(0); ImGui::Text("%d", i + 1);
+          ImGui::TableSetColumnIndex(1);
+          ImGui::TextUnformatted(tool_names[static_cast<int>(batch_queue[i])]);
+          ImGui::TableSetColumnIndex(2);
+          ImGui::PushID(i);
+          if (i > 0) {
+            if (ImGui::SmallButton("^")) { move_from = i; move_to = i - 1; }
+          } else {
+            ImGui::TextDisabled(" ");
+          }
+          ImGui::SameLine();
+          if (i < static_cast<int>(batch_queue.size()) - 1) {
+            if (ImGui::SmallButton("v")) { move_from = i; move_to = i + 1; }
+          } else {
+            ImGui::TextDisabled(" ");
+          }
+          ImGui::TableSetColumnIndex(3);
+          if (ImGui::SmallButton("X##rm")) { to_remove = i; }
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (move_from >= 0 && move_to >= 0 && !batch_running) {
+          std::swap(batch_queue[move_from], batch_queue[move_to]);
+        }
+        if (to_remove >= 0 && !batch_running) {
+          batch_queue.erase(batch_queue.begin() + to_remove);
+        }
+      }
+
+      ImGui::Separator();
+
+      if (batch_running) {
+        ImGui::TextColored(ImVec4(1, 1, 0, 1), "Running [%d/%zu]: %s",
+          batch_current_task + 1, batch_queue.size(), batch_status.c_str());
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.25f, 0.25f, 1.0f));
+        if (ImGui::Button(batch_cancel_requested ? "Stopping...##bt" : "Stop##bt")) {
+          batch_cancel_requested = true;
+        }
+        ImGui::PopStyleColor();
+      } else {
+        const bool can_run = !batch_queue.empty();
+        if (!can_run) ImGui::BeginDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.25f, 1.0f));
+        if (ImGui::Button("Run batch")) {
+          if (pfd::message("Confirm Batch Run",
+              "Execute the queued tasks in order, each with current UI defaults?\n\n"
+              "Several of these modify HD frames on disk. Backup first.",
+              pfd::choice::ok_cancel, pfd::icon::warning).result() == pfd::button::ok) {
+            batch_running = true;
+            batch_cancel_requested = false;
+            batch_current_task = 0;
+            batch_status = "Starting...";
+            std::thread([this] {
+              for (size_t i = 0; i < batch_queue.size(); i++) {
+                if (batch_cancel_requested) break;
+                batch_current_task = static_cast<int>(i);
+                const BatchTool t = batch_queue[i];
+                char buf[96]; std::snprintf(buf, sizeof(buf), "[%zu/%zu] tool=%d", i + 1, batch_queue.size(), static_cast<int>(t));
+                batch_status = buf;
+                logger->info("[Batch] {}", batch_status);
+
+                switch (t) {
+                  case BatchTool::LivoxDelete0:
+                  case BatchTool::LivoxMark2ndReturn:
+                  case BatchTool::LivoxInterpolate: {
+                    const int mode = (t == BatchTool::LivoxDelete0) ? 0 : (t == BatchTool::LivoxMark2ndReturn) ? 1 : 2;
+                    const float radius = livox_interp_radius_m;
+                    size_t total_zero = 0, total_pts = 0; int frames_touched = 0;
+                    for (const auto& submap : submaps) {
+                      if (batch_cancel_requested) break;
+                      if (!submap) continue;
+                      if (hidden_sessions.count(submap->session_id)) continue;
+                      std::string shd = hd_frames_path;
+                      for (const auto& s : sessions) { if (s.id == submap->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+                      for (const auto& fr : submap->frames) {
+                        if (batch_cancel_requested) break;
+                        char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                        const std::string fd = shd + "/" + dn;
+                        const std::string meta = fd + "/frame_meta.json";
+                        if (!boost::filesystem::exists(meta)) continue;
+                        std::ifstream ifs(meta);
+                        const auto j = nlohmann::json::parse(ifs, nullptr, false);
+                        if (j.is_discarded()) continue;
+                        const int np = j.value("num_points", 0);
+                        if (np == 0) continue;
+                        std::vector<float> ints(np, 0.0f);
+                        if (!glim::load_bin(fd + "/intensities.bin", ints, np)) continue;
+                        if (mode == 0) {
+                          std::vector<int> kept; kept.reserve(np);
+                          for (int k = 0; k < np; k++) if (ints[k] != 0.0f) kept.push_back(k);
+                          const int nc = static_cast<int>(kept.size());
+                          total_zero += (np - nc); total_pts += np;
+                          if (nc == np) continue;
+                          glim::filter_bin_file(fd + "/points.bin",      sizeof(Eigen::Vector3f), np, kept, nc);
+                          glim::filter_bin_file(fd + "/intensities.bin", sizeof(float),           np, kept, nc);
+                          glim::filter_bin_file(fd + "/range.bin",       sizeof(float),           np, kept, nc);
+                          glim::filter_bin_file(fd + "/times.bin",       sizeof(float),           np, kept, nc);
+                          glim::filter_bin_file(fd + "/normals.bin",     sizeof(Eigen::Vector3f), np, kept, nc);
+                          glim::filter_bin_file(fd + "/aux_ground.bin",  sizeof(float),           np, kept, nc);
+                          glim::filter_bin_file(fd + "/aux_rgb.bin",     sizeof(Eigen::Vector3f), np, kept, nc);
+                          nlohmann::json jm = j; jm["num_points"] = nc;
+                          std::ofstream om(meta); om << jm.dump(2);
+                          frames_touched++;
+                        } else if (mode == 1) {
+                          std::vector<float> sec(np, 0.0f); size_t z = 0;
+                          for (int k = 0; k < np; k++) if (ints[k] == 0.0f) { sec[k] = 1.0f; z++; }
+                          std::ofstream f(fd + "/aux_second_return.bin", std::ios::binary);
+                          if (f) f.write(reinterpret_cast<const char*>(sec.data()), sizeof(float) * np);
+                          total_zero += z; total_pts += np; frames_touched++;
+                        } else {
+                          std::vector<Eigen::Vector3f> pts;
+                          if (!glim::load_bin(fd + "/points.bin", pts, np)) continue;
+                          const float inv = 1.0f / std::max(0.05f, radius);
+                          std::unordered_map<uint64_t, std::vector<int>> vmap;
+                          for (int k = 0; k < np; k++) {
+                            if (ints[k] == 0.0f) continue;
+                            const int vx = static_cast<int>(std::floor(pts[k].x() * inv));
+                            const int vy = static_cast<int>(std::floor(pts[k].y() * inv));
+                            const int vz = static_cast<int>(std::floor(pts[k].z() * inv));
+                            vmap[glim::voxel_key(vx, vy, vz)].push_back(k);
+                          }
+                          const float r2 = radius * radius; size_t z = 0;
+                          for (int k = 0; k < np; k++) {
+                            if (ints[k] != 0.0f) continue;
+                            z++;
+                            const int vx = static_cast<int>(std::floor(pts[k].x() * inv));
+                            const int vy = static_cast<int>(std::floor(pts[k].y() * inv));
+                            const int vz = static_cast<int>(std::floor(pts[k].z() * inv));
+                            double sum = 0; int cnt = 0;
+                            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+                              auto it2 = vmap.find(glim::voxel_key(vx + dx, vy + dy, vz + dz));
+                              if (it2 == vmap.end()) continue;
+                              for (int nj : it2->second) {
+                                if (ints[nj] == 0.0f) continue;
+                                if ((pts[nj] - pts[k]).squaredNorm() > r2) continue;
+                                sum += ints[nj]; cnt++;
+                              }
+                            }
+                            if (cnt > 0) ints[k] = static_cast<float>(sum / cnt);
+                          }
+                          std::ofstream f(fd + "/intensities.bin", std::ios::binary);
+                          f.write(reinterpret_cast<const char*>(ints.data()), sizeof(float) * np);
+                          total_zero += z; total_pts += np; frames_touched++;
+                        }
+                        if (frames_touched % 50 == 0) {
+                          char b[160]; std::snprintf(b, sizeof(b),
+                            "[%zu/%zu] Livox mode %d: %d frames, %zu/%zu zero",
+                            i + 1, batch_queue.size(), mode, frames_touched, total_zero, total_pts);
+                          batch_status = b;
+                        }
+                      }
+                    }
+                    logger->info("[Batch] Livox mode {}: {} frames touched, {}/{} pts zero", mode, frames_touched, total_zero, total_pts);
+                    break;
+                  }
+                  case BatchTool::SOR:
+                  case BatchTool::Range:
+                  case BatchTool::Dynamic:
+                  case BatchTool::Scalar:
+                  case BatchTool::Voxelize: {
+                    logger->warn("[Batch] Tool {} not yet wired for batch -- skipping. TODO: extract apply-to-HD body into a member function.", static_cast<int>(t));
+                    // NOTE for Dynamic when wired: batch runs on raw datasets, so pass
+                    // "recompute ground" semantics (not "reuse aux_ground.bin") -- the UI prompt
+                    // the user sees interactively should be bypassed and default to recompute.
+                    batch_status = std::string(tool_names[static_cast<int>(t)]) + ": NOT WIRED yet, skipped";
+                    break;
+                  }
+                }
+              }
+              batch_running = false;
+              batch_status = batch_cancel_requested ? "Cancelled." : "Batch complete.";
+              logger->info("[Batch] {}", batch_status);
+            }).detach();
+          }
+        }
+        ImGui::PopStyleColor();
+        if (!can_run) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Clear queue##bt")) batch_queue.clear();
+      }
+
+      if (!batch_status.empty()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Status: %s", batch_status.c_str());
+      }
+
+      ImGui::Separator();
+      ImGui::TextDisabled(
+        "Wired tools: Livox modes (Delete / Mark / Interpolate).\n"
+        "Stubbed: SOR / Range / Dynamic / Scalar / Voxelize -- logged as skipped.\n"
+        "Extraction of those tools into batch-callable functions is a follow-up.");
+    }
+    ImGui::End();
+  });
+
   viewer->register_ui_callback("trail_config_window", [this] {
     if (!show_trail_config) return;
     ImGui::SetNextWindowSize(ImVec2(250, 0), ImGuiCond_FirstUseEver);
@@ -1301,7 +2805,7 @@ void OfflineViewer::setup_ui() {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum trail extent in longest axis.");
       ImGui::DragFloat("Min aspect ratio", &df_trail_min_aspect, 0.5f, 1.0f, 20.0f, "%.1f");
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum longest/shortest axis ratio.\nTrails are elongated (>3).");
-      ImGui::DragFloat("Min density (pts/m³)", &df_trail_min_density, 1.0f, 1.0f, 500.0f, "%.0f");
+      ImGui::DragFloat("Min density (pts/m^3)", &df_trail_min_density, 1.0f, 1.0f, 500.0f, "%.0f");
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum point density in occupied voxels.");
     }
     ImGui::End();
@@ -1351,6 +2855,11 @@ void OfflineViewer::setup_ui() {
           align_last_submap_id = -1;  // force submap point cache refresh
           align_show = true;
         }
+        if (ImGui::MenuItem("Auto-calibrate from this camera")) {
+          ac_cam_src = src_idx;
+          ac_cam_idx = frame_idx;
+          ac_show = true;
+        }
         if (ImGui::MenuItem("Colorize from this camera")) {
           colorize_last_cam_src = src_idx; colorize_last_cam_idx = frame_idx; colorize_last_submap = -1;
           // Highlight this camera in yellow
@@ -1365,19 +2874,9 @@ void OfflineViewer::setup_ui() {
                 Eigen::Vector4i(static_cast<int>(PickType::CAMERA), src_idx, 0, frame_idx)));
           }
           if (frame.located && frame.timestamp > 0.0) {
-            // Find submap by timestamp — the submap whose frames bracket the camera's time
+            // Find submap by timestamp -- bracket match, else nearest boundary.
             const double cam_time = frame.timestamp + image_sources[src_idx].time_shift;
-            int best_sm = -1; double best_dt = 1e9;
-            for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
-              if (!submaps[si] || submaps[si]->frames.empty()) continue;
-              const double t_first = submaps[si]->frames.front()->stamp;
-              const double t_last = submaps[si]->frames.back()->stamp;
-              // Camera time within submap's time range → perfect match
-              if (cam_time >= t_first && cam_time <= t_last) { best_sm = si; break; }
-              // Otherwise find closest boundary
-              const double dt = std::min(std::abs(cam_time - t_first), std::abs(cam_time - t_last));
-              if (dt < best_dt) { best_dt = dt; best_sm = si; }
-            }
+            const int best_sm = find_submap_for_timestamp(submaps, cam_time);
             if (best_sm >= 0) {
               logger->info("[Colorize] Projecting from camera {} onto submap {}", fname, best_sm);
               // Ensure mask is loaded
@@ -1426,28 +2925,16 @@ void OfflineViewer::setup_ui() {
                 logger->info("[Colorize] Loaded {} points from {} nearby frames", world_pts.size(), max_frames);
               }
               if (!world_pts.empty()) {
-                std::vector<CameraFrame> cams = {frame};
-                auto cr = Colorizer::project_colors(cams, image_sources[src_idx].intrinsics, world_pts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
-                logger->info("[Colorize] {} / {} points colored", cr.colored, cr.total);
+                // Expand spherical cams to 6 virtual cube-face pinhole cams.
+                // No-op for pinhole sources.
+                const auto& rc_src = image_sources[src_idx];
+                const auto& rc_cp  = rc_src.params;
+                auto expanded = expand_source_cams_for_projection(rc_src, {frame}, colorize_mask);
+                auto cr = make_colorizer(rc_cp.view_selector_mode)->project(expanded.cams, expanded.intrinsics, world_pts, ints, std::vector<Eigen::Vector3f>{}, std::vector<double>{}, current_blend_params(rc_src));
+                logger->info("[Colorize] {} / {} points colored (cams={})", cr.colored, cr.total, expanded.cams.size());
                 colorize_last_result = cr;
                 { auto vw = guik::LightViewer::instance(); lod_hide_all_submaps = true;
-                  const size_t n = cr.points.size();
-                  float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
-                  for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
-                  if (imin >= imax) { imin = 0; imax = 255; }
-                  std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
-                  for (size_t i = 0; i < n; i++) {
-                    p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
-                    Eigen::Vector3f rgb = cr.colors[i];
-                    if (colorize_intensity_blend && i < cr.intensities.size()) {
-                      float inv = (cr.intensities[i] - imin) / (imax - imin);
-                      if (colorize_nonlinear_int) inv = std::sqrt(inv);
-                      rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
-                    }
-                    c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
-                  }
-                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
-                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+                  push_colorize_preview_drawable(vw, cr, rc_cp); }
               }
             }
           }
@@ -1511,7 +2998,7 @@ void OfflineViewer::setup_ui() {
       }
     }
 
-    // Submap right-click — add colorize option
+    // Submap right-click -- add colorize option
     if (type == PickType::FRAME && !image_sources.empty()) {
       const int submap_id = right_clicked_info[3];
       if (submap_id >= 0 && submap_id < static_cast<int>(submaps.size()) && submaps[submap_id]) {
@@ -1519,16 +3006,29 @@ void OfflineViewer::setup_ui() {
         if (ImGui::MenuItem("Colorize submap")) {
           colorize_last_submap = submap_id; colorize_last_cam_src = -1; colorize_last_cam_idx = -1;
           const auto& sm = submaps[submap_id];
-          // Select cameras by timestamp — those within the submap's time range + margin
+          // Select cameras by timestamp -- those within the submap's time range + margin
           const double t_first = sm->frames.front()->stamp;
           const double t_last = sm->frames.back()->stamp;
           const double t_margin = 1.0;  // 1 second before/after submap time range
           std::vector<CameraFrame> nearby_cams;
-          for (auto& src : image_sources) {
-            for (auto& cam : src.frames) {
+          // ALWAYS restrict to the active source, regardless of camera_type.
+          // project() takes a single intrinsics + camera_type assumption; mixing
+          // e.g. a Pinhole source with a Spherical one's cams in the same call
+          // re-projects the Spherical cams with pinhole math -> broken output.
+          // When we eventually support mixed-type blends we'll route each cam
+          // through its source's own expand/intrinsics/mask here.
+          {
+            auto& src_i = image_sources[colorize_source_idx];
+            for (auto& cam : src_i.frames) {
               if (!cam.located || cam.timestamp <= 0.0) continue;
-              const double cam_t = cam.timestamp + src.time_shift;
-              if (cam_t >= t_first - t_margin && cam_t <= t_last + t_margin) nearby_cams.push_back(cam);
+              const double cam_t = cam.timestamp + effective_time_shift(src_i, cam.timestamp);
+              if (cam_t >= t_first - t_margin && cam_t <= t_last + t_margin) {
+                // Pre-shift .timestamp into LiDAR time so downstream time-slice compares
+                // against world_point_times (also LiDAR-frame gps_time) consistently.
+                CameraFrame shifted = cam;
+                shifted.timestamp = cam_t;
+                nearby_cams.push_back(std::move(shifted));
+              }
             }
           }
           logger->info("[Colorize] Submap {}: {} cameras (t={:.1f}-{:.1f}s, margin={:.1f}s)",
@@ -1545,33 +3045,32 @@ void OfflineViewer::setup_ui() {
             auto hd = load_hd_for_submap(submap_id, false);
             if (hd && hd->size() > 0) {
               const Eigen::Isometry3d T_wo = sm->T_world_origin;
+              const Eigen::Matrix3d R_wo = T_wo.rotation();
               std::vector<Eigen::Vector3f> world_pts(hd->size());
               std::vector<float> ints(hd->size(), 0.0f);
+              std::vector<Eigen::Vector3f> world_normals;
+              std::vector<double> world_times;
+              if (hd->normals) world_normals.resize(hd->size());
+              if (hd->times)   world_times.assign(hd->times, hd->times + hd->size());
               for (size_t i = 0; i < hd->size(); i++) {
                 world_pts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
                 if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                if (hd->normals)     world_normals[i] = (R_wo * Eigen::Vector3d(hd->normals[i].head<3>())).normalized().cast<float>();
               }
               logger->info("[Colorize] Mask status: empty={}, size={}x{}", colorize_mask.empty(), colorize_mask.cols, colorize_mask.rows);
-              auto cr = Colorizer::project_colors(nearby_cams, image_sources[colorize_source_idx].intrinsics, world_pts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
-              logger->info("[Colorize] {} / {} points colored from {} cameras", cr.colored, cr.total, nearby_cams.size());
+              // Spherical sources: expand each nearby cam to 6 virtual cube faces.
+              const auto& sm_src = image_sources[colorize_source_idx];
+              const auto& sm_cp  = sm_src.params;
+              auto expanded = expand_source_cams_for_projection(sm_src, nearby_cams, colorize_mask);
+              auto cr = make_colorizer(sm_cp.view_selector_mode)->project(expanded.cams, expanded.intrinsics, world_pts, ints, world_normals, world_times, current_blend_params(sm_src));
+              logger->info("[Colorize] {} / {} points colored from {} cameras ({} virtual)",
+                cr.colored, cr.total, nearby_cams.size(), expanded.cams.size());
               colorize_last_result = cr;
               { auto vw = guik::LightViewer::instance(); lod_hide_all_submaps = true;
-                const size_t n = cr.points.size();
-                float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
-                for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
-                if (imin >= imax) { imin = 0; imax = 255; }
-                std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
-                for (size_t i = 0; i < n; i++) {
-                  p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
-                  Eigen::Vector3f rgb = cr.colors[i];
-                  if (colorize_intensity_blend && i < cr.intensities.size()) {
-                    const float inv = (cr.intensities[i] - imin) / (imax - imin);
-                    rgb = rgb * (1.0f - colorize_intensity_mix) + Eigen::Vector3f(inv, inv, inv) * colorize_intensity_mix;
-                  }
-                  c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
-                }
-                auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
-                vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+                // Grayscale intensity ramp here is a legacy behavior of the
+                // right-click per-submap preview -- kept for parity, even
+                // though the other previews use intensity_to_color().
+                push_colorize_preview_drawable(vw, cr, sm_cp, /*use_grayscale_intensity=*/true); }
             }
           }
         }
@@ -1851,9 +3350,9 @@ void OfflineViewer::setup_ui() {
             const auto& cam = src.frames[calib_cam_idx];
             // Get T_world_lidar from trajectory (not from T_world_cam which includes current extrinsic)
             if (!trajectory_built) build_trajectory();
-            std::vector<TimedPose> timed_traj(trajectory_data.size());
-            for (size_t ti = 0; ti < trajectory_data.size(); ti++) timed_traj[ti] = {trajectory_data[ti].stamp, trajectory_data[ti].pose};
-            const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(timed_traj, cam.timestamp + src.time_shift);
+            const auto timed_traj = timed_traj_snapshot();
+            const auto& placement_traj = trajectory_for(src, timed_traj);
+            const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(placement_traj, cam.timestamp + effective_time_shift(src, cam.timestamp));
 
             auto T_lidar_cam_new = Colorizer::solve_extrinsic(pts_3d, pts_2d, src.intrinsics, T_world_lidar);
 
@@ -1957,7 +3456,7 @@ void OfflineViewer::setup_ui() {
           }
         }
 
-        // Sphere size slider — update all existing markers when changed
+        // Sphere size slider -- update all existing markers when changed
         ImGui::SetNextItemWidth(100);
         if (ImGui::SliderFloat("Sphere size", &calib_sphere_size, 0.01f, 0.5f, "%.2f")) {
           auto vw = guik::LightViewer::instance();
@@ -1999,34 +3498,123 @@ void OfflineViewer::setup_ui() {
         }
       }
     } else if (draw_cameras && !prev_cameras) {
-      auto vw = guik::LightViewer::instance();
       for (size_t si = 0; si < image_sources.size(); si++) {
         for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
           if (!image_sources[si].frames[fi].located) continue;
-          const auto& T = image_sources[si].frames[fi].T_world_cam;
-          const Eigen::Vector3f pos = T.translation().cast<float>();
-          const Eigen::Matrix3f R = T.rotation().cast<float>();
-          const Eigen::Vector3f fwd = R.col(0).normalized(), right = R.col(1).normalized(), up = R.col(2).normalized();
-          const float fl = 0.6f, fw = 0.3f, fh = 0.2f;
-          const Eigen::Vector3f bc = pos + fwd * fl;
-          std::vector<Eigen::Vector3f> verts = {
-            pos, bc+right*fw+up*fh, pos, bc-right*fw+up*fh, pos, bc-right*fw-up*fh, pos, bc+right*fw-up*fh,
-            bc+right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw-up*fh,
-            bc-right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw+up*fh
-          };
-          vw->update_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi),
-            std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false),
-            guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
-          Eigen::Affine3f btf = Eigen::Affine3f::Identity(); btf.translate(pos); btf.linear() = R;
-          btf = btf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
-          vw->update_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi),
-            glk::Primitives::cube(),
-            guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, btf).add("info_values",
-              Eigen::Vector4i(static_cast<int>(PickType::CAMERA), static_cast<int>(si), 0, static_cast<int>(fi))));
+          render_camera_gizmo(static_cast<int>(si), static_cast<int>(fi));
         }
       }
     }
     prev_cameras = draw_cameras;
+  });
+
+  // 3D gizmos for time-shift anchors. Each anchor becomes a cyan cone-pin at
+  // the camera's world position at its cam_time (apex down = the anchor's
+  // exact moment, base up = ~40 cm above by default). The row the user has
+  // selected in the Alignment-check anchor table is scaled x10 on Z so it
+  // stands up as a tall pillar -- easy to spot across a long track without
+  // digging through the viewer. Placed in a dedicated callback so it refreshes
+  // every frame (follows trajectory edits, re-sorts, anchor adds/removes).
+  // Alt-trajectory polyline gizmo -- one polyline per source in 'Coords > own
+  // path' mode. Drawable name prefixed with "traj_" so the existing Trajectory
+  // checkbox hides it alongside the SLAM track. Tropical-blue colour makes it
+  // easy to distinguish from the session-coloured SLAM polyline.
+  viewer->register_ui_callback("camera_trajectory_gizmos", [this] {
+    auto vw = guik::LightViewer::instance();
+    static std::unordered_set<std::string> prev_traj_names;
+    std::unordered_set<std::string> live_traj_names;
+    const Eigen::Vector4f tropical(0.0f, 0.85f, 0.85f, 1.0f);
+    for (size_t si = 0; si < image_sources.size(); si++) {
+      const auto& s = image_sources[si];
+      if (s.params.locate_mode != 2 || s.camera_trajectory.size() < 2) continue;
+      std::vector<Eigen::Vector3f> verts;
+      std::vector<Eigen::Vector4f> cols;
+      verts.reserve(s.camera_trajectory.size());
+      cols.reserve(s.camera_trajectory.size());
+      for (const auto& tp : s.camera_trajectory) {
+        verts.emplace_back(tp.pose.translation().cast<float>());
+        cols.push_back(tropical);
+      }
+      auto line = std::make_shared<glk::ThinLines>(verts, cols, true);
+      line->set_line_width(2.0f);
+      const std::string name = "traj_cam_src_" + std::to_string(si);
+      vw->update_drawable(name, line, guik::VertexColor());
+      live_traj_names.insert(name);
+    }
+    // Prune drawables that no longer correspond to a mode-2 source (e.g. user
+    // switched back to Time or removed a source).
+    for (const auto& n : prev_traj_names) {
+      if (!live_traj_names.count(n)) vw->remove_drawable(n);
+    }
+    prev_traj_names = std::move(live_traj_names);
+  });
+
+  viewer->register_ui_callback("anchor_gizmos", [this] {
+    auto vw = guik::LightViewer::instance();
+    // Build timed pose vector once (cheap -- avoids recomputing per anchor).
+    // If the trajectory isn't built yet, skip; the next frame will retry.
+    std::vector<TimedPose> timed_traj;
+    if (trajectory_built && !trajectory_data.empty()) {
+      timed_traj.reserve(trajectory_data.size());
+      for (const auto& rec : trajectory_data) timed_traj.push_back({rec.stamp, rec.pose});
+    }
+    // Track names currently in use so we can prune stale ones (e.g. after
+    // "Clear all" or anchor removal). Using a simple always-prune-then-draw
+    // pattern: remember the max count we've seen and remove above the current.
+    static std::map<int, int> last_anchor_count;  // src_idx -> count drawn last tick
+    for (size_t si = 0; si < image_sources.size(); si++) {
+      const auto& s = image_sources[si];
+      const int prev_n = last_anchor_count[static_cast<int>(si)];
+      for (int k = static_cast<int>(s.anchors.size()); k < prev_n; k++) {
+        vw->remove_drawable("anchor_" + std::to_string(si) + "_" + std::to_string(k));
+      }
+      last_anchor_count[static_cast<int>(si)] = static_cast<int>(s.anchors.size());
+      // Route per-source anchors through the alt trajectory when the source
+      // is in 'Coords > own path' mode. Mode 0/1 falls through to SLAM.
+      const auto& anchor_traj = trajectory_for(s, timed_traj);
+      if (anchor_traj.empty()) continue;  // can't place without a trajectory yet
+      const Eigen::Isometry3d T_lidar_cam = Colorizer::build_extrinsic(s.lever_arm, s.rotation_rpy);
+      for (size_t ai = 0; ai < s.anchors.size(); ai++) {
+        const auto& a = s.anchors[ai];
+        const double ts = a.cam_time + a.time_shift;
+        if (ts < anchor_traj.front().stamp - 2.0 || ts > anchor_traj.back().stamp + 2.0) continue;
+        const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(anchor_traj, ts);
+        const Eigen::Isometry3d T_world_cam   = T_world_lidar * T_lidar_cam;
+        const Eigen::Vector3f world_pos = T_world_cam.translation().cast<float>();
+        // Pin geometry: cone primitive has apex at (0,0,1), base disc at z=0
+        // radius 1. We want apex at anchor world position, base extending up.
+        //   step 1 (innermost): scale(1,1,-1)   -> apex at z=-1, base at z=0
+        //   step 2:            translate(0,0,1) -> apex at z=0,  base at z=1
+        //   step 3:            scale(r,r,h)     -> base at z=h, radius r
+        //   step 4 (outermost): translate(world_pos)
+        const bool is_selected = (align_anchor_selected == static_cast<int>(ai) &&
+                                   align_anchor_selected_src == static_cast<int>(si));
+        // UNIFORM scaling so selection grows the whole cone in every axis (not
+        // just a tall thin pillar) while keeping the tip glued to the anchor's
+        // world position. Tip lives at the "origin" of the transform composition
+        // below (see math in the initial gizmo implementation) so pure scale
+        // here preserves it. Base 2x the previous; selected 5x uniform on top
+        // (~20m tall pin, visibly fat across km-scale scenes).
+        const float base_r = 1.0f;
+        const float base_h = 4.0f;
+        const float sel_mul = 5.0f;
+        const float pin_r = is_selected ? base_r * sel_mul : base_r;
+        const float pin_h = is_selected ? base_h * sel_mul : base_h;
+        Eigen::Affine3f tf = Eigen::Affine3f::Identity();
+        tf.translate(world_pos);
+        tf.scale(Eigen::Vector3f(pin_r, pin_r, pin_h));
+        tf.translate(Eigen::Vector3f(0.0f, 0.0f, 1.0f));
+        tf.scale(Eigen::Vector3f(1.0f, 1.0f, -1.0f));
+        // White, full-alpha for the selected anchor; slightly dimmer off-selected
+        // so the selection stands out against non-selected pins at the same size.
+        const Eigen::Vector4f color = is_selected
+          ? Eigen::Vector4f(1.0f, 1.0f, 1.0f, 1.0f)
+          : Eigen::Vector4f(1.0f, 1.0f, 1.0f, 0.85f);
+        vw->update_drawable("anchor_" + std::to_string(si) + "_" + std::to_string(ai),
+          glk::Primitives::cone(),
+          guik::FlatColor(color.x(), color.y(), color.z(), color.w(), tf));
+      }
+    }
   });
 
   // 3D point picking for calibration (intercepts short left-click when calib is active)
@@ -2080,40 +3668,184 @@ void OfflineViewer::setup_ui() {
   viewer->register_ui_callback("colorize_window", [this] {
     if (!show_colorize_window) return;
     ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Locate Cameras", &show_colorize_window)) {
+    if (ImGui::Begin("Colorize", &show_colorize_window)) {
       if (image_sources.empty()) {
         ImGui::Text("No image sources loaded.\nUse Colorize > Image folder > Add folder...");
       } else {
         // Source selector
         std::vector<const char*> src_names;
         for (const auto& s : image_sources) src_names.push_back(s.name.c_str());
+        static int prev_colorize_source_idx = -1;
         ImGui::Combo("Source", &colorize_source_idx, src_names.data(), src_names.size());
 
         auto& src = image_sources[colorize_source_idx];
+
+        // When the dropdown index changes, reload colorize_mask from the NEW
+        // source's mask_path. Without this, the previous source's mask (e.g.
+        // a 7680x3840 equirect mask) sticks in the shared cv::Mat and gets
+        // applied to the next source (pinhole) -- either failing the size
+        // check or getting resized and used wrongly. ImageSource already owns
+        // mask_path per-entry; this is just syncing the runtime texture with
+        // the active selection.
+        if (prev_colorize_source_idx != colorize_source_idx) {
+          prev_colorize_source_idx = colorize_source_idx;
+          colorize_mask = cv::Mat();
+          if (!src.mask_path.empty() && boost::filesystem::exists(src.mask_path)) {
+            colorize_mask = cv::imread(src.mask_path, cv::IMREAD_UNCHANGED);
+            if (!colorize_mask.empty())
+              logger->info("[Colorize] Swapped to source {} ({}), loaded mask {}",
+                           colorize_source_idx, camera_type_label(src.camera_type), src.mask_path);
+            else
+              logger->warn("[Colorize] Swapped to source {} but mask failed to load: {}",
+                           colorize_source_idx, src.mask_path);
+          } else {
+            logger->info("[Colorize] Swapped to source {} ({}), no mask", colorize_source_idx,
+                         camera_type_label(src.camera_type));
+          }
+          colorize_intrinsics_dirty = true;  // invalidate live-preview cache
+        }
         ImGui::Text("%zu images (%zu located)", src.frames.size(),
           std::count_if(src.frames.begin(), src.frames.end(), [](const CameraFrame& f) { return f.located; }));
 
+        // Camera type. Pinhole uses Brown-Conrady via PinholeIntrinsics.
+        // Spherical = 2:1 equirectangular panorama (Osmo 360 etc); intrinsics
+        // degrade to image dimensions only, no fx/fy/cx/cy/distortion. The
+        // colorize pipeline branches on this at projection time.
+        {
+          int ct = static_cast<int>(src.camera_type);
+          ImGui::SetNextItemWidth(160);
+          if (ImGui::Combo("Camera type", &ct, "Pinhole\0Spherical (equirect)\0")) {
+            src.camera_type = static_cast<CameraType>(ct);
+            colorize_intrinsics_dirty = true;  // force live-preview refresh
+            // Re-render camera gizmos for THIS source so the cube/sphere icon
+            // flips immediately.
+            for (size_t fi = 0; fi < src.frames.size(); fi++) {
+              if (!src.frames[fi].located) continue;
+              render_camera_gizmo(colorize_source_idx, static_cast<int>(fi));
+            }
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Pinhole: standard perspective lens (Facecam Pro etc). Uses fx/fy/cx/cy\n"
+            "         + Brown-Conrady distortion from the Camera Intrinsics block.\n"
+            "Spherical: full 360 equirectangular panorama (Osmo 360, Insta360 etc).\n"
+            "         Image must be 2:1 aspect ratio. Intrinsics are unused --\n"
+            "         focal is derived as f = width/(2*pi).");
+          // Badge showing the active type prominently next to the combo.
+          ImGui::SameLine();
+          if (src.camera_type == CameraType::Spherical) {
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "[Spherical]");
+          } else {
+            ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.55f, 1.0f), "[Pinhole]");
+          }
+        }
+
         ImGui::Separator();
 
-        // Location criteria
-        ImGui::Combo("Criteria", &colorize_locate_mode, "Time\0Coordinates\0");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Time: match image timestamp to trajectory.\nCoordinates: match GPS position to trajectory.");
+        // Location criteria -- stored per source so Pinhole / Spherical can
+        // use different strategies without clobbering each other.
+        const int prev_locate_mode = src.params.locate_mode;
+        ImGui::Combo("Criteria", &src.params.locate_mode,
+                      "Time\0Coords > SLAM\0Coords > own path\0");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "How to place this source's frames in the world.\n"
+          "- Time: interpolate the SLAM trajectory at the frame's timestamp + time_shift.\n"
+          "  Default for time-synced cameras.\n"
+          "- Coords > SLAM: snap each frame's EXIF GPS to the nearest point on the SLAM\n"
+          "  trajectory. Useful when camera timestamps aren't GPS-synced (e.g. GoPro\n"
+          "  with GPS but independent camera clock).\n"
+          "- Coords > own path: build an alternative trajectory from this source's EXIF\n"
+          "  GPS track and interpolate THAT by time. Used for a second-pass GPS+camera\n"
+          "  sweep (different lighting, etc.) over an existing SLAM map -- the source\n"
+          "  rides its own path, not the original capture trajectory.");
+        if (prev_locate_mode != src.params.locate_mode &&
+            src.params.locate_mode == 2 && src.camera_trajectory.empty()) {
+          // Lazy build on first switch to Coords > own path.
+          build_camera_trajectory(src, gnss_utm_zone,
+                                   gnss_utm_easting_origin, gnss_utm_northing_origin,
+                                   gnss_datum_alt);
+          if (src.camera_trajectory.empty()) {
+            logger->warn("[Colorize] Source '{}' has no valid EXIF GPS timestamps; "
+                         "'Coords > own path' will fall back to SLAM until EXIF is present.",
+                         src.name);
+          } else {
+            logger->info("[Colorize] Built alt trajectory for '{}': {} points",
+                         src.name, src.camera_trajectory.size());
+          }
+        }
 
-        // Time shift with +/- step buttons
+        // Time shift with +/- step buttons. Bind InputDouble directly to
+        // src.time_shift (double) so we don't lose precision through float;
+        // 6-decimal display lets the user fine-tune sub-millisecond shifts to
+        // chase sub-frame drift on dense sources (Osmo 360 equirects).
         bool time_changed = false;
-        float ts_f = static_cast<float>(src.time_shift);
-        ImGui::SetNextItemWidth(100);
-        if (ImGui::InputFloat("##ts", &ts_f, 0.0f, 0.0f, "%.3f")) { src.time_shift = ts_f; time_changed = true; }
+        ImGui::SetNextItemWidth(150);
+        if (ImGui::InputDouble("##ts", &src.time_shift, 0.0, 0.0, "%.6f")) time_changed = true;
         ImGui::SameLine();
         if (ImGui::Button("<")) { src.time_shift -= colorize_time_step; time_changed = true; }
         ImGui::SameLine();
         if (ImGui::Button(">")) { src.time_shift += colorize_time_step; time_changed = true; }
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(60);
-        ImGui::InputFloat("step##ts_step", &colorize_time_step, 0.0f, 0.0f, "%.3f");
+        ImGui::SetNextItemWidth(100);
+        ImGui::InputFloat("step##ts_step", &colorize_time_step, 0.0f, 0.0f, "%.6f");
         ImGui::SameLine();
         ImGui::Text("Time shift");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Offset in seconds. Use < > to step.\nAdjust to align camera timing with LiDAR.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Offset in seconds (6 decimal places visible). Use < > to step.\n"
+          "Adjust to align camera timing with LiDAR. For dense sources where\n"
+          "frames drift sub-frame over long tracks, sweep at 1e-4 s or finer.");
+
+        // Anchor panel just below the Time shift widget. Resolution priority for
+        // "Anchor here" cam_time: (1) alignment-check selected frame if on this
+        // source, (2) last live-preview camera on this source, (3) last-colorize
+        // submap center time. If none available, button is disabled.
+        {
+          double anchor_t = 0.0;
+          bool   have_t = false;
+          if (align_cam_src == colorize_source_idx &&
+              align_cam_idx >= 0 &&
+              align_cam_idx < static_cast<int>(src.frames.size()) &&
+              src.frames[align_cam_idx].timestamp > 0.0) {
+            anchor_t = src.frames[align_cam_idx].timestamp; have_t = true;
+          } else if (colorize_last_cam_src == colorize_source_idx &&
+                     colorize_last_cam_idx >= 0 &&
+                     colorize_last_cam_idx < static_cast<int>(src.frames.size()) &&
+                     src.frames[colorize_last_cam_idx].timestamp > 0.0) {
+            anchor_t = src.frames[colorize_last_cam_idx].timestamp; have_t = true;
+          } else if (colorize_last_submap >= 0 &&
+                     colorize_last_submap < static_cast<int>(submaps.size()) &&
+                     submaps[colorize_last_submap] &&
+                     !submaps[colorize_last_submap]->frames.empty()) {
+            // Submap preview: snap to the active source's camera CLOSEST in
+            // LiDAR-time to the submap's center. Using the camera's source-local
+            // cam.timestamp keeps every anchor in the same domain -- lower_bound
+            // in effective_time_shift works across the full anchor list even if
+            // some were placed from single-cam preview and others from submap
+            // preview. Submap LiDAR-frame timestamp itself would be a domain
+            // mismatch since cameras are queried by their own timestamps.
+            const auto& sm_frames = submaps[colorize_last_submap]->frames;
+            const double sm_center = 0.5 * (sm_frames.front()->stamp + sm_frames.back()->stamp);
+            double best_dt = std::numeric_limits<double>::max();
+            int best_fi = -1;
+            for (size_t fi = 0; fi < src.frames.size(); fi++) {
+              const auto& c = src.frames[fi];
+              if (c.timestamp <= 0.0) continue;
+              // Compare on the LiDAR-time side using effective_time_shift so
+              // the match is accurate even when anchors are already defined
+              // for this source (the scalar may be a scratched value).
+              const double ct = c.timestamp + effective_time_shift(src, c.timestamp);
+              const double dt = std::abs(ct - sm_center);
+              if (dt < best_dt) { best_dt = dt; best_fi = static_cast<int>(fi); }
+            }
+            if (best_fi >= 0) {
+              anchor_t = src.frames[best_fi].timestamp;  // source-local
+              have_t = true;
+            }
+          }
+          render_anchor_panel(colorize_source_idx, anchor_t, have_t, "colz");
+        }
+        // Separator between the time-shift group and the extrinsic (lever + rpy)
+        // group -- they're different beasts and benefit from a visual break.
+        ImGui::Separator();
 
         // Lever arm with per-axis step buttons
         bool extrinsic_changed = false;
@@ -2156,186 +3888,214 @@ void OfflineViewer::setup_ui() {
         }
         // Treat extrinsic changes like time changes for live preview
         if (extrinsic_changed) time_changed = true;
+        // Consume persistent intrinsic-dirty flag from previous frame (the
+        // intrinsic input fields live further down in this callback, so their
+        // change signal arrives one frame late -- we pick it up here).
+        if (colorize_intrinsics_dirty) { time_changed = true; colorize_intrinsics_dirty = false; }
 
         // Live preview
         ImGui::Checkbox("Live preview", &colorize_live_preview);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto-update colorize preview when time shift changes.\nUses last colorized camera or submap.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Auto-update the 3D colorize preview when time_shift changes.\n"
+          "Uses the last right-clicked camera or submap.\n"
+          "\n"
+          "When anchors are active on this source, the live preview uses the\n"
+          "SCALAR time_shift (what the widget shows) so drag gives immediate\n"
+          "feedback. 'Anchor here' commits it; Apply / Compute-assignment use\n"
+          "anchor-interpolated values as usual.");
 
         ImGui::Separator();
+
+        // Auto-sync src.time_shift to interpolated value when the live-preview
+        // target cam changes (right-click "Colorize from this camera" on a new
+        // frame). Mirrors the align-check side's auto-sync, so the widget
+        // ALWAYS starts at the correct value for the previewed section before
+        // the user drags. Only when anchors exist (otherwise scalar IS baseline).
+        {
+          static int prev_lp_cam_src = -1;
+          static int prev_lp_cam_idx = -1;
+          if (!src.anchors.empty() &&
+              colorize_last_cam_src == colorize_source_idx &&
+              colorize_last_cam_idx >= 0 &&
+              colorize_last_cam_idx < static_cast<int>(src.frames.size()) &&
+              src.frames[colorize_last_cam_idx].timestamp > 0.0 &&
+              (prev_lp_cam_src != colorize_last_cam_src || prev_lp_cam_idx != colorize_last_cam_idx)) {
+            src.time_shift = effective_time_shift(src, src.frames[colorize_last_cam_idx].timestamp);
+            time_changed = true;  // propagate into live-preview trigger below
+          }
+          prev_lp_cam_src = colorize_last_cam_src;
+          prev_lp_cam_idx = colorize_last_cam_idx;
+        }
 
         // Auto re-colorize on time shift change with live preview
         if (time_changed && colorize_live_preview) {
           if (!trajectory_built) build_trajectory();
-          std::vector<TimedPose> timed_traj(trajectory_data.size());
-          for (size_t i = 0; i < trajectory_data.size(); i++)
-            timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+          const auto timed_traj = timed_traj_snapshot();
 
           // Re-locate only the preview cameras (not all)
           if (colorize_last_cam_src >= 0 && colorize_last_cam_idx >= 0 &&
               colorize_last_cam_src < static_cast<int>(image_sources.size())) {
-            // Single camera preview — re-locate just this camera (apply full extrinsic: lever + RPY)
+            // Single camera preview -- re-locate just this camera (apply full extrinsic: lever + RPY).
+            // Live preview uses the SCALAR src.time_shift (not effective_time_shift)
+            // so that dragging the widget gives immediate 3D feedback even when
+            // anchors are active. Matches the scratch-override model used in the
+            // align-check overlay. Apply / Compute-assignment / non-live paths
+            // still use effective_time_shift and honor anchors.
             auto& cam = image_sources[colorize_last_cam_src].frames[colorize_last_cam_idx];
             if (cam.timestamp > 0.0) {
               const double ts = cam.timestamp + src.time_shift;
-              const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(timed_traj, ts);
+              const auto& placement_traj = trajectory_for(src, timed_traj);
+              const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(placement_traj, ts);
               const Eigen::Isometry3d T_lidar_cam = Colorizer::build_extrinsic(src.lever_arm, src.rotation_rpy);
               cam.T_world_cam = T_world_lidar * T_lidar_cam;
               cam.located = true;
             }
-            // Re-project — find submap by timestamp
+            // Re-project -- find submap by timestamp (bracket, else nearest).
             const double lp_cam_time = cam.timestamp + src.time_shift;
-            int best_sm = -1; double best_dt = 1e9;
-            for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
-              if (!submaps[si] || submaps[si]->frames.empty()) continue;
-              const double t0 = submaps[si]->frames.front()->stamp;
-              const double t1 = submaps[si]->frames.back()->stamp;
-              if (lp_cam_time >= t0 && lp_cam_time <= t1) { best_sm = si; break; }
-              const double dt = std::min(std::abs(lp_cam_time - t0), std::abs(lp_cam_time - t1));
-              if (dt < best_dt) { best_dt = dt; best_sm = si; }
-            }
+            const int best_sm = find_submap_for_timestamp(submaps, lp_cam_time);
             if (best_sm >= 0) {
               auto hd = load_hd_for_submap(best_sm, false);
               if (hd && hd->size() > 0) {
                 const Eigen::Isometry3d T_wo = submaps[best_sm]->T_world_origin;
+                const Eigen::Matrix3d R_wo = T_wo.rotation();
                 std::vector<Eigen::Vector3f> wpts(hd->size()); std::vector<float> ints(hd->size(), 0.0f);
+                std::vector<Eigen::Vector3f> wnor;
+                std::vector<double> wtimes;
+                if (hd->normals) wnor.resize(hd->size());
+                if (hd->times)   wtimes.assign(hd->times, hd->times + hd->size());
                 for (size_t i = 0; i < hd->size(); i++) {
                   wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
                   if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                  if (hd->normals)     wnor[i] = (R_wo * Eigen::Vector3d(hd->normals[i].head<3>())).normalized().cast<float>();
                 }
-                std::vector<CameraFrame> cams = {cam};
-                auto cr = Colorizer::project_colors(cams, src.intrinsics, wpts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
+                CameraFrame shifted_cam = cam;
+                shifted_cam.timestamp = cam.timestamp + src.time_shift;  // LiDAR-time (scratch)
+                // Spherical source: expand to 6 cube faces before project().
+                auto expanded = expand_source_cams_for_projection(src, {shifted_cam}, colorize_mask);
+                const auto& lp_cp = src.params;
+                auto cr = make_colorizer(lp_cp.view_selector_mode)->project(expanded.cams, expanded.intrinsics, wpts, ints, wnor, wtimes, current_blend_params(src));
                 colorize_last_result = cr;
                 { auto vw = guik::LightViewer::instance();
-                  const size_t n = cr.points.size();
-                  float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
-                  for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
-                  if (imin >= imax) { imin = 0; imax = 255; }
-                  std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
-                  for (size_t i = 0; i < n; i++) {
-                    p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
-                    Eigen::Vector3f rgb = cr.colors[i];
-                    if (colorize_intensity_blend && i < cr.intensities.size()) {
-                      float inv = (cr.intensities[i] - imin) / (imax - imin);
-                      if (colorize_nonlinear_int) inv = std::sqrt(inv);
-                      rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
-                    }
-                    c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
-                  }
-                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
-                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+                  push_colorize_preview_drawable(vw, cr, lp_cp); }
               }
             }
           } else if (colorize_last_submap >= 0) {
-            // Submap preview — re-locate all sources, then filter by submap's time range (matches right-click colorize)
-            for (auto& s : image_sources) Colorizer::locate_by_time(s, timed_traj);
+            // Submap preview. Relocate the ACTIVE source only, using the scalar
+            // time_shift (scratch). The previous implementation called
+            // Colorizer::locate_by_time for every source, which runs through
+            // effective_calib and uses anchor-interpolated time -- that left
+            // camera WORLD POSITIONS frozen at the anchor value while the
+            // nearby-cams filter below used the scratch value, so dragging
+            // time_shift only shifted which cams were SELECTED, not where they
+            // project from. Visually: a handful of cams flickering in/out of
+            // the frame while the rest stay glued in place. Fixed by keeping
+            // everything on the scratch rail for the active source. Other
+            // sources are not being edited right now, so their last-located
+            // positions stand (cheaper too).
+            {
+              auto& active_src = image_sources[colorize_source_idx];
+              const Eigen::Isometry3d T_lidar_cam_active =
+                Colorizer::build_extrinsic(active_src.lever_arm, active_src.rotation_rpy);
+              const auto& placement_traj = trajectory_for(active_src, timed_traj);
+              for (auto& c : active_src.frames) {
+                if (c.timestamp <= 0.0) { c.located = false; continue; }
+                const double ts = c.timestamp + active_src.time_shift;
+                if (placement_traj.empty() ||
+                    ts < placement_traj.front().stamp - 2.0 ||
+                    ts > placement_traj.back().stamp + 2.0) {
+                  c.located = false; continue;
+                }
+                const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(placement_traj, ts);
+                c.T_world_cam = T_world_lidar * T_lidar_cam_active;
+                c.located = true;
+              }
+            }
             const auto& sm = submaps[colorize_last_submap];
             const double t_first = sm->frames.front()->stamp;
             const double t_last = sm->frames.back()->stamp;
             const double t_margin = 1.0;
             std::vector<CameraFrame> nearby;
-            for (const auto& s : image_sources) {
+            // ALWAYS restrict to the active source (see note in right-click
+            // submap handler above). Mixing sources of different camera_type in
+            // one project() call produces wrong projections for the off-type
+            // source. Future mixed-type blend = per-cam routing through its own
+            // expand/intrinsics/mask.
+            {
+              const auto& s = image_sources[colorize_source_idx];
               for (const auto& c : s.frames) {
                 if (!c.located || c.timestamp <= 0.0) continue;
+                // Live-preview scratch: scalar time_shift so drag propagates
+                // immediately. Non-live paths still use effective_time_shift.
                 const double ct = c.timestamp + s.time_shift;
-                if (ct >= t_first - t_margin && ct <= t_last + t_margin) nearby.push_back(c);
+                if (ct >= t_first - t_margin && ct <= t_last + t_margin) {
+                  CameraFrame shifted = c;
+                  shifted.timestamp = ct;  // LiDAR-time for time-slice comparisons
+                  nearby.push_back(std::move(shifted));
+                }
               }
             }
             if (!nearby.empty()) {
               auto hd = load_hd_for_submap(colorize_last_submap, false);
               if (hd && hd->size() > 0) {
                 const Eigen::Isometry3d T_wo = sm->T_world_origin;
+                const Eigen::Matrix3d R_wo = T_wo.rotation();
                 std::vector<Eigen::Vector3f> wpts(hd->size()); std::vector<float> ints(hd->size(), 0.0f);
+                std::vector<Eigen::Vector3f> wnor;
+                std::vector<double> wtimes;
+                if (hd->normals) wnor.resize(hd->size());
+                if (hd->times)   wtimes.assign(hd->times, hd->times + hd->size());
                 for (size_t i = 0; i < hd->size(); i++) {
                   wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
                   if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                  if (hd->normals)     wnor[i] = (R_wo * Eigen::Vector3d(hd->normals[i].head<3>())).normalized().cast<float>();
                 }
-                auto cr = Colorizer::project_colors(nearby, src.intrinsics, wpts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
+                // Spherical source: expand nearby equirect cams to 6 cube faces each.
+                auto expanded = expand_source_cams_for_projection(src, nearby, colorize_mask);
+                const auto& lps_cp = src.params;
+                auto cr = make_colorizer(lps_cp.view_selector_mode)->project(expanded.cams, expanded.intrinsics, wpts, ints, wnor, wtimes, current_blend_params(src));
                 colorize_last_result = cr;
                 { auto vw = guik::LightViewer::instance();
-                  const size_t n = cr.points.size();
-                  float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
-                  for (size_t i = 0; i < n && i < cr.intensities.size(); i++) { imin = std::min(imin, cr.intensities[i]); imax = std::max(imax, cr.intensities[i]); }
-                  if (imin >= imax) { imin = 0; imax = 255; }
-                  std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
-                  for (size_t i = 0; i < n; i++) {
-                    p4[i] = Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
-                    Eigen::Vector3f rgb = cr.colors[i];
-                    if (colorize_intensity_blend && i < cr.intensities.size()) {
-                      float inv = (cr.intensities[i] - imin) / (imax - imin);
-                      if (colorize_nonlinear_int) inv = std::sqrt(inv);
-                      rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
-                    }
-                    c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
-                  }
-                  auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size()); cb->add_color(c4);
-                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR)); }
+                  push_colorize_preview_drawable(vw, cr, lps_cp); }
               }
             }
           }
-          // Update camera gizmo position for the preview camera
+          // Update camera gizmo position for the preview camera.
           if (draw_cameras && colorize_last_cam_src >= 0 && colorize_last_cam_idx >= 0) {
-            const auto& cam = image_sources[colorize_last_cam_src].frames[colorize_last_cam_idx];
-            if (cam.located) {
-              auto vw = guik::LightViewer::instance();
-              const Eigen::Vector3f pos = cam.T_world_cam.translation().cast<float>();
-              const Eigen::Matrix3f R = cam.T_world_cam.rotation().cast<float>();
-              const Eigen::Vector3f fwd = R.col(0).normalized(), right = R.col(1).normalized(), up = R.col(2).normalized();
-              const float fl = 0.6f, fw = 0.3f, fh = 0.2f;
-              const Eigen::Vector3f bc = pos + fwd * fl;
-              std::vector<Eigen::Vector3f> verts = {
-                pos, bc+right*fw+up*fh, pos, bc-right*fw+up*fh, pos, bc-right*fw-up*fh, pos, bc+right*fw-up*fh,
-                bc+right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw+up*fh, bc-right*fw-up*fh,
-                bc-right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw-up*fh, bc+right*fw+up*fh
-              };
-              const int si = colorize_last_cam_src, fi = colorize_last_cam_idx;
-              vw->update_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi),
-                std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false),
-                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
-              Eigen::Affine3f btf = Eigen::Affine3f::Identity(); btf.translate(pos); btf.linear() = R;
-              btf = btf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
-              vw->update_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi),
-                glk::Primitives::cube(),
-                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, btf).add("info_values",
-                  Eigen::Vector4i(static_cast<int>(PickType::CAMERA), si, 0, fi)));
-            }
+            render_camera_gizmo(colorize_last_cam_src, colorize_last_cam_idx);
           }
         }
 
         // Locate button
         if (ImGui::Button("Locate along path")) {
-          // Save colorize config on each locate
+          // Save colorize config on each locate. Single helper keeps this
+          // serializer in lock-step with the "add image folder" serializer below.
           if (!loaded_map_path.empty()) {
             nlohmann::json cfg; cfg["sources"] = nlohmann::json::array();
-            for (const auto& s : image_sources) {
-              nlohmann::json sj;
-              sj["path"] = s.path; sj["mask_path"] = s.mask_path; sj["time_shift"] = s.time_shift;
-              sj["lever_arm"] = {s.lever_arm.x(), s.lever_arm.y(), s.lever_arm.z()};
-              sj["rotation_rpy"] = {s.rotation_rpy.x(), s.rotation_rpy.y(), s.rotation_rpy.z()};
-              sj["fx"] = s.intrinsics.fx; sj["fy"] = s.intrinsics.fy;
-              sj["cx"] = s.intrinsics.cx; sj["cy"] = s.intrinsics.cy;
-              sj["width"] = s.intrinsics.width; sj["height"] = s.intrinsics.height;
-              sj["k1"] = s.intrinsics.k1; sj["k2"] = s.intrinsics.k2;
-              sj["p1"] = s.intrinsics.p1; sj["p2"] = s.intrinsics.p2; sj["k3"] = s.intrinsics.k3;
-              cfg["sources"].push_back(sj);
-            }
+            for (const auto& s : image_sources) cfg["sources"].push_back(image_source_to_json(s));
             std::ofstream ofs(loaded_map_path + "/colorize_config.json");
             ofs << std::setprecision(10) << cfg.dump(2);
           }
           if (!trajectory_built) build_trajectory();
           // Build timed pose vector from trajectory
-          std::vector<TimedPose> timed_traj(trajectory_data.size());
-          for (size_t i = 0; i < trajectory_data.size(); i++) {
-            timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
-          }
+          const auto timed_traj = timed_traj_snapshot();
 
           int count = 0;
-          if (colorize_locate_mode == 0) {
+          if (src.params.locate_mode == 0) {
             count = Colorizer::locate_by_time(src, timed_traj);
-          } else {
+          } else if (src.params.locate_mode == 1) {
             count = Colorizer::locate_by_coordinates(src, timed_traj,
               gnss_utm_zone, gnss_utm_easting_origin, gnss_utm_northing_origin, gnss_datum_alt);
+          } else {
+            // Mode 2: build (or refresh) the source's own GPS-derived trajectory,
+            // then place frames on THAT via the same time-based interp as mode 0.
+            build_camera_trajectory(src, gnss_utm_zone,
+                                     gnss_utm_easting_origin, gnss_utm_northing_origin,
+                                     gnss_datum_alt);
+            count = Colorizer::locate_by_time(src, trajectory_for(src, timed_traj));
           }
-          logger->info("[Colorize] Located {} / {} cameras", count, src.frames.size());
+          logger->info("[Colorize] Located {} / {} cameras (source={} type={})",
+            count, src.frames.size(), colorize_source_idx,
+            src.camera_type == CameraType::Spherical ? "Spherical" : "Pinhole");
           draw_cameras = true;
 
           // Render camera gizmos
@@ -2344,40 +4104,7 @@ void OfflineViewer::setup_ui() {
             int cam_count = 0;
             for (size_t fi = 0; fi < src.frames.size(); fi++) {
               if (!src.frames[fi].located) continue;
-              const auto& T = src.frames[fi].T_world_cam;
-              const Eigen::Vector3f pos = T.translation().cast<float>();
-              const Eigen::Matrix3f R = T.rotation().cast<float>();
-              const Eigen::Vector3f fwd = R.col(0).normalized();
-              const Eigen::Vector3f right = R.col(1).normalized();
-              const Eigen::Vector3f up = R.col(2).normalized();
-
-              // FOV pyramid: tip at camera pos, 4 lines to rectangle corners ahead
-              const float fov_len = 0.6f, fov_w = 0.3f, fov_h = 0.2f;
-              const Eigen::Vector3f base_center = pos + fwd * fov_len;
-              const Eigen::Vector3f c0 = base_center + right * fov_w + up * fov_h;
-              const Eigen::Vector3f c1 = base_center - right * fov_w + up * fov_h;
-              const Eigen::Vector3f c2 = base_center - right * fov_w - up * fov_h;
-              const Eigen::Vector3f c3 = base_center + right * fov_w - up * fov_h;
-
-              // 8 lines: 4 from tip to corners + 4 base edges (16 vertices, pairs)
-              std::vector<Eigen::Vector3f> verts = {
-                pos, c0, pos, c1, pos, c2, pos, c3,  // tip to corners
-                c0, c1, c1, c2, c2, c3, c3, c0       // base rectangle
-              };
-              // FOV lines
-              auto line_buf = std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false);
-              vw->update_drawable("cam_fov_" + std::to_string(colorize_source_idx) + "_" + std::to_string(fi),
-                line_buf, guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
-
-              // Camera body — solid pickable cube
-              Eigen::Affine3f box_tf = Eigen::Affine3f::Identity();
-              box_tf.translate(pos);
-              box_tf.linear() = R;
-              box_tf = box_tf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
-              const Eigen::Vector4i cam_info(static_cast<int>(PickType::CAMERA), colorize_source_idx, 0, static_cast<int>(fi));
-              vw->update_drawable("cam_" + std::to_string(colorize_source_idx) + "_" + std::to_string(fi),
-                glk::Primitives::cube(),
-                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, box_tf).add("info_values", cam_info));
+              render_camera_gizmo(colorize_source_idx, static_cast<int>(fi));
               cam_count++;
             }
             logger->info("[Colorize] Rendered {} camera gizmos", cam_count);
@@ -2392,7 +4119,7 @@ void OfflineViewer::setup_ui() {
 
         // Handle show/hide transitions
         if (!draw_cameras && prev_draw_cameras) {
-          // Just turned off — remove all gizmos
+          // Just turned off -- remove all gizmos
           auto vw = guik::LightViewer::instance();
           for (size_t si = 0; si < image_sources.size(); si++) {
             for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
@@ -2401,74 +4128,325 @@ void OfflineViewer::setup_ui() {
             }
           }
         } else if (draw_cameras && !prev_draw_cameras) {
-          // Just turned on — re-render all located cameras
-          auto vw = guik::LightViewer::instance();
+          // Just turned on -- re-render all located cameras
           for (size_t si = 0; si < image_sources.size(); si++) {
             for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
               if (!image_sources[si].frames[fi].located) continue;
-              const auto& T = image_sources[si].frames[fi].T_world_cam;
-              const Eigen::Vector3f pos = T.translation().cast<float>();
-              const Eigen::Matrix3f R = T.rotation().cast<float>();
-              const Eigen::Vector3f fwd = R.col(0).normalized();
-              const Eigen::Vector3f right = R.col(1).normalized();
-              const Eigen::Vector3f up = R.col(2).normalized();
-              const float fov_len = 0.6f, fov_w = 0.3f, fov_h = 0.2f;
-              const Eigen::Vector3f bc = pos + fwd * fov_len;
-              std::vector<Eigen::Vector3f> verts = {
-                pos, bc + right*fov_w + up*fov_h, pos, bc - right*fov_w + up*fov_h,
-                pos, bc - right*fov_w - up*fov_h, pos, bc + right*fov_w - up*fov_h,
-                bc + right*fov_w + up*fov_h, bc - right*fov_w + up*fov_h,
-                bc - right*fov_w + up*fov_h, bc - right*fov_w - up*fov_h,
-                bc - right*fov_w - up*fov_h, bc + right*fov_w - up*fov_h,
-                bc + right*fov_w - up*fov_h, bc + right*fov_w + up*fov_h
-              };
-              vw->update_drawable("cam_fov_" + std::to_string(si) + "_" + std::to_string(fi),
-                std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false),
-                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.7f));
-              Eigen::Affine3f box_tf = Eigen::Affine3f::Identity();
-              box_tf.translate(pos); box_tf.linear() = R;
-              box_tf = box_tf * Eigen::Scaling(Eigen::Vector3f(0.12f, 0.18f, 0.12f));
-              const Eigen::Vector4i cam_info(static_cast<int>(PickType::CAMERA), static_cast<int>(si), 0, static_cast<int>(fi));
-              vw->update_drawable("cam_" + std::to_string(si) + "_" + std::to_string(fi),
-                glk::Primitives::cube(),
-                guik::FlatColor(1.0f, 1.0f, 1.0f, 0.9f, box_tf).add("info_values", cam_info));
+              render_camera_gizmo(static_cast<int>(si), static_cast<int>(fi));
             }
           }
         }
         prev_draw_cameras = draw_cameras;
 
-        // Intrinsics (compact input fields)
+        // Intrinsics (compact input fields). Hidden for Spherical sources -- the
+        // equirect model needs no fx/fy/cx/cy/distortion; focal is derived from
+        // image width (f = w/(2*pi)) and principal point is the image center.
         ImGui::Separator();
-        if (ImGui::CollapsingHeader("Camera Intrinsics")) {
+        if (src.camera_type == CameraType::Spherical) {
+          ImGui::TextDisabled("Camera Intrinsics: not used for Spherical sources.");
+          ImGui::TextDisabled("  f = width / (2 pi), principal point = image center.");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Equirectangular cameras have a fixed mathematical projection --\n"
+            "no lens parameters to fit. Switch to 'Pinhole' to edit fx/fy/cx/cy.");
+        }
+        if (src.camera_type == CameraType::Pinhole && ImGui::CollapsingHeader("Camera Intrinsics")) {
+          if (ImGui::Button("Import Metashape XML")) {
+            auto files = pfd::open_file("Select Metashape calibration XML",
+                                        src.path.empty() ? "." : src.path,
+                                        {"Metashape calibration", "*.xml", "All files", "*"}).result();
+            if (!files.empty()) {
+              std::ifstream xf(files[0]);
+              const std::string xml((std::istreambuf_iterator<char>(xf)), std::istreambuf_iterator<char>());
+              auto pull = [&](const std::string& tag, double& out) {
+                std::regex re("<" + tag + ">([^<]+)</" + tag + ">");
+                std::smatch m;
+                if (std::regex_search(xml, m, re)) { try { out = std::stod(m[1]); return true; } catch (...) {} }
+                return false;
+              };
+              auto pulli = [&](const std::string& tag, int& out) {
+                std::regex re("<" + tag + ">([^<]+)</" + tag + ">");
+                std::smatch m;
+                if (std::regex_search(xml, m, re)) { try { out = std::stoi(m[1]); return true; } catch (...) {} }
+                return false;
+              };
+              int w = src.intrinsics.width, h = src.intrinsics.height;
+              double f = 0, cx_off = 0, cy_off = 0;
+              double k1 = 0, k2 = 0, k3 = 0, p1 = 0, p2 = 0;
+              const bool got_wh = pulli("width", w) && pulli("height", h);
+              const bool got_f  = pull("f", f);
+              if (!got_wh || !got_f) {
+                logger->warn("[Intrinsics import] Missing required tags <width>/<height>/<f> in {}", files[0]);
+              } else {
+                pull("cx", cx_off); pull("cy", cy_off);  // Metashape: offset from image center
+                pull("k1", k1); pull("k2", k2); pull("k3", k3);
+                pull("p1", p1); pull("p2", p2);
+                src.intrinsics.width  = w;
+                src.intrinsics.height = h;
+                src.intrinsics.fx = f;
+                src.intrinsics.fy = f;   // Metashape frame projection uses single f
+                src.intrinsics.cx = 0.5 * w + cx_off;   // convert offset -> absolute
+                src.intrinsics.cy = 0.5 * h + cy_off;
+                src.intrinsics.k1 = k1; src.intrinsics.k2 = k2; src.intrinsics.k3 = k3;
+                src.intrinsics.p1 = p1; src.intrinsics.p2 = p2;
+                logger->info("[Intrinsics import] Loaded from {}: {}x{}, f={:.2f}, cx={:.2f}, cy={:.2f}",
+                             files[0], w, h, f, src.intrinsics.cx, src.intrinsics.cy);
+              }
+            }
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Load intrinsics from a Metashape calibration XML (<calibration><f>, <cx>, <cy>, <k1>...</>).\n"
+            "Metashape stores cx/cy as OFFSETS from image center -- this converts to\n"
+            "absolute pixel coordinates automatically. Single f value is copied to fx and fy.");
+          ImGui::Separator();
+          bool intrinsics_changed = false;
           float fx = static_cast<float>(src.intrinsics.fx), fy = static_cast<float>(src.intrinsics.fy);
           float cxv = static_cast<float>(src.intrinsics.cx), cyv = static_cast<float>(src.intrinsics.cy);
-          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("fx##i", &fx, 0, 0, "%.0f")) src.intrinsics.fx = fx;
-          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("fy##i", &fy, 0, 0, "%.0f")) src.intrinsics.fy = fy;
-          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("cx##i", &cxv, 0, 0, "%.0f")) src.intrinsics.cx = cxv;
-          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("cy##i", &cyv, 0, 0, "%.0f")) src.intrinsics.cy = cyv;
+          // fx/fy/cx/cy: step=1 px, step_fast=10 px (Ctrl+click). Hold +/- to repeat.
+          const float IW_FOC = 110.0f;   // field width wide enough to show value after the +/- buttons
+          ImGui::SetNextItemWidth(IW_FOC); if (ImGui::InputFloat("fx##i", &fx, 1.0f, 10.0f, "%.0f")) { src.intrinsics.fx = fx; intrinsics_changed = true; }
+          ImGui::SameLine(); ImGui::SetNextItemWidth(IW_FOC); if (ImGui::InputFloat("fy##i", &fy, 1.0f, 10.0f, "%.0f")) { src.intrinsics.fy = fy; intrinsics_changed = true; }
+          ImGui::SetNextItemWidth(IW_FOC); if (ImGui::InputFloat("cx##i", &cxv, 1.0f, 10.0f, "%.0f")) { src.intrinsics.cx = cxv; intrinsics_changed = true; }
+          ImGui::SameLine(); ImGui::SetNextItemWidth(IW_FOC); if (ImGui::InputFloat("cy##i", &cyv, 1.0f, 10.0f, "%.0f")) { src.intrinsics.cy = cyv; intrinsics_changed = true; }
           int iw = src.intrinsics.width, ih = src.intrinsics.height;
-          ImGui::SetNextItemWidth(80); if (ImGui::InputInt("W##i", &iw)) src.intrinsics.width = iw;
-          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputInt("H##i", &ih)) src.intrinsics.height = ih;
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pinhole intrinsics. Default: Elgato Facecam Pro 90° FOV.");
+          ImGui::SetNextItemWidth(IW_FOC); if (ImGui::InputInt("W##i", &iw)) { src.intrinsics.width = iw; intrinsics_changed = true; }
+          ImGui::SameLine(); ImGui::SetNextItemWidth(IW_FOC); if (ImGui::InputInt("H##i", &ih)) { src.intrinsics.height = ih; intrinsics_changed = true; }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pinhole intrinsics. Default: Elgato Facecam Pro 90 deg FOV.\n+/- buttons hold-to-repeat. Ctrl+click uses fast step (10 px).");
           ImGui::Separator();
           ImGui::Text("Distortion (Brown-Conrady)");
+          // User-tunable step for distortion coefficients (defaults 0.0005 -> fine
+          // enough for calibration tweaks). Fast step is 10x this for Ctrl+click.
+          ImGui::SetNextItemWidth(140);
+          ImGui::DragFloat("Dist step##dstep", &intrinsics_dist_step, 0.00001f, 0.00001f, 0.01f, "%.5f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Step size for the +/- buttons on k1/k2/k3/p1/p2.\n"
+            "Tweak down to ~1e-5 for fine convergence, up to ~1e-3 for rough search.\n"
+            "Ctrl+click the +/- buttons to use 10x this step.");
+          const float dstep_fast = intrinsics_dist_step * 10.0f;
+          // Wider field so the %.6f value remains readable next to the +/- buttons.
+          const float IW_DIST = 130.0f;
           float dk1 = static_cast<float>(src.intrinsics.k1), dk2 = static_cast<float>(src.intrinsics.k2);
           float dp1 = static_cast<float>(src.intrinsics.p1), dp2 = static_cast<float>(src.intrinsics.p2);
           float dk3 = static_cast<float>(src.intrinsics.k3);
-          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("k1##d", &dk1, 0, 0, "%.6f")) src.intrinsics.k1 = dk1;
-          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("k2##d", &dk2, 0, 0, "%.6f")) src.intrinsics.k2 = dk2;
-          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("p1##d", &dp1, 0, 0, "%.6f")) src.intrinsics.p1 = dp1;
-          ImGui::SameLine(); ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("p2##d", &dp2, 0, 0, "%.6f")) src.intrinsics.p2 = dp2;
-          ImGui::SetNextItemWidth(80); if (ImGui::InputFloat("k3##d", &dk3, 0, 0, "%.6f")) src.intrinsics.k3 = dk3;
+          ImGui::SetNextItemWidth(IW_DIST); if (ImGui::InputFloat("k1##d", &dk1, intrinsics_dist_step, dstep_fast, "%.6f")) { src.intrinsics.k1 = dk1; intrinsics_changed = true; }
+          ImGui::SameLine(); ImGui::SetNextItemWidth(IW_DIST); if (ImGui::InputFloat("k2##d", &dk2, intrinsics_dist_step, dstep_fast, "%.6f")) { src.intrinsics.k2 = dk2; intrinsics_changed = true; }
+          ImGui::SetNextItemWidth(IW_DIST); if (ImGui::InputFloat("p1##d", &dp1, intrinsics_dist_step, dstep_fast, "%.6f")) { src.intrinsics.p1 = dp1; intrinsics_changed = true; }
+          ImGui::SameLine(); ImGui::SetNextItemWidth(IW_DIST); if (ImGui::InputFloat("p2##d", &dp2, intrinsics_dist_step, dstep_fast, "%.6f")) { src.intrinsics.p2 = dp2; intrinsics_changed = true; }
+          ImGui::SetNextItemWidth(IW_DIST); if (ImGui::InputFloat("k3##d", &dk3, intrinsics_dist_step, dstep_fast, "%.6f")) { src.intrinsics.k3 = dk3; intrinsics_changed = true; }
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Radial (k1,k2,k3) and tangential (p1,p2) distortion.\nImport from Metashape or calibration tool.\nLeave zeros for no distortion.");
+          // Live preview trigger for intrinsic tweaks: persist a flag so the top
+          // of NEXT frame sees it (the time_changed check runs earlier in the
+          // callback than this CollapsingHeader). Lets user eyeball calib by
+          // dragging fx/cx/k1/etc and watching projection shift in real time.
+          if (intrinsics_changed) colorize_intrinsics_dirty = true;
         }
 
-        ImGui::DragFloat("Min range (m)", &colorize_min_range, 0.5f, 0.0f, 50.0f, "%.1f");
+        ImGui::DragFloat("Min range (m)", &src.params.min_range, 0.5f, 0.0f, 50.0f, "%.1f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Skip points closer than this to the camera.\nReduces close-up distortion artifacts.");
-        ImGui::DragFloat("Max range (m)", &colorize_max_range, 1.0f, 5.0f, 200.0f, "%.0f");
+        ImGui::DragFloat("Max range (m)", &src.params.max_range, 1.0f, 5.0f, 200.0f, "%.0f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max distance from camera to project points.\nCloser = faster, further = more coverage.");
-        ImGui::Checkbox("Blend cameras", &colorize_blend);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("On: average colors from all cameras seeing a point.\nOff: use only the closest camera's color.");
+        // View selector strategy (which camera colors which point). Bind combo
+        // to an int temporary so we can round-trip to the enum cleanly.
+        {
+          const char* vs_labels[] = {
+            "Simple nearest",
+            "Weighted top-1",
+            "Weighted top-K",
+            "Matched (WIP)"
+          };
+          int vs_mode_int = static_cast<int>(src.params.view_selector_mode);
+          ImGui::SetNextItemWidth(180);
+          if (ImGui::Combo("View selector", &vs_mode_int, vs_labels, IM_ARRAYSIZE(vs_labels))) {
+            src.params.view_selector_mode = static_cast<ViewSelectorMode>(vs_mode_int);
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "How to decide which camera's color each point gets.\n"
+            "\n"
+            "- Simple nearest   : closest-distance camera wins per point. Fast baseline.\n"
+            "- Weighted top-1   : per-(point,cam) score = w_range x w_center x w_incidence.\n"
+            "                     One winner per point. Best default when filters are on.\n"
+            "- Weighted top-K   : softmax over K highest-scoring cameras. Gentler blending.\n"
+            "- Matched          : future (LightGlue + per-pixel warp + semantic gating).\n"
+            "\n"
+            "Time-slice filter below can restrict candidates BEFORE any of these run:\n"
+            "Simple nearest + Time-slice hard = the FAST-LIVO2 pairing strategy.");
+        }
+        // Weighted-mode knobs (visible only when weighted)
+        const auto vs_mode_enum = src.params.view_selector_mode;
+        if (vs_mode_enum == ViewSelectorMode::WeightedTop1 || vs_mode_enum == ViewSelectorMode::WeightedTopK) {
+          ImGui::Indent();
+          ImGui::SetNextItemWidth(100); ImGui::DragFloat("range tau (m)", &src.params.range_tau, 0.1f, 0.5f, 100.0f, "%.1f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Range weight: w_range = exp(-dist / tau).\n"
+            "Smaller tau -> cameras close to the point dominate more aggressively.\n"
+            "Larger tau -> distance matters less. tau=10m is a good default.");
+          ImGui::SetNextItemWidth(100); ImGui::DragFloat("center exp", &src.params.center_exp, 0.05f, 0.0f, 8.0f, "%.2f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Image-center weight: w_center = (1 - r^2)^exp, where r is the point's\n"
+            "normalized image-plane radius from principal point (0 at center, 1 at edge).\n"
+            "Penalizes edges where lens distortion residuals are largest.\n"
+            "Set to 0 to disable. Typical 1.5-3.");
+          ImGui::SetNextItemWidth(100); ImGui::DragFloat("incidence exp", &src.params.incidence_exp, 0.05f, 0.0f, 8.0f, "%.2f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Incidence weight: w_incidence = max(0, |cos theta|)^exp, where theta is the angle\n"
+            "between the surface normal and the ray to the camera. Favors face-on views,\n"
+            "demotes grazing. |.| is used because PCA normals have arbitrary sign.\n"
+            "Requires per-point normals. Set to 0 to disable. Typical 1-2.");
+          if (vs_mode_enum == ViewSelectorMode::WeightedTopK) {
+            ImGui::SetNextItemWidth(80); ImGui::SliderInt("top-K", &src.params.topK, 2, 8);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Number of top cameras to softmax-blend per point. 2-3 typical.");
+          }
+          ImGui::Unindent();
+        }
+
+        // Correctness filters -- each one independent so you can A/B the impact.
+        ImGui::Separator();
+        ImGui::TextDisabled("Correctness filters (independent toggles)");
+
+        // ----- 1. Time-slice per-point camera pairing (FAST-LIVO2 style) -----
+        {
+          ImGui::Checkbox("Time-slice (hard)", &src.params.time_slice_hard);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "FAST-LIVO2 pairing. For each LiDAR point (using its per-point GPS time),\n"
+            "use ONLY the camera whose timestamp is closest in time to that point.\n"
+            "No other camera may contribute -- this eliminates multi-view blending smear.\n"
+            "\n"
+            "Best default for high-framerate cameras (30 fps = <=17ms drift per point).\n"
+            "Requires per-point times; loads from hd->times (gps_time). If unavailable, no-op.\n"
+            "Applies to BOTH Simple and Weighted modes.");
+          ImGui::SameLine();
+          ImGui::Checkbox("Time-slice (soft)", &src.params.time_slice_soft);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Weighted-only. Adds a w_time = exp(-|dt| / sigma) term into the weighted blend\n"
+            "instead of hard-selecting one camera. Gentler than hard mode -- cameras farther\n"
+            "in time still contribute but less. Can combine with hard if you want the\n"
+            "closest camera to dominate a fallback-capable blend.");
+          if (src.params.time_slice_soft) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(100);
+            ImGui::DragFloat("time sigma (s)", &src.params.time_slice_sigma, 0.005f, 0.005f, 2.0f, "%.3fs");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Time-decay scale for SOFT mode. Smaller sigma = sharper time preference.\n"
+              "Typical: 30fps camera -> sigma ~= 0.03s. 10fps camera -> sigma ~= 0.1s.");
+            ImGui::Unindent();
+          }
+        }
+
+        // ----- 2. Depth-buffer occlusion -----
+        {
+          ImGui::Checkbox("Depth-buffer occlusion", &src.params.use_occlusion);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Per-camera z-buffer built before color sampling. Rejects any point whose\n"
+            "depth is larger than zbuf[u,v] x (1 + tolerance) -- i.e. hidden behind\n"
+            "a closer point at that pixel.\n"
+            "\n"
+            "This is the single biggest fix for 'color bleeding through thin structures'\n"
+            "(fences, poles, tree branches, wires). Applies to BOTH Simple and Weighted.\n"
+            "Cost: ~15%% slower projection, one extra z-buffer per camera.");
+          if (src.params.use_occlusion) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(100); ImGui::DragFloat("tolerance", &src.params.occlusion_tolerance, 0.005f, 0.005f, 0.5f, "%.3f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Slack as fraction of depth. 0.05 = a point 5%% farther than the\n"
+              "z-buffer value is still accepted. Too tight -> valid points get rejected\n"
+              "(LiDAR sparsity makes same-surface neighbors land at slightly different depths).\n"
+              "Too loose -> occluders bleed through again. 0.03-0.08 is typical.");
+            ImGui::SameLine(); ImGui::SetNextItemWidth(60);
+            ImGui::DragInt("zbuf /N", &src.params.occlusion_downscale, 1, 1, 16);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Z-buffer resolution divisor. 4 = zbuf is image_w/4 x image_h/4.\n"
+              "Larger N = faster + less memory, but less precise at thin structure edges.\n"
+              "For 4K images, N=4 gives a ~1000x540 zbuf which is plenty.");
+            ImGui::Unindent();
+          }
+        }
+
+        // ----- 3. Hard incidence gate -----
+        {
+          ImGui::Checkbox("Hard incidence gate", &src.params.use_incidence_hard);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Reject (point, camera) pairs where the camera views the surface at a\n"
+            "grazing angle -- i.e. angle between surface normal and camera ray exceeds threshold.\n"
+            "\n"
+            "This does NOT reject close/far points. It rejects viewing DIRECTIONS where\n"
+            "each pixel covers a huge area and color gets smeared. FAST-LIVO2 uses a\n"
+            "hard 60 deg gate. Example: a road point 30m ahead viewed by a forward-facing\n"
+            "camera hits the ground normal at ~85 deg -- grazing, gets dropped.\n"
+            "\n"
+            "Weighted mode only. Requires per-point normals (loaded from normals.bin).\n"
+            "If a point has no covering camera after this gate, it stays uncolored\n"
+            "(intensity-gray fallback).");
+          if (src.params.use_incidence_hard) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(100);
+            ImGui::DragFloat("max angle deg", &src.params.incidence_hard_deg, 1.0f, 10.0f, 89.0f, "%.0f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Views with angle between surface normal and ray larger than this are dropped.\n"
+              "60 deg is standard (FAST-LIVO2 default). Lower = stricter + more uncolored points\n"
+              "at distance. Higher = more grazing contamination.");
+            ImGui::Unindent();
+          }
+        }
+
+        // ----- 4. NCC cross-check -----
+        {
+          ImGui::Checkbox("NCC cross-check (top-K only)", &src.params.use_ncc);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Weighted top-K mode only. After the top-K candidate cameras are picked,\n"
+            "patch-match each non-winner against the top-1 winner using normalized\n"
+            "cross-correlation; drop non-winners whose NCC < threshold.\n"
+            "\n"
+            "Catches motion-blurred or time-desynced frames contributing bad color.\n"
+            "Typically small quality delta in post-processing (more useful in streaming VO).\n"
+            "No effect in Simple or Weighted top-1 modes -- nothing to cross-check.");
+          if (src.params.use_ncc) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(100);
+            ImGui::DragFloat("NCC thr", &src.params.ncc_threshold, 0.01f, -0.5f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "NCC value below which a non-winner candidate is dropped from the blend.\n"
+              "Range [-1, 1]. Typical: 0.3. Higher = stricter (fewer contributors survive).");
+            ImGui::SameLine(); ImGui::SetNextItemWidth(60);
+            ImGui::DragInt("patch half", &src.params.ncc_half, 1, 1, 10);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Patch size = 2*half + 1. half=3 -> 7x7 patch. Larger = more robust but slower.");
+            ImGui::Unindent();
+          }
+        }
+
+        // ----- 5. Per-image exposure normalization (FAST-LIVO2 trick #1) -----
+        {
+          ImGui::Checkbox("Exposure normalize", &src.params.use_exposure_norm);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Per-image brightness gain. Keeps color consistent across frames whose auto-exposure drifts.\n"
+            "\n"
+            "Two modes (see 'Simple' checkbox):\n"
+            "- Simple OFF (surface-pixel):  mean over pixels where LiDAR points project.\n"
+            "  Unbiased by sky/ceiling but tends to over-boost sunny outdoor scenes\n"
+            "  (surface samples are darker than sky, so gain pushes images too bright).\n"
+            "- Simple ON  (image-mean):     mean over the whole downscaled image.\n"
+            "  Slightly biased by sky/ceiling, but moderate gain -- visually balanced\n"
+            "  outdoors (doesn't burn sunny areas). This is the legacy behavior.\n"
+            "\n"
+            "Gain is clamped to [0.25, 4.0]. Works with Simple + Weighted selectors.");
+          if (src.params.use_exposure_norm) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(100);
+            ImGui::DragFloat("target mean", &src.params.exposure_target, 0.01f, 0.1f, 0.9f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Target mean brightness in [0,1] (0.5 = neutral gray). All images get normalized\n"
+              "to this. Lower (0.3) = darker final result, higher (0.7) = brighter.");
+            ImGui::SameLine();
+            ImGui::Checkbox("Simple##expsimp", &src.params.exposure_simple);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "ON:  downscaled image mean (legacy, balanced for sunny outdoor scenes).\n"
+              "OFF: surface-pixel mean (unbiased by sky/ceiling, but can over-boost sunny data).\n"
+              "\n"
+              "If outdoor sunny frames come out burned with 'OFF', turn this ON\n"
+              "(or lower target mean to ~0.4).");
+            ImGui::Unindent();
+          }
+        }
 
         // Static mask
         if (ImGui::Button("Load mask")) {
@@ -2488,7 +4466,13 @@ void OfflineViewer::setup_ui() {
         }
         if (!colorize_mask.empty()) {
           ImGui::SameLine();
-          const bool mask_size_ok = (colorize_mask.cols == src.intrinsics.width && colorize_mask.rows == src.intrinsics.height);
+          // For Spherical sources, intrinsics.width/height aren't used for image
+          // dimensions -- cube-face slicing handles sampling regardless of the
+          // equirect's pixel count. Skip the mismatch warning in that case; the
+          // mask is resized to the image at sample time anyway (see Preview below).
+          const bool check_size = (src.camera_type == CameraType::Pinhole);
+          const bool mask_size_ok = !check_size ||
+            (colorize_mask.cols == src.intrinsics.width && colorize_mask.rows == src.intrinsics.height);
           if (mask_size_ok) ImGui::TextDisabled("Mask: %dx%d ch=%d", colorize_mask.cols, colorize_mask.rows, colorize_mask.channels());
           else ImGui::TextColored(ImVec4(1,0.4f,0,1), "Mask: %dx%d (expected %dx%d!)", colorize_mask.cols, colorize_mask.rows, src.intrinsics.width, src.intrinsics.height);
           ImGui::SameLine();
@@ -2531,7 +4515,7 @@ void OfflineViewer::setup_ui() {
             }
           }
           ImGui::SameLine();
-          if (ImGui::SmallButton("Clear mask")) colorize_mask = cv::Mat();
+          if (ImGui::SmallButton("Clear mask")) { colorize_mask = cv::Mat(); src.mask_path.clear(); }
         } else {
           ImGui::SameLine();
           ImGui::TextDisabled("No mask (place mask.png in image folder)");
@@ -2539,38 +4523,45 @@ void OfflineViewer::setup_ui() {
 
         ImGui::Separator();
         bool blend_changed = false;
-        if (ImGui::Checkbox("Intensity blend", &colorize_intensity_blend)) blend_changed = true;
+        if (ImGui::Checkbox("Intensity blend", &src.params.intensity_blend)) blend_changed = true;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blend projected RGB with LiDAR intensity.\nUseful for alignment verification using road markings.");
-        if (colorize_intensity_blend) {
-          if (ImGui::SliderFloat("Mix##intblend", &colorize_intensity_mix, 0.0f, 1.0f, "%.2f")) blend_changed = true;
+        if (src.params.intensity_blend) {
+          if (ImGui::SliderFloat("Mix##intblend", &src.params.intensity_mix, 0.0f, 1.0f, "%.2f")) blend_changed = true;
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = pure RGB, 1 = pure intensity.");
-          if (ImGui::Checkbox("Non-linear intensity", &colorize_nonlinear_int)) blend_changed = true;
+          if (ImGui::Checkbox("Non-linear intensity", &src.params.nonlinear_int)) blend_changed = true;
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Compress intensity range (sqrt) to boost\nroad marking contrast. Useful for Livox scanners.");
         }
-        // Re-render preview with new blend without re-projecting
+        // Re-render preview with new blend without re-projecting.
         if (blend_changed && !colorize_last_result.points.empty()) {
           auto vw = guik::LightViewer::instance();
-          const size_t n = colorize_last_result.points.size();
-          float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
-          for (size_t i = 0; i < n && i < colorize_last_result.intensities.size(); i++) {
-            imin = std::min(imin, colorize_last_result.intensities[i]);
-            imax = std::max(imax, colorize_last_result.intensities[i]);
+          push_colorize_preview_drawable(vw, colorize_last_result, src.params);
+        }
+
+        // Cube-face cache cap (Spherical only uses it). FIFO-evicts when total
+        // bytes exceed the cap. 8 GB default keeps long-session previews from
+        // eating all RAM -- bump if you have headroom and want bigger caches.
+        {
+          float cap_gb = static_cast<float>(preview_cache_cap_gb);
+          ImGui::SetNextItemWidth(100);
+          if (ImGui::DragFloat("Cache cap (GB)##cap", &cap_gb, 0.5f, 0.0f, 128.0f, "%.1f")) {
+            preview_cache_cap_gb = static_cast<double>(std::max(0.0f, cap_gb));
+            g_cube_face_cache_cap_bytes.store(
+              static_cast<size_t>(preview_cache_cap_gb * 1024.0 * 1024.0 * 1024.0),
+              std::memory_order_relaxed);
           }
-          if (imin >= imax) { imin = 0; imax = 255; }
-          std::vector<Eigen::Vector4d> p4(n); std::vector<Eigen::Vector4f> c4(n);
-          for (size_t i = 0; i < n; i++) {
-            p4[i] = Eigen::Vector4d(colorize_last_result.points[i].x(), colorize_last_result.points[i].y(), colorize_last_result.points[i].z(), 1.0);
-            Eigen::Vector3f rgb = colorize_last_result.colors[i];
-            if (colorize_intensity_blend && i < colorize_last_result.intensities.size()) {
-              float inv = (colorize_last_result.intensities[i] - imin) / (imax - imin);
-              if (colorize_nonlinear_int) inv = std::sqrt(inv);
-              rgb = rgb * (1.0f - colorize_intensity_mix) + intensity_to_color(inv) * colorize_intensity_mix;
-            }
-            c4[i] = Eigen::Vector4f(rgb.x(), rgb.y(), rgb.z(), 1.0f);
-          }
-          auto cb = std::make_shared<glk::PointCloudBuffer>(p4.data(), p4.size());
-          cb->add_color(c4);
-          vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR));
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "RAM cap for the spherical cube-face cache (not VRAM).\n"
+            "Each equirect frame caches as ~66 MB of cube faces; the cache grows\n"
+            "as Preview / Apply touch more frames. When total exceeds this cap,\n"
+            "oldest entries are evicted FIFO.\n"
+            "\n"
+            "0 = no cap (previous behavior, grow unbounded).");
+          // Live stats: total bytes + frame count, so user sees current pressure.
+          size_t bytes = 0, frames = 0;
+          get_cube_face_cache_stats(bytes, frames);
+          ImGui::SameLine();
+          ImGui::TextDisabled("%.2f GB, %zu frames cached",
+            static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), frames);
         }
 
         // Colorize all submaps + clear
@@ -2578,79 +4569,175 @@ void OfflineViewer::setup_ui() {
         static std::string colorize_all_status;
         if (colorize_all_running) {
           ImGui::TextColored(ImVec4(1, 1, 0, 1), "%s", colorize_all_status.c_str());
+          ImGui::SameLine();
+          ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.25f, 0.25f, 1.0f));
+          if (ImGui::Button(colorize_all_cancel_requested ? "Stopping...##cap" : "Stop##cap")) {
+            colorize_all_cancel_requested = true;
+          }
+          ImGui::PopStyleColor();
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Stop after the current submap. Submaps already colorized stay visible.\nClear preview to remove them.");
         } else {
           if (ImGui::Button("Colorize all submaps (preview)")) {
             colorize_all_running = true;
+            colorize_all_cancel_requested = false;
             colorize_all_status = "Starting...";
             const auto& isrc = image_sources[colorize_source_idx];
-            std::thread([this, &isrc] {
+            // Snapshot the 3D viewer's camera world position so the worker can
+            // order submaps nearest-first. Must be taken on the UI thread.
+            // The camera-control exposes view_matrix() (world->cam); the world
+            // position sits at -R^T * t when decomposed, or equivalently the
+            // inverse's translation block.
+            Eigen::Vector3f view_pos(0.0f, 0.0f, 0.0f);
+            {
+              auto vw = guik::LightViewer::instance();
+              if (auto cam = vw->get_camera_control()) {
+                const Eigen::Matrix4f vm = cam->view_matrix();
+                view_pos = vm.inverse().block<3, 1>(0, 3);
+              }
+            }
+            std::thread([this, &isrc, view_pos] {
               if (!trajectory_built) build_trajectory();
-              std::vector<TimedPose> timed_traj(trajectory_data.size());
-              for (size_t i = 0; i < trajectory_data.size(); i++) timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+              const auto timed_traj = timed_traj_snapshot();
 
-              std::vector<Eigen::Vector4d> all_pts;
-              std::vector<Eigen::Vector4f> all_cols;
-              ColorizeResult agg;  // store full-map result for blend re-render
+              // Per-submap preview: emit one drawable per submap instead of accumulating.
+              // Memory scales with a single submap (~500k pts) not the full map, so this
+              // handles 100km+ trajectories without a single giant VBO blowing up.
+              // Side effects: intensity-blend slider re-render is skipped (would need to
+              // store per-submap cr copies, which defeats the point). Use single-submap
+              // colorize if you need blend interactivity.
               size_t total_colored = 0;
+              size_t total_rendered_pts = 0;
+              size_t sm_drawables_made = 0;
 
-              for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+              // Set up one-time preview state on the main thread.
+              guik::LightViewer::instance()->invoke([this] {
+                lod_hide_all_submaps = true;
+                colorize_last_submap = -1;
+                colorize_last_cam_src = -1;
+                colorize_last_cam_idx = -1;
+                // Clear any previous per-submap preview drawables
+                auto vw = guik::LightViewer::instance();
+                for (int sid : colorize_preview_sm_ids) vw->remove_drawable("colorize_preview_sm_" + std::to_string(sid));
+                colorize_preview_sm_ids.clear();
+                // Also clear the legacy single drawable in case it exists from an older run
+                vw->remove_drawable("colorize_preview");
+                // Intensity blend slider has nothing to re-render in per-submap mode
+                colorize_last_result = ColorizeResult{};
+              });
+
+              // Submap visit order: nearest-to-view-camera first, then follow the
+              // trajectory forward from there, wrapping around. Rationale: a
+              // user tuning a specific section is usually looking at it in the
+              // 3D view; if the cache fills or they cancel, the region they can
+              // actually see gets colorized before far-away sections. On cold
+              // start (no cache pressure) the perceived responsiveness is the
+              // same -- the first colored submap lands right where they're
+              // looking instead of at submap 0.
+              const int nsm = static_cast<int>(submaps.size());
+              int start_si = 0;
+              {
+                double best_dsq = std::numeric_limits<double>::max();
+                for (int si = 0; si < nsm; si++) {
+                  const auto& sm = submaps[si];
+                  if (!sm || sm->frames.empty()) continue;
+                  const Eigen::Vector3f c = sm->T_world_origin.translation().cast<float>();
+                  const double dsq = (c - view_pos).squaredNorm();
+                  if (dsq < best_dsq) { best_dsq = dsq; start_si = si; }
+                }
+              }
+              // Build visit order: [start, start+1, ..., nsm-1, 0, 1, ..., start-1].
+              std::vector<int> visit_order;
+              visit_order.reserve(nsm);
+              for (int k = 0; k < nsm; k++) visit_order.push_back((start_si + k) % nsm);
+
+              for (int vi = 0; vi < static_cast<int>(visit_order.size()); vi++) {
+                if (colorize_all_cancel_requested) break;  // Stop requested
+                const int si = visit_order[vi];
                 const auto& sm = submaps[si];
                 if (!sm || sm->frames.empty()) continue;
                 if (hidden_sessions.count(sm->session_id)) continue;
 
-                char buf[64]; std::snprintf(buf, sizeof(buf), "Submap %d/%zu...", si + 1, submaps.size());
+                char buf[96]; std::snprintf(buf, sizeof(buf), "Submap %d (%d/%zu visited, starting from nearest #%d)...",
+                  si, vi + 1, visit_order.size(), start_si);
                 colorize_all_status = buf;
 
-                // Find cameras for this submap by timestamp
+                // Find cameras for this submap by timestamp. ALWAYS restrict to
+                // the active source (isrc) -- same reasoning as right-click and
+                // live-preview submap handlers: mixing camera_types in one
+                // project() call breaks the off-type cams. Previous version
+                // looped over all sources and passed them raw through project()
+                // with isrc.intrinsics -- Spherical cams in a Pinhole run
+                // projected as if pinhole (bogus), and Spherical active never
+                // got cube-face expansion because expand_source_cams_for_projection
+                // was not called here at all.
                 const double t0 = sm->frames.front()->stamp, t1 = sm->frames.back()->stamp;
                 std::vector<CameraFrame> cams;
-                for (const auto& src2 : image_sources) {
-                  for (const auto& cam : src2.frames) {
-                    if (!cam.located || cam.timestamp <= 0) continue;
-                    const double ct = cam.timestamp + src2.time_shift;
-                    if (ct >= t0 - 1.0 && ct <= t1 + 1.0) cams.push_back(cam);
+                for (const auto& cam : isrc.frames) {
+                  if (!cam.located || cam.timestamp <= 0) continue;
+                  const double ct = cam.timestamp + effective_time_shift(isrc, cam.timestamp);
+                  if (ct >= t0 - 1.0 && ct <= t1 + 1.0) {
+                    CameraFrame shifted = cam;
+                    shifted.timestamp = ct;  // LiDAR-time for time-slice comparisons
+                    cams.push_back(std::move(shifted));
                   }
                 }
                 if (cams.empty()) continue;
 
-                // Load HD points
+                // Load HD points (+ normals & times when available)
                 auto hd = load_hd_for_submap(si, false);
                 if (!hd || hd->size() == 0) continue;
                 const Eigen::Isometry3d T_wo = sm->T_world_origin;
+                const Eigen::Matrix3d R_wo = T_wo.rotation();
                 std::vector<Eigen::Vector3f> wpts(hd->size());
                 std::vector<float> ints(hd->size(), 0.0f);
+                std::vector<Eigen::Vector3f> wnor;
+                std::vector<double> wtimes;
+                if (hd->normals) wnor.resize(hd->size());
+                if (hd->times)   wtimes.assign(hd->times, hd->times + hd->size());
                 for (size_t i = 0; i < hd->size(); i++) {
                   wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
                   if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                  if (hd->normals)     wnor[i] = (R_wo * Eigen::Vector3d(hd->normals[i].head<3>())).normalized().cast<float>();
                 }
 
-                auto cr = Colorizer::project_colors(cams, isrc.intrinsics, wpts, ints, colorize_max_range, colorize_blend, colorize_min_range, colorize_mask);
-                for (size_t i = 0; i < cr.points.size(); i++) {
-                  if (cr.colors[i].x() == 0.5f && cr.colors[i].y() == 0.5f && cr.colors[i].z() == 0.5f) continue; // skip gray (uncolored)
-                  all_pts.push_back(Eigen::Vector4d(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0));
-                  all_cols.push_back(Eigen::Vector4f(cr.colors[i].x(), cr.colors[i].y(), cr.colors[i].z(), 1.0f));
-                  agg.points.push_back(cr.points[i]);
-                  agg.colors.push_back(cr.colors[i]);
-                  if (i < cr.intensities.size()) agg.intensities.push_back(cr.intensities[i]);
-                }
+                // Cube-face expand for Spherical (no-op for Pinhole). Without
+                // this, a Spherical active source projects as if pinhole and
+                // produces near-zero colored points.
+                auto expanded = expand_source_cams_for_projection(isrc, cams, colorize_mask);
+                auto cr = make_colorizer(isrc.params.view_selector_mode)->project(
+                  expanded.cams, expanded.intrinsics, wpts, ints, wnor, wtimes, current_blend_params(isrc));
                 total_colored += cr.colored;
+
+                // Build this submap's drawable data (only colored, non-gray points)
+                std::vector<Eigen::Vector4d> sm_pts; sm_pts.reserve(cr.points.size());
+                std::vector<Eigen::Vector4f> sm_cols; sm_cols.reserve(cr.points.size());
+                for (size_t i = 0; i < cr.points.size(); i++) {
+                  if (cr.colors[i].x() == 0.5f && cr.colors[i].y() == 0.5f && cr.colors[i].z() == 0.5f) continue;
+                  sm_pts.emplace_back(cr.points[i].x(), cr.points[i].y(), cr.points[i].z(), 1.0);
+                  sm_cols.emplace_back(cr.colors[i].x(), cr.colors[i].y(), cr.colors[i].z(), 1.0f);
+                }
+                if (sm_pts.empty()) continue;
+                total_rendered_pts += sm_pts.size();
+                sm_drawables_made++;
+
+                // Upload immediately on main thread, by submap id.
+                const int submap_id = sm->id;
+                guik::LightViewer::instance()->invoke([this, submap_id, pts = std::move(sm_pts), cols = std::move(sm_cols)]() mutable {
+                  auto vw = guik::LightViewer::instance();
+                  auto cb = std::make_shared<glk::PointCloudBuffer>(pts.data(), pts.size());
+                  cb->add_color(cols);
+                  const std::string name = "colorize_preview_sm_" + std::to_string(submap_id);
+                  vw->update_drawable(name, cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR));
+                  colorize_preview_sm_ids.push_back(submap_id);
+                });
               }
 
-              // Render — store in colorize_last_result so blend slider re-renders the full map
-              guik::LightViewer::instance()->invoke([this, all_pts, all_cols, agg, total_colored] {
-                auto vw = guik::LightViewer::instance();
-                lod_hide_all_submaps = true;
-                colorize_last_result = agg;
-                // Clear focused context so live preview won't swap back to a single submap/cam
-                colorize_last_submap = -1;
-                colorize_last_cam_src = -1;
-                colorize_last_cam_idx = -1;
-                if (!all_pts.empty()) {
-                  auto cb = std::make_shared<glk::PointCloudBuffer>(all_pts.data(), all_pts.size());
-                  cb->add_color(all_cols);
-                  vw->update_drawable("colorize_preview", cb, guik::Rainbow().set_color_mode(guik::ColorMode::VERTEX_COLOR));
-                }
-                char buf[128]; std::snprintf(buf, sizeof(buf), "Done: %zu colored points from %zu total", total_colored, all_pts.size());
+              // Final status
+              guik::LightViewer::instance()->invoke([this, total_colored, total_rendered_pts, sm_drawables_made] {
+                char buf[192]; std::snprintf(buf, sizeof(buf),
+                  "Done: %zu colored / %zu rendered pts across %zu submap drawables",
+                  total_colored, total_rendered_pts, sm_drawables_made);
                 colorize_all_status = buf;
                 colorize_all_running = false;
                 logger->info("[Colorize] {}", colorize_all_status);
@@ -2663,57 +4750,106 @@ void OfflineViewer::setup_ui() {
         if (ImGui::Button("Clear preview")) {
           auto vw = guik::LightViewer::instance();
           vw->remove_drawable("colorize_preview");
+          for (int sid : colorize_preview_sm_ids) vw->remove_drawable("colorize_preview_sm_" + std::to_string(sid));
+          colorize_preview_sm_ids.clear();
           lod_hide_all_submaps = false;
         }
 
         // Apply colorize to HD (write aux_rgb.bin per frame)
         static bool apply_rgb_running = false;
         static std::string apply_rgb_status;
+        {
+          const char* methods[] = {"Per-submap (legacy)", "Chunk-based"};
+          ImGui::SetNextItemWidth(180);
+          ImGui::Combo("Method##apply", &apply_method, methods, IM_ARRAYSIZE(methods));
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Per-submap: iterate submaps, project all cameras in each submap's time range.\n"
+            "  Fast, but submap boundaries can cut off cameras that would have seen edge points.\n"
+            "\n"
+            "Chunk-based: iterate spatial chunks along the trajectory (like Voxelize HD / Data Filter).\n"
+            "  For each chunk, load frames + cameras whose bbox/position overlap, with edge margin.\n"
+            "  Eliminates submap-boundary cut-offs -- a point near a submap edge sees EVERY camera\n"
+            "  that could see it, not just those in its own submap's time window.");
+          if (apply_method == 1) {
+            ImGui::Indent();
+            ImGui::SetNextItemWidth(100); ImGui::DragFloat("chunk (m)##apply", &apply_chunk_size_m, 1.0f, 5.0f, 200.0f, "%.1f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Core chunk size. Points in this area are the ones WRITTEN per chunk.");
+            ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+            ImGui::DragFloat("margin (m)##apply", &apply_chunk_margin_m, 1.0f, 0.0f, 200.0f, "%.1f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Edge overlap: frames+cameras within (core + margin) are LOADED so points near the\n"
+              "chunk boundary see all cameras that might contribute. Set >= colorize max_range.");
+            ImGui::Unindent();
+          }
+        }
         if (apply_rgb_running) {
           ImGui::TextColored(ImVec4(1, 1, 0, 1), "%s", apply_rgb_status.c_str());
+          ImGui::SameLine();
+          ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.25f, 0.25f, 1.0f));
+          if (ImGui::Button(apply_cancel_requested ? "Stopping...##app" : "Stop##app")) apply_cancel_requested = true;
+          ImGui::PopStyleColor();
         } else {
-          if (ImGui::Button("Apply colorize to HD")) {
+          if (ImGui::Button(apply_method == 0 ? "Apply colorize to HD (per-submap)" : "Apply colorize to HD (chunked)")) {
             apply_rgb_running = true;
+            apply_cancel_requested = false;
             apply_rgb_status = "Starting...";
             const auto mask_copy = colorize_mask.clone();
-            std::thread([this, mask_copy] {
+            if (apply_method == 0) std::thread([this, mask_copy] {
               if (!trajectory_built) build_trajectory();
               const auto start_time = std::chrono::steady_clock::now();
               const auto& isrc = image_sources[colorize_source_idx];
               int frames_written = 0;
 
               for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
+                if (apply_cancel_requested) break;
                 const auto& sm = submaps[si];
                 if (!sm || sm->frames.empty() || hidden_sessions.count(sm->session_id)) continue;
 
                 char buf[64]; std::snprintf(buf, sizeof(buf), "Submap %d/%zu...", si + 1, submaps.size());
                 apply_rgb_status = buf;
 
-                // Find cameras by timestamp
+                // Find cameras by timestamp. Restricted to active source +
+                // expanded via cube-face faces (no-op for Pinhole). Same reason
+                // as the preview paths: single intrinsics/camera_type per
+                // project() call.
                 const double t0 = sm->frames.front()->stamp, t1 = sm->frames.back()->stamp;
                 std::vector<CameraFrame> cams;
-                for (const auto& src2 : image_sources) {
-                  for (const auto& cam : src2.frames) {
-                    if (!cam.located || cam.timestamp <= 0) continue;
-                    const double ct = cam.timestamp + src2.time_shift;
-                    if (ct >= t0 - 1.0 && ct <= t1 + 1.0) cams.push_back(cam);
+                for (const auto& cam : isrc.frames) {
+                  if (!cam.located || cam.timestamp <= 0) continue;
+                  const double ct = cam.timestamp + effective_time_shift(isrc, cam.timestamp);
+                  if (ct >= t0 - 1.0 && ct <= t1 + 1.0) {
+                    CameraFrame shifted = cam;
+                    shifted.timestamp = ct;  // LiDAR-time for time-slice comparisons
+                    cams.push_back(std::move(shifted));
                   }
                 }
                 if (cams.empty()) continue;
 
-                // Load full submap (same as preview) — project once, split by frame
+                // Load full submap (same as preview) -- project once, split by frame
                 auto hd = load_hd_for_submap(si, false);
                 if (!hd || hd->size() == 0) continue;
                 const Eigen::Isometry3d T_wo = sm->T_world_origin;
+                const Eigen::Matrix3d R_wo = T_wo.rotation();
                 std::vector<Eigen::Vector3f> wpts(hd->size());
                 std::vector<float> ints(hd->size(), 0.0f);
+                std::vector<Eigen::Vector3f> wnor;
+                if (hd->normals) wnor.resize(hd->size());
                 for (size_t i = 0; i < hd->size(); i++) {
                   wpts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
                   if (hd->intensities) ints[i] = static_cast<float>(hd->intensities[i]);
+                  if (hd->normals)     wnor[i] = (R_wo * Eigen::Vector3d(hd->normals[i].head<3>())).normalized().cast<float>();
                 }
 
-                auto cr = Colorizer::project_colors(cams, isrc.intrinsics, wpts, ints,
-                  colorize_max_range, colorize_blend, colorize_min_range, mask_copy);
+                // Gather per-point times from hd (gps_time = frame_stamp + per-point offset)
+                std::vector<double> ptimes;
+                if (hd->times) { ptimes.assign(hd->times, hd->times + hd->size()); }
+                // Apply path runs in a worker thread that snapshotted mask_copy
+                // beforehand -- override the live mask on the base params.
+                BlendParams bp_apply = current_blend_params(isrc);
+                bp_apply.mask = mask_copy;
+                auto expanded = expand_source_cams_for_projection(isrc, cams, mask_copy);
+                auto cr = make_colorizer(isrc.params.view_selector_mode)->project(
+                  expanded.cams, expanded.intrinsics, wpts, ints, wnor, ptimes, bp_apply);
                 logger->info("[Apply] Submap {}: {} colored / {} total from {} cameras",
                   si, cr.colored, cr.total, cams.size());
 
@@ -2739,7 +4875,7 @@ void OfflineViewer::setup_ui() {
                     if (r >= 1.5f || rng.empty()) frame_hd_pts++;
                   }
 
-                  // Write aux_rgb.bin — map merged submap indices back to frame indices
+                  // Write aux_rgb.bin -- map merged submap indices back to frame indices
                   std::vector<float> rgb_data(fi.num_points * 3);
                   int hd_idx = 0;
                   for (int pi = 0; pi < fi.num_points; pi++) {
@@ -2753,7 +4889,7 @@ void OfflineViewer::setup_ui() {
                       }
                       hd_idx++;
                     } else {
-                      // Point filtered by range — use intensity fallback
+                      // Point filtered by range -- use intensity fallback
                       float gray = 0.5f;
                       rgb_data[pi * 3 + 0] = gray;
                       rgb_data[pi * 3 + 1] = gray;
@@ -2774,8 +4910,268 @@ void OfflineViewer::setup_ui() {
               apply_rgb_running = false;
               logger->info("[Colorize] {}", apply_rgb_status);
             }).detach();
+            // end per-submap branch
+            else std::thread([this, mask_copy] {
+              // ---- Chunk-based Apply ----
+              if (!trajectory_built) build_trajectory();
+              const auto start_time = std::chrono::steady_clock::now();
+              const auto& isrc = image_sources[colorize_source_idx];
+
+              // Build chunks along trajectory
+              auto chunks = glim::build_chunks(trajectory_data, trajectory_total_dist,
+                apply_chunk_size_m, apply_chunk_size_m * 0.5 + apply_chunk_margin_m);
+              logger->info("[Apply/chunk] {} chunks along {:.0f}m (core={}m, margin={}m)",
+                chunks.size(), trajectory_total_dist, apply_chunk_size_m, apply_chunk_margin_m);
+
+              // Index all frames (world bbox + frame_info from meta)
+              std::vector<glim::FrameInfo> all_frames;
+              for (const auto& sm : submaps) {
+                if (!sm) continue;
+                if (hidden_sessions.count(sm->session_id)) continue;
+                std::string shd = hd_frames_path;
+                for (const auto& s : sessions) { if (s.id == sm->session_id && !s.hd_frames_path.empty()) { shd = s.hd_frames_path; break; } }
+                const Eigen::Isometry3d T0 = sm->frames.front()->T_world_imu;
+                for (const auto& fr : sm->frames) {
+                  char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", fr->id);
+                  auto fi = glim::frame_info_from_meta(shd + "/" + dn,
+                    glim::compute_frame_world_pose(sm->T_world_origin, sm->T_origin_endpoint_L, T0, fr->T_world_imu, fr->T_lidar_imu),
+                    sm->id, sm->session_id);
+                  if (fi.num_points > 0) all_frames.push_back(std::move(fi));
+                }
+              }
+
+              // Frame-keyed RGB accumulator. Each entry holds a full vector
+              // sized to the frame's num_points (~12 B/pt). Without bounded
+              // lifetime this used to grow until end-of-Apply -- 5K frames at
+              // 64K pts each = ~3.7 GB just sitting around. Now flushed +
+              // evicted as soon as no future chunk needs the frame, so RAM
+              // stays bounded to "frames in-flight across the chunk margin".
+              struct FrameRgb {
+                int num_points = 0;
+                std::vector<Eigen::Vector3f> rgb;      // default (0.5, 0.5, 0.5) = uncolored gray
+                std::vector<uint8_t> has_color;        // parallel
+              };
+              std::unordered_map<std::string, FrameRgb> frame_rgb;  // key = frame.dir
+
+              // Pre-compute per-frame-dir "last chunk index that still needs it"
+              // by spatial AABB intersection. After processing chunk ci, any
+              // frame with last_chunk[fdir] <= ci can be flushed and dropped
+              // from frame_rgb -- no more chunks will touch it. This bounds the
+              // accumulator's RAM regardless of session length.
+              std::unordered_map<std::string, int> frame_last_chunk;
+              for (size_t ci = 0; ci < chunks.size(); ci++) {
+                const auto chunk_aabb = chunks[ci].world_aabb();
+                for (const auto& fi : all_frames) {
+                  if (fi.num_points == 0 || !chunk_aabb.intersects(fi.world_bbox)) continue;
+                  frame_last_chunk[fi.dir] = static_cast<int>(ci);  // overwrites with later ci automatically
+                }
+              }
+
+              // Loaded frame cache (sliding). Holds world-space points per frame directory.
+              struct CachedFrame {
+                std::vector<Eigen::Vector3f> world_pts;
+                std::vector<float> intensities;
+                std::vector<Eigen::Vector3f> world_normals;
+                std::vector<double> times;
+                std::vector<int> orig_idx;              // parallel; original index in frame's on-disk order
+              };
+              std::unordered_map<std::string, std::shared_ptr<CachedFrame>> frame_cache;
+
+              size_t total_points_written = 0;
+              size_t total_core_points_processed = 0;
+              int frames_written = 0;  // promoted out of the final loop so incremental flush can update it
+
+              for (size_t ci = 0; ci < chunks.size(); ci++) {
+                if (apply_cancel_requested) break;
+                const auto& chunk = chunks[ci];           // already built with margin half-size
+                const auto chunk_aabb = chunk.world_aabb();
+                glim::Chunk core = chunk;
+                core.half_size = apply_chunk_size_m * 0.5;
+
+                char buf[192]; std::snprintf(buf, sizeof(buf), "Chunk %zu/%zu loading (cache: %zu frames)",
+                  ci + 1, chunks.size(), frame_cache.size());
+                apply_rgb_status = buf;
+
+                // Find frames overlapping the LOADED area (chunk with margin)
+                std::vector<const glim::FrameInfo*> chunk_frame_infos;
+                std::unordered_set<std::string> needed_dirs;
+                for (const auto& fi : all_frames) {
+                  if (fi.num_points == 0 || !chunk_aabb.intersects(fi.world_bbox)) continue;
+                  chunk_frame_infos.push_back(&fi);
+                  needed_dirs.insert(fi.dir);
+                }
+
+                // Evict frames no longer needed
+                for (auto it = frame_cache.begin(); it != frame_cache.end();) {
+                  if (!needed_dirs.count(it->first)) it = frame_cache.erase(it);
+                  else ++it;
+                }
+
+                // Load missing frames into cache (+ normals, times when available)
+                for (const auto* fi : chunk_frame_infos) {
+                  if (frame_cache.count(fi->dir)) continue;
+                  std::vector<Eigen::Vector3f> pts; std::vector<float> rng, ints(fi->num_points, 0.0f);
+                  if (!glim::load_bin(fi->dir + "/points.bin", pts, fi->num_points)) continue;
+                  glim::load_bin(fi->dir + "/range.bin", rng, fi->num_points);
+                  glim::load_bin(fi->dir + "/intensities.bin", ints, fi->num_points);
+                  std::vector<Eigen::Vector3f> fnor;
+                  std::ifstream fnorm(fi->dir + "/normals.bin", std::ios::binary);
+                  if (fnorm) { fnor.resize(fi->num_points); fnorm.read(reinterpret_cast<char*>(fnor.data()), sizeof(Eigen::Vector3f) * fi->num_points); }
+                  std::vector<float> ft(fi->num_points, 0.0f);
+                  glim::load_bin(fi->dir + "/times.bin", ft, fi->num_points);
+                  const Eigen::Matrix3f R = fi->T_world_lidar.rotation().cast<float>();
+                  const Eigen::Vector3f t = fi->T_world_lidar.translation().cast<float>();
+                  const Eigen::Matrix3f R_for_normals = R;  // normals rotate same as points
+                  auto cf = std::make_shared<CachedFrame>();
+                  cf->world_pts.reserve(fi->num_points); cf->intensities.reserve(fi->num_points);
+                  cf->orig_idx.reserve(fi->num_points);
+                  if (!fnor.empty()) cf->world_normals.reserve(fi->num_points);
+                  cf->times.reserve(fi->num_points);
+                  for (int i = 0; i < fi->num_points; i++) {
+                    if (!rng.empty() && rng[i] < 1.5f) continue;
+                    cf->world_pts.push_back(R * pts[i] + t);
+                    cf->intensities.push_back(ints[i]);
+                    cf->orig_idx.push_back(i);
+                    if (!fnor.empty()) cf->world_normals.push_back((R_for_normals * fnor[i]).normalized());
+                    cf->times.push_back(static_cast<double>(fi->stamp) + static_cast<double>(ft[i]));
+                  }
+                  // Prepare persistent FrameRgb on first touch
+                  auto& pf = frame_rgb[fi->dir];
+                  if (pf.rgb.empty()) {
+                    pf.num_points = fi->num_points;
+                    pf.rgb.assign(fi->num_points, Eigen::Vector3f(0.5f, 0.5f, 0.5f));
+                    pf.has_color.assign(fi->num_points, 0);
+                  }
+                  frame_cache[fi->dir] = cf;
+                }
+
+                // Find cameras whose POSITION is within the loaded chunk AABB, AND
+                // whose forward axis points toward the core (rejects cameras driving past
+                // the chunk and looking the other way -- otherwise they project nothing
+                // useful but pay full NCC/occlusion cost). Restricted to the active
+                // source only (one camera_type per project() call).
+                const Eigen::Vector3d core_center = core.center;
+                std::vector<CameraFrame> cams;
+                int rejected_backward = 0, rejected_outside = 0;
+                // For Spherical the forward-dot-to-core gate is meaningless
+                // (360 cams see in every direction) -- skip it when equirect.
+                const bool is_spherical_src = (isrc.camera_type == CameraType::Spherical);
+                for (const auto& cam : isrc.frames) {
+                  if (!cam.located || cam.timestamp <= 0) continue;
+                  const Eigen::Vector3f cp = cam.T_world_cam.translation().cast<float>();
+                  if (!chunk.contains(cp)) { rejected_outside++; continue; }
+                  if (!is_spherical_src) {
+                    const Eigen::Vector3d cam_fwd = cam.T_world_cam.rotation() * Eigen::Vector3d::UnitZ();
+                    const Eigen::Vector3d to_core = (core_center - cam.T_world_cam.translation()).normalized();
+                    if (cam_fwd.dot(to_core) < 0.2) { rejected_backward++; continue; }
+                  }
+                  CameraFrame shifted = cam;
+                  shifted.timestamp = cam.timestamp + effective_time_shift(isrc, cam.timestamp);
+                  cams.push_back(std::move(shifted));
+                }
+                if (cams.empty()) continue;
+
+                // Assemble points in the CORE area (only these get written), keeping back-references
+                std::vector<Eigen::Vector3f> chunk_pts;
+                std::vector<float> chunk_ints;
+                std::vector<Eigen::Vector3f> chunk_nors;
+                std::vector<double> chunk_times;
+                std::vector<std::pair<std::string, int>> chunk_src;  // (frame.dir, orig_idx)
+                for (const auto* fi : chunk_frame_infos) {
+                  auto it = frame_cache.find(fi->dir);
+                  if (it == frame_cache.end()) continue;
+                  const auto& cf = it->second;
+                  const bool have_normals = !cf->world_normals.empty();
+                  for (size_t i = 0; i < cf->world_pts.size(); i++) {
+                    if (!core.contains(cf->world_pts[i])) continue;
+                    chunk_pts.push_back(cf->world_pts[i]);
+                    chunk_ints.push_back(cf->intensities[i]);
+                    if (have_normals) chunk_nors.push_back(cf->world_normals[i]);
+                    chunk_times.push_back(cf->times[i]);
+                    chunk_src.emplace_back(fi->dir, cf->orig_idx[i]);
+                  }
+                }
+                if (chunk_pts.empty()) continue;
+
+                {
+                  char sbuf[192]; std::snprintf(sbuf, sizeof(sbuf),
+                    "Chunk %zu/%zu projecting: %zu cams, %zu pts (skipped %d back-facing, %d outside)",
+                    ci + 1, chunks.size(), cams.size(), chunk_pts.size(), rejected_backward, rejected_outside);
+                  apply_rgb_status = sbuf;
+                }
+
+                BlendParams bp_chunk = current_blend_params(isrc);
+                bp_chunk.mask = mask_copy;
+                auto expanded = expand_source_cams_for_projection(isrc, cams, mask_copy);
+                auto cr = make_colorizer(isrc.params.view_selector_mode)->project(
+                  expanded.cams, expanded.intrinsics, chunk_pts, chunk_ints,
+                  chunk_nors.size() == chunk_pts.size() ? chunk_nors : std::vector<Eigen::Vector3f>{},
+                  chunk_times, bp_chunk);
+
+                // Scatter results back to per-frame RGB arrays
+                for (size_t i = 0; i < cr.points.size(); i++) {
+                  // Skip uncolored (gray sentinel) points
+                  if (cr.colors[i].x() == 0.5f && cr.colors[i].y() == 0.5f && cr.colors[i].z() == 0.5f) continue;
+                  const auto& [fdir, oidx] = chunk_src[i];
+                  auto& pf = frame_rgb[fdir];
+                  if (oidx >= 0 && oidx < pf.num_points) {
+                    pf.rgb[oidx] = cr.colors[i];
+                    pf.has_color[oidx] = 1;
+                    total_points_written++;
+                  }
+                }
+                total_core_points_processed += chunk_pts.size();
+
+                // Incremental flush: any frame that no later chunk will touch
+                // gets its aux_rgb.bin written and dropped from frame_rgb. This
+                // is the bound that keeps RAM linear in chunk-margin frame
+                // count, not total session frame count.
+                for (auto it = frame_rgb.begin(); it != frame_rgb.end();) {
+                  auto last_it = frame_last_chunk.find(it->first);
+                  const bool no_more_chunks =
+                    (last_it == frame_last_chunk.end()) ||
+                    (last_it->second <= static_cast<int>(ci));
+                  if (!no_more_chunks) { ++it; continue; }
+                  const auto& fdir = it->first;
+                  const auto& pf = it->second;
+                  bool any = false;
+                  for (uint8_t b : pf.has_color) if (b) { any = true; break; }
+                  if (any) {
+                    std::ofstream f(fdir + "/aux_rgb.bin", std::ios::binary);
+                    if (f) {
+                      f.write(reinterpret_cast<const char*>(pf.rgb.data()), sizeof(Eigen::Vector3f) * pf.num_points);
+                      frames_written++;
+                    }
+                  }
+                  it = frame_rgb.erase(it);
+                }
+              }
+
+              // Final flush -- safety net for anything not caught by the
+              // per-chunk pass (e.g. a frame whose last_chunk index wasn't
+              // computed because its bbox didn't overlap any chunk).
+              apply_rgb_status = "Writing remaining aux_rgb.bin...";
+              for (const auto& [fdir, pf] : frame_rgb) {
+                bool any = false;
+                for (uint8_t b : pf.has_color) if (b) { any = true; break; }
+                if (!any) continue;
+                std::ofstream f(fdir + "/aux_rgb.bin", std::ios::binary);
+                if (!f) continue;
+                f.write(reinterpret_cast<const char*>(pf.rgb.data()), sizeof(Eigen::Vector3f) * pf.num_points);
+                frames_written++;
+              }
+              frame_rgb.clear();
+
+              const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+              char buf[192]; std::snprintf(buf, sizeof(buf),
+                "Chunked done: %d frames written, %zu core pts processed, %zu colored (%.1f sec)",
+                frames_written, total_core_points_processed, total_points_written, elapsed);
+              apply_rgb_status = buf;
+              apply_rgb_running = false;
+              logger->info("[Apply/chunk] {}", apply_rgb_status);
+            }).detach();
           }
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip("WRITE aux_rgb.bin to every HD frame.\nPersistent — appears in color dropdown after HD reload.");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("WRITE aux_rgb.bin to every HD frame.\nPersistent -- appears in color dropdown after HD reload.");
         }
 
         // Info about first/last timestamps
@@ -2798,7 +5194,7 @@ void OfflineViewer::setup_ui() {
     ImGui::End();
   });
 
-  // Alignment check window — image + projected LiDAR overlay, scale-aware
+  // Alignment check window -- image + projected LiDAR overlay, scale-aware
   viewer->register_ui_callback("align_view", [this] {
     if (!align_show) return;
     ImGui::SetNextWindowSize(ImVec2(1000, 700), ImGuiCond_FirstUseEver);
@@ -2827,44 +5223,255 @@ void OfflineViewer::setup_ui() {
       if (ImGui::ArrowButton("##align_next", ImGuiDir_Right)) align_cam_idx = std::min(static_cast<int>(src.frames.size()) - 1, align_cam_idx + 1);
       ImGui::SameLine();
       ImGui::Text("%s", boost::filesystem::path(src.frames[align_cam_idx].filepath).filename().string().c_str());
+      // Camera-type badge -- same wording as the Colorize window so the user
+      // sees the model this overlay is branching on (pinhole proj + distortion
+      // vs equirectangular proj with no distortion).
+      ImGui::SameLine();
+      if (src.camera_type == CameraType::Spherical) {
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "[%s]", camera_type_label(src.camera_type));
+      } else {
+        ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.55f, 1.0f), "[%s]", camera_type_label(src.camera_type));
+      }
 
-      ImGui::SetNextItemWidth(120); ImGui::SliderFloat("View scale", &align_display_scale, 0.05f, 4.0f, "%.2fx");
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Display scale vs native pixels.\nMath always runs at native resolution.");
+      ImGui::SetNextItemWidth(120); ImGui::SliderFloat("View scale", &align_display_scale, 0.05f, 10.0f, "%.2fx");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Display scale vs native pixels. Math always runs at native resolution.\n"
+        "Mouse wheel on the canvas zooms around the cursor; +/- buttons step.");
       ImGui::SameLine(); if (ImGui::Button("Fit")) {
         // Will be computed below once we know window size
         align_display_scale = -1.0f;  // sentinel
       }
+      ImGui::SameLine();
+      if (ImGui::Button("-##zoom")) align_display_scale = std::max(0.05f, align_display_scale / 1.25f);
+      ImGui::SameLine();
+      if (ImGui::Button("+##zoom")) align_display_scale = std::min(10.0f, align_display_scale * 1.25f);
       ImGui::SameLine(); ImGui::SetNextItemWidth(100);
       ImGui::SliderFloat("Pt size", &align_point_size, 0.5f, 6.0f, "%.1f");
-      ImGui::SameLine(); ImGui::SetNextItemWidth(100);
-      ImGui::Combo("Color", &align_point_color_mode, "Intensity\0Range\0Depth\0");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(110);
+      ImGui::Combo("Color", &align_point_color_mode, "Intensity\0Range\0Depth\0Winner-mask\0Weight\0");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "How to color projected dots.\n"
+        "- Winner-mask: only points where this camera is the top-1 winner (requires Compute assignment)\n"
+        "- Weight: heatmap of per-point winning weight (requires Compute assignment)");
+      // Color scale dropdown: applies to any scalar mode (Intensity/Range/Depth/Weight).
+      // Winner-mask is categorical (this-cam vs others) and ignores the scale.
+      if (align_point_color_mode != 3) {
+        ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+        static const auto _cmap_names = glk::colormap_names();
+        ImGui::Combo("Scale##al", &align_colormap_sel, _cmap_names.data(), static_cast<int>(_cmap_names.size()));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Color scale applied to the active scalar field (Intensity / Range / Depth / Weight).\n"
+          "Winner-mask is categorical and ignores this.\n"
+          "Turbo (default) is perceptually strong; Cividis is colour-blind safe; Ocean / Turbo\n"
+          "are great for LiDAR intensity. Try different scales to surface contrast in dim data.");
+      }
+      // Colorize-from-this-camera: runs the full colorize pipeline (view-selector
+      // + all vs_* params from the Colorize window) on the current submap cloud
+      // using ONLY this one frame as the camera source. Shows what this single
+      // frame actually contributes to the overall colorize, so misalignment
+      // between image + LiDAR jumps out immediately. Lives through param tweaks
+      // when live preview is on.
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Colorize", &align_colorize_auto)) {
+        // Click just flipped the value; act on the new state.
+        if (align_colorize_auto) {
+          align_colorize_dirty = true;
+          align_colorize_valid = true;
+        } else {
+          align_colorize_valid = false;
+          align_colorize_dirty = false;
+          align_colorize_rgb.clear();
+        }
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "TOGGLE. When ON, the RGB cache auto-recomputes:\n"
+        "  - every time you step to a different camera frame\n"
+        "  - on every intrinsic / extrinsic / time-shift change (with Live preview ON)\n"
+        "\n"
+        "Runs the full Colorize pipeline on this single camera (view selector,\n"
+        "range gates, exposure, NCC, incidence, occlusion, time-slice). Overrides\n"
+        "the scalar color mode while active. Cost is ~50-200 ms per compute --\n"
+        "fast enough to feel instant while scrubbing frames.");
+      if (align_colorize_valid) {
+        ImGui::SameLine();
+        if (ImGui::Button("Clear RGB")) {
+          align_colorize_valid = false;
+          align_colorize_dirty = false;
+          align_colorize_auto = false;   // turn toggle off so frame-change won't re-fire
+          align_colorize_rgb.clear();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Drop the colorize cache AND turn off the auto-colorize toggle.\n"
+          "Back to scalar color mode. Saves navigating away and back to reset.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Hide uncol", &align_colorize_hide_uncolored);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Skip drawing points the colorizer couldn't colour (gray-sentinel).\n"
+          "These are points rejected by time-slice / incidence / NCC / occlusion\n"
+          "gates. Hiding them shows EXACTLY what this camera contributes --\n"
+          "matches the scene-view colorize output 1:1.");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "RGB active");
+      }
+      // Frame change: either drop the cache (one-shot mode) or request a
+      // recompute for the new frame (auto mode). Auto mode keeps the "RGB
+      // active" label lit so the user sees continuous coloring while scrubbing.
+      if (align_colorize_valid &&
+          (align_colorize_cam_src != align_cam_src || align_colorize_cam_idx != align_cam_idx)) {
+        if (align_colorize_auto) {
+          align_colorize_dirty = true;  // recompute for the new frame
+        } else {
+          align_colorize_valid = false;
+          align_colorize_rgb.clear();
+        }
+      }
+      // Auto-refresh while live preview is ON and anything the colorizer depends
+      // on changed since last compute (intrinsics, lever arm, rpy, time shift).
+      if (align_colorize_valid && align_live_preview) {
+        const auto& lk = align_last_intrinsics; const auto& ck = src.intrinsics;
+        const bool extr_changed =
+          align_last_rpy != src.rotation_rpy || align_last_lever != src.lever_arm ||
+          align_last_time_shift != src.time_shift;
+        const bool intr_changed =
+          lk.fx != ck.fx || lk.fy != ck.fy || lk.cx != ck.cx || lk.cy != ck.cy ||
+          lk.k1 != ck.k1 || lk.k2 != ck.k2 || lk.k3 != ck.k3 ||
+          lk.p1 != ck.p1 || lk.p2 != ck.p2;
+        if (extr_changed || intr_changed) align_colorize_dirty = true;
+      }
       ImGui::SameLine(); ImGui::SetNextItemWidth(100);
       ImGui::SliderFloat("Min bright", &align_bright_threshold, 0.0f, 1.0f, "%.2f");
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only show points with intensity above this threshold.\nUseful for comparing road markings.");
 
-      ImGui::SetNextItemWidth(120); ImGui::SliderFloat("Max range", &align_max_range, 2.0f, 100.0f, "%.1fm");
+      ImGui::SetNextItemWidth(120); ImGui::SliderFloat("Max range", &align_max_range, 2.0f, 200.0f, "%.1fm");
       ImGui::SameLine(); ImGui::SetNextItemWidth(120);
       ImGui::SliderFloat("Min range", &align_min_range, 0.1f, 10.0f, "%.1fm");
       ImGui::SameLine(); ImGui::SetNextItemWidth(120);
       ImGui::SliderFloat("Alpha", &align_point_alpha, 0.05f, 1.0f, "%.2f");
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overlay point transparency — blend dots with image.");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overlay point transparency -- blend dots with image.");
       ImGui::SameLine();
+      if (ImGui::Checkbox("Gray BG", &align_image_grayscale)) align_loaded_path.clear();  // force reload
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Render the background image as grayscale. Boosts visual contrast between\n"
+        "the colored LiDAR dots and the photo, making small offsets easier to spot.");
+      ImGui::SameLine();
+      ImGui::Checkbox("Hide BG", &align_image_hidden);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Fully hide the background image -- inspect coloring quality on the raw\n"
+        "dot overlay. Useful for judging colorize (RGB) output without photo bias.");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(90);
+      ImGui::InputInt("+/- frames", &align_nearest_frames, 1, 5);
+      align_nearest_frames = std::clamp(align_nearest_frames, 0, 60);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Temporal filter on displayed points:\n"
+        "  0 = whole submap (may include ~1-2s of LiDAR frames)\n"
+        "  N = keep only points from +/- N LiDAR frames around this camera's time\n"
+        "\n"
+        "Set to 1-2 to mimic what colorize-with-time-slice actually covers --\n"
+        "the alignment check then shows the same subset the scene view colors,\n"
+        "making offset diagnostics 1:1 with the final output.");
+      ImGui::SameLine();
+      ImGui::Checkbox("Grid##al", &align_grid_show);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Overlay a reference grid of straight horizontal + vertical lines.\n"
+        "Real-world straight features (building edges, road lanes, sign posts)\n"
+        "should project to STRAIGHT lines on a well-calibrated image. Distortion\n"
+        "bends them. Eyeball the bend against a grid line to spot residual k1/k2.");
+      if (align_grid_show) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        ImGui::InputInt("+/- lines", &align_grid_lines, 1, 5);
+        align_grid_lines = std::clamp(align_grid_lines, 1, 60);
+      }
+      // User-placed reference lines: click a feature that should be straight in
+      // the world -> a distorted straight line is drawn through it. Store in
+      // IDEAL pinhole coords (distortion-invariant) so the line re-bends correctly
+      // as the user tweaks k1/k2/p1/p2 live.
+      ImGui::SameLine();
+      if (ImGui::Button(align_add_line_mode == 1 ? "Click V...##al" : "+V##al")) {
+        align_add_line_mode = (align_add_line_mode == 1) ? 0 : 1;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Arm 'add vertical reference line' -- next click on the image places a\n"
+        "vertical line passing through that point. The line bends with current\n"
+        "distortion so it always represents a world-straight feature.");
+      ImGui::SameLine();
+      if (ImGui::Button(align_add_line_mode == 2 ? "Click H...##al" : "+H##al")) {
+        align_add_line_mode = (align_add_line_mode == 2) ? 0 : 2;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Arm 'add horizontal reference line' -- next click on the image places\n"
+        "a horizontal line through that point, bent by current distortion.");
+      if (!align_user_lines.empty()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Clear lines##al")) {
+          align_user_lines.clear();
+          align_add_line_mode = 0;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%zu)", align_user_lines.size());
+      }
+      ImGui::SameLine();
+      // Rectified only makes sense for Brown-Conrady pinhole. Greyed out +
+      // forced off for Spherical (equirect has no k1/k2/p1/p2 to undo).
+      const bool rectify_applicable = camera_type_has_brown_conrady(src.camera_type);
+      ImGui::BeginDisabled(!rectify_applicable);
       if (ImGui::Checkbox("Rectified", &align_rectified)) align_loaded_path.clear();  // force reload
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("OFF: raw image + distorted projection (matches colorize phase).\nON: undistorted image + pinhole projection (isolates extrinsic error).");
-      if (align_rectified) {
-        ImGui::TextDisabled("Mode: rectified image vs pinhole projection — residual = extrinsic only.");
+      ImGui::EndDisabled();
+      if (!rectify_applicable && align_rectified) { align_rectified = false; align_loaded_path.clear(); }
+      if (ImGui::IsItemHovered()) {
+        if (rectify_applicable) {
+          ImGui::SetTooltip("OFF: raw image + distorted projection (matches colorize phase).\nON: undistorted image + pinhole projection (isolates extrinsic error).");
+        } else {
+          ImGui::SetTooltip("Not applicable for %s sources -- equirectangular has no\nBrown-Conrady distortion parameters to undo.",
+            camera_type_label(src.camera_type));
+        }
+      }
+      ImGui::SameLine();
+      ImGui::Checkbox("Live preview##al", &align_live_preview);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Re-render this overlay whenever intrinsics / extrinsics / time-shift change.\n"
+        "Cheaper than the Colorize window's live preview (one image, not a full HD\n"
+        "cloud re-project), so it's the right place to iterate on distortion + pose.\n"
+        "\n"
+        "When ON: the Colorize window's 'Live preview' is overridden OFF for perf --\n"
+        "you get instant overlay feedback here while tuning the params there.");
+      // Both live-preview toggles coexist now. They operate on independent
+      // state (align overlays a single image; Colorize re-projects a cloud),
+      // and the user benefits from seeing BOTH update while dragging time_shift
+      // -- align gives 2D offset feedback, Colorize 3D gives section-wide effect.
+      // If you hit a perf wall, turn one off manually.
+      if (src.camera_type == CameraType::Spherical) {
+        ImGui::TextDisabled("Mode: equirectangular image vs spherical projection -- residual = extrinsic + time shift.");
+      } else if (align_rectified) {
+        ImGui::TextDisabled("Mode: rectified image vs pinhole projection -- residual = extrinsic only.");
       } else {
-        ImGui::TextDisabled("Mode: raw image vs distorted projection — residual = extrinsic + distortion model.");
+        ImGui::TextDisabled("Mode: raw image vs distorted projection -- residual = extrinsic + distortion model.");
       }
 
       // --- Load image if needed ---
+      // Triggers: new camera, rectified toggle changed, OR live-preview mode
+      // with rectified ON and intrinsics changed since last load (cheap check
+      // on raw doubles -- one exact compare per field).
       const auto& cam = src.frames[align_cam_idx];
-      if (cam.filepath != align_loaded_path || align_rect_applied != align_rectified) {
+      const auto& lk = align_last_intrinsics; const auto& ck = src.intrinsics;
+      // Re-undistort whenever intrinsics drift from the snapshot the current
+      // texture was built from, regardless of the Live preview toggle. Otherwise
+      // tweaking k1/cx with Live preview OFF leaves the image stale while the
+      // grid / user lines update, making them appear mis-registered.
+      const bool intrinsics_changed_for_rect =
+        align_rectified && (
+          lk.fx != ck.fx || lk.fy != ck.fy || lk.cx != ck.cx || lk.cy != ck.cy ||
+          lk.k1 != ck.k1 || lk.k2 != ck.k2 || lk.k3 != ck.k3 ||
+          lk.p1 != ck.p1 || lk.p2 != ck.p2);
+      if (cam.filepath != align_loaded_path || align_rect_applied != align_rectified
+          || intrinsics_changed_for_rect) {
         cv::Mat img = cv::imread(cam.filepath);
         if (!img.empty()) {
           align_img_w = img.cols; align_img_h = img.rows;
-          // Optional rectification: undistort at native resolution using source intrinsics
-          if (align_rectified) {
+          // Optional rectification: only meaningful for Brown-Conrady pinhole.
+          // Spherical/Fisheye ignore the toggle -- no k1/k2/p1/p2 to undo.
+          if (align_rectified && camera_type_has_brown_conrady(src.camera_type)) {
             cv::Mat K = (cv::Mat_<double>(3, 3) <<
               src.intrinsics.fx, 0, src.intrinsics.cx,
               0, src.intrinsics.fy, src.intrinsics.cy,
@@ -2876,7 +5483,15 @@ void OfflineViewer::setup_ui() {
             cv::undistort(img, rect, K, D);
             img = rect;
           }
-          cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+          if (align_image_grayscale) {
+            // Grayscale then broadcast back to 3 channels -- texture stays RGB,
+            // the extra contrast makes colored dots pop against the photo.
+            cv::Mat gray;
+            cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+            cv::cvtColor(gray, img, cv::COLOR_GRAY2RGB);
+          } else {
+            cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+          }
           // Downscale texture if huge; display math uses native size
           const int max_tex = 2048;
           cv::Mat tex_img = img;
@@ -2894,19 +5509,44 @@ void OfflineViewer::setup_ui() {
           align_tex_w = tex_img.cols; align_tex_h = tex_img.rows;
           align_loaded_path = cam.filepath;
           align_rect_applied = align_rectified;
+          align_last_intrinsics = src.intrinsics;  // snapshot for change detection next frame
         }
       }
 
       // --- Locate camera using current colorize extrinsic (live-linked) ---
       if (!trajectory_built) build_trajectory();
-      std::vector<TimedPose> timed_traj(trajectory_data.size());
-      for (size_t i = 0; i < trajectory_data.size(); i++) timed_traj[i] = {trajectory_data[i].stamp, trajectory_data[i].pose};
+      const auto timed_traj = timed_traj_snapshot();
+      // Auto-sync scalar time_shift to the interpolated value when the user
+      // scrubs to a different frame (anchors active only). Two effects:
+      //   1. The time_shift widget in the Colorize window shows a MEANINGFUL
+      //      number for this specific section of track -- not a frozen global.
+      //   2. The user can drag that widget to preview a BETTER calib for this
+      //      frame; the align-check overlay updates live (scratch override).
+      //      "Anchor here" then commits the dragged value as an anchor.
+      {
+        static int prev_align_cam_src = -1;
+        static int prev_align_cam_idx = -1;
+        if (!src.anchors.empty() && cam.timestamp > 0.0 &&
+            (prev_align_cam_src != align_cam_src || prev_align_cam_idx != align_cam_idx)) {
+          src.time_shift = effective_time_shift(src, cam.timestamp);
+        }
+        prev_align_cam_src = align_cam_src;
+        prev_align_cam_idx = align_cam_idx;
+      }
+
       Eigen::Isometry3d T_world_cam = Eigen::Isometry3d::Identity();
       bool cam_ok = false;
-      if (cam.timestamp > 0.0 && !timed_traj.empty()) {
+      // Route through the per-source alt trajectory when the active source is
+      // in 'Coords > own path' mode; otherwise use SLAM (modes 0/1 unchanged).
+      const auto& align_traj = trajectory_for(src, timed_traj);
+      if (cam.timestamp > 0.0 && !align_traj.empty()) {
+        // Align-check uses the scalar src.time_shift DIRECTLY (not
+        // effective_time_shift) so dragging the widget updates this overlay
+        // live. Every other pipeline still goes through effective_time_shift
+        // and honors anchors as usual.
         const double ts = cam.timestamp + src.time_shift;
-        if (ts >= timed_traj.front().stamp - 2.0 && ts <= timed_traj.back().stamp + 2.0) {
-          const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(timed_traj, ts);
+        if (ts >= align_traj.front().stamp - 2.0 && ts <= align_traj.back().stamp + 2.0) {
+          const Eigen::Isometry3d T_world_lidar = Colorizer::interpolate_pose(align_traj, ts);
           const Eigen::Isometry3d T_lidar_cam = Colorizer::build_extrinsic(src.lever_arm, src.rotation_rpy);
           T_world_cam = T_world_lidar * T_lidar_cam;
           cam_ok = true;
@@ -2916,27 +5556,54 @@ void OfflineViewer::setup_ui() {
       // --- Find submap at camera timestamp; cache its world points ---
       int best_sm = -1;
       if (cam_ok) {
-        double best_dt = 1e9;
-        const double ct = cam.timestamp + src.time_shift;
-        for (int si = 0; si < static_cast<int>(submaps.size()); si++) {
-          if (!submaps[si] || submaps[si]->frames.empty()) continue;
-          const double t0 = submaps[si]->frames.front()->stamp, t1 = submaps[si]->frames.back()->stamp;
-          if (ct >= t0 && ct <= t1) { best_sm = si; break; }
-          const double dt = std::min(std::abs(ct - t0), std::abs(ct - t1));
-          if (dt < best_dt) { best_dt = dt; best_sm = si; }
-        }
+        best_sm = find_submap_for_timestamp(submaps, cam.timestamp + src.time_shift);
       }
       if (best_sm >= 0 && best_sm != align_last_submap_id) {
-        align_submap_world_pts.clear(); align_submap_ints.clear();
+        align_submap_world_pts.clear(); align_submap_ints.clear(); align_submap_world_normals.clear(); align_submap_world_times.clear();
         auto hd = load_hd_for_submap(best_sm, false);
         if (hd && hd->size() > 0) {
           const Eigen::Isometry3d T_wo = submaps[best_sm]->T_world_origin;
+          const Eigen::Matrix3d R_wo = T_wo.rotation();
           align_submap_world_pts.resize(hd->size());
           align_submap_ints.assign(hd->size(), 0.0f);
+          const bool have_normals = (hd->normals != nullptr);
+          const bool have_times   = (hd->times   != nullptr);
+          if (have_normals) align_submap_world_normals.resize(hd->size());
+          if (have_times)   align_submap_world_times.resize(hd->size());
           for (size_t i = 0; i < hd->size(); i++) {
             align_submap_world_pts[i] = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
             if (hd->intensities) align_submap_ints[i] = static_cast<float>(hd->intensities[i]);
+            if (have_normals) {
+              align_submap_world_normals[i] = (R_wo * Eigen::Vector3d(hd->normals[i].head<3>())).normalized().cast<float>();
+            }
+            if (have_times)  align_submap_world_times[i] = hd->times[i];
           }
+        }
+        // Percentile-based intensity range: 5% / 95% keeps a few bright outliers
+        // from flattening the whole scale to "dark". Recomputed per submap load.
+        if (!align_submap_ints.empty()) {
+          std::vector<float> ints_copy(align_submap_ints);
+          const size_t n = ints_copy.size();
+          const size_t lo = static_cast<size_t>(0.05 * n);
+          const size_t hi = static_cast<size_t>(0.95 * n);
+          std::nth_element(ints_copy.begin(), ints_copy.begin() + lo, ints_copy.end());
+          const float v_lo = ints_copy[lo];
+          std::nth_element(ints_copy.begin() + lo, ints_copy.begin() + hi, ints_copy.end());
+          const float v_hi = ints_copy[hi];
+          align_intensity_range = (v_hi > v_lo + 1e-3f)
+            ? Eigen::Vector2f(v_lo, v_hi)
+            : Eigen::Vector2f(0.0f, 255.0f);
+        } else {
+          align_intensity_range = Eigen::Vector2f(0.0f, 255.0f);
+        }
+        // Cache average LiDAR-frame interval for the "+/- N frames" temporal
+        // filter: allows translating a frame count into a wall-clock window.
+        align_frame_interval_s = 0.1;  // sensible default
+        if (submaps[best_sm] && submaps[best_sm]->frames.size() > 1) {
+          const double t0 = submaps[best_sm]->frames.front()->stamp;
+          const double t1 = submaps[best_sm]->frames.back()->stamp;
+          align_frame_interval_s = (t1 - t0) / std::max<double>(1, submaps[best_sm]->frames.size() - 1);
+          if (align_frame_interval_s < 1e-3 || align_frame_interval_s > 1.0) align_frame_interval_s = 0.1;
         }
         align_last_submap_id = best_sm;
       }
@@ -2946,7 +5613,7 @@ void OfflineViewer::setup_ui() {
       double nearest_frame_stamp = 0.0;
       double nearest_dt = 0.0;
       if (cam_ok && best_sm >= 0 && !submaps[best_sm]->frames.empty()) {
-        const double ct = cam.timestamp + src.time_shift;
+        const double ct = cam.timestamp + src.time_shift;  // scratch override; see note above
         double best_dt = 1e9;
         for (const auto& f : submaps[best_sm]->frames) {
           const double dt = std::abs(f->stamp - ct);
@@ -2961,6 +5628,86 @@ void OfflineViewer::setup_ui() {
         ImGui::TextDisabled("Camera not locatable (timestamp out of trajectory range).");
       }
 
+      // --- Time-shift anchors (shared widget; see render_anchor_panel) -------
+      ImGui::Separator();
+      render_anchor_panel(align_cam_src, cam.timestamp, cam.timestamp > 0.0, "align");
+
+      // --- Assignment compute controls (Winner-mask / Weight viz) ---
+      const bool need_assignment = (align_point_color_mode == 3 || align_point_color_mode == 4);
+      const bool cache_valid_for_current_view =
+        align_winner_sm == best_sm && align_winner_src == align_cam_src &&
+        align_winner_frame_idx.size() == align_submap_world_pts.size();
+      if (need_assignment) {
+        ImGui::PushStyleColor(ImGuiCol_Button, cache_valid_for_current_view ? ImVec4(0.2f, 0.4f, 0.2f, 1.0f) : ImVec4(0.5f, 0.3f, 0.1f, 1.0f));
+        const bool do_compute = ImGui::Button("Compute assignment");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Run weighted colorizer on this submap using cameras in its time window.\n"
+          "Caches per-point winner camera + weight. Required for Winner-mask / Weight viz.");
+        ImGui::SameLine();
+        if (cache_valid_for_current_view) {
+          ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "cached (sm=%d, src=%d)", align_winner_sm, align_winner_src);
+        } else {
+          ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.3f, 1.0f), "STALE -- click to recompute");
+        }
+        if (do_compute && cam_ok && best_sm >= 0 && !align_submap_world_pts.empty()) {
+          const double t0 = submaps[best_sm]->frames.front()->stamp;
+          const double t1 = submaps[best_sm]->frames.back()->stamp;
+          const double t_margin = 2.0;
+          // Build camera list for current source within submap time range, remember frame indices
+          std::vector<CameraFrame> cams;
+          std::vector<int> frame_idx_map;
+          for (int fi = 0; fi < static_cast<int>(src.frames.size()); fi++) {
+            const auto& c = src.frames[fi];
+            if (!c.located || c.timestamp <= 0.0) continue;
+            const double ct2 = c.timestamp + effective_time_shift(src, c.timestamp);
+            if (ct2 >= t0 - t_margin && ct2 <= t1 + t_margin) {
+              CameraFrame shifted = c;
+              shifted.timestamp = ct2;  // LiDAR-time for time-slice comparisons
+              cams.push_back(std::move(shifted));
+              frame_idx_map.push_back(fi);
+            }
+          }
+          if (!cams.empty()) {
+            // Assignment compute forces Weighted-Top-1 (deterministic winner per
+            // point) but otherwise honors every other tuning from the source's
+            // ColorizeParams. topK is pinned to 1 since the viz is winner-based.
+            BlendParams p = current_blend_params(src);
+            p.topK = 1;
+            auto impl = make_colorizer(ViewSelectorMode::WeightedTop1);
+            // For Spherical, each equirect cam becomes 6 virtual cube-face cams.
+            // winner_cam then indexes into the expanded list (0..6*N-1); recover
+            // the parent equirect index by dividing by 6 before mapping to the
+            // source's original frame list via frame_idx_map.
+            const bool is_sph = (src.camera_type == CameraType::Spherical);
+            auto expanded = expand_source_cams_for_projection(src, cams, colorize_mask);
+            auto res = impl->project(expanded.cams, expanded.intrinsics, align_submap_world_pts, align_submap_ints,
+                                     align_submap_world_normals, align_submap_world_times, p);
+            align_winner_frame_idx.assign(res.winner_cam.size(), -1);
+            align_winner_weight_vec.assign(res.winner_weight.size(), 0.0f);
+            align_weight_max_cached = 0.0f;
+            for (size_t i = 0; i < res.winner_cam.size(); i++) {
+              const int ci = res.winner_cam[i];
+              if (ci >= 0) {
+                const int parent = is_sph ? (ci / 6) : ci;
+                if (parent >= 0 && parent < static_cast<int>(frame_idx_map.size())) {
+                  align_winner_frame_idx[i] = frame_idx_map[parent];
+                }
+              }
+              align_winner_weight_vec[i] = res.winner_weight[i];
+              if (res.winner_weight[i] > align_weight_max_cached) align_weight_max_cached = res.winner_weight[i];
+            }
+            align_winner_sm = best_sm;
+            align_winner_src = align_cam_src;
+            logger->info("[Align] Computed assignment: sm={} src={} type={} cams_used={} (expanded={}) pts={} max_w={:.4f}",
+              best_sm, align_cam_src, camera_type_label(src.camera_type),
+              cams.size(), expanded.cams.size(), align_submap_world_pts.size(), align_weight_max_cached);
+          } else {
+            logger->warn("[Align] No cameras in submap time window -- cannot compute assignment");
+          }
+        }
+      }
+
       // --- Compute canvas area ---
       const ImVec2 avail = ImGui::GetContentRegionAvail();
       if (align_display_scale < 0.0f && align_img_w > 0 && align_img_h > 0) {
@@ -2973,10 +5720,234 @@ void OfflineViewer::setup_ui() {
 
       ImGui::BeginChild("align_canvas", avail, false, ImGuiWindowFlags_HorizontalScrollbar);
       const ImVec2 cur = ImGui::GetCursorScreenPos();
-      if (align_texture && align_img_w > 0) {
+      // Reserve space for the canvas via Dummy when hiding the image -- keeps
+      // the scroll region and cursor position math identical to the image path.
+      if (align_texture && align_img_w > 0 && !align_image_hidden) {
         ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(align_texture)), ImVec2(disp_w, disp_h));
       } else {
         ImGui::Dummy(ImVec2(disp_w > 0 ? disp_w : 400, disp_h > 0 ? disp_h : 300));
+      }
+      // Click handling for user-placed reference lines. We need this BEFORE the
+      // wheel handler so the mouse-wheel hover check doesn't swallow clicks.
+      if (align_add_line_mode != 0 && ImGui::IsWindowHovered() &&
+          ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const ImVec2 mpos = ImGui::GetMousePos();
+        const double s = std::max(1e-4f, align_display_scale);
+        // Click position in distorted image pixels (what we actually see on screen).
+        const double u_click = (mpos.x - cur.x) / s;
+        const double v_click = (mpos.y - cur.y) / s;
+        // Convert to ideal pinhole pixels via iterative inverse Brown-Conrady
+        // (Pinhole only). For Spherical the click coord IS the equirect pixel
+        // and we draw a straight axis-aligned line -- no inverse needed.
+        double u_ideal = u_click, v_ideal = v_click;
+        const auto& k = src.intrinsics;
+        const bool have_dist = camera_type_has_brown_conrady(src.camera_type)
+          && !align_rectified && (k.k1 != 0 || k.k2 != 0 || k.k3 != 0 || k.p1 != 0 || k.p2 != 0);
+        if (have_dist) {
+          const double xd = (u_click - k.cx) / k.fx;
+          const double yd = (v_click - k.cy) / k.fy;
+          double xn = xd, yn = yd;
+          for (int it = 0; it < 10; it++) {
+            const double r2 = xn*xn + yn*yn, r4 = r2*r2, r6 = r4*r2;
+            const double radial = 1.0 + k.k1*r2 + k.k2*r4 + k.k3*r6;
+            const double dx = 2.0*k.p1*xn*yn + k.p2*(r2 + 2.0*xn*xn);
+            const double dy = k.p1*(r2 + 2.0*yn*yn) + 2.0*k.p2*xn*yn;
+            xn = (xd - dx) / radial;
+            yn = (yd - dy) / radial;
+          }
+          u_ideal = k.fx * xn + k.cx;
+          v_ideal = k.fy * yn + k.cy;
+        }
+        if (u_ideal >= 0 && u_ideal < align_img_w && v_ideal >= 0 && v_ideal < align_img_h) {
+          if (align_add_line_mode == 1)      align_user_lines.emplace_back(0, u_ideal);   // V: fixed u
+          else if (align_add_line_mode == 2) align_user_lines.emplace_back(1, v_ideal);   // H: fixed v
+        }
+        align_add_line_mode = 0;  // consume the click, back to passive
+      }
+
+      // Mouse-wheel zoom centred on the cursor -- scroll is adjusted so the
+      // image pixel under the mouse stays under the mouse after zoom change.
+      // Runs only while hovering the canvas; safe vs. other ImGui wheel users.
+      if (ImGui::IsWindowHovered() && !ImGui::GetIO().KeyCtrl) {
+        const float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+          const ImVec2 mpos = ImGui::GetMousePos();
+          const float old_scale = std::max(1e-4f, align_display_scale);
+          const float ix = (mpos.x - cur.x) / old_scale;
+          const float iy = (mpos.y - cur.y) / old_scale;
+          const float factor = (wheel > 0.0f) ? 1.15f : (1.0f / 1.15f);
+          align_display_scale = std::clamp(old_scale * factor, 0.05f, 10.0f);
+          const float desired_cur_x = mpos.x - ix * align_display_scale;
+          const float desired_cur_y = mpos.y - iy * align_display_scale;
+          ImGui::SetScrollX(ImGui::GetScrollX() + (cur.x - desired_cur_x));
+          ImGui::SetScrollY(ImGui::GetScrollY() + (cur.y - desired_cur_y));
+        }
+      }
+
+      // --- Colorize-from-this-camera: (re)compute on demand ---
+      // Runs the actual colorize pipeline with the single current frame as
+      // the camera list. Returned per-point RGB is cached and consumed in the
+      // draw loop below. Runs synchronously in the UI thread -- acceptable at
+      // ~50-200 ms for typical submap point counts; fires only on the click or
+      // on a single param change (not every ImGui frame).
+      if (align_colorize_dirty && cam_ok && !align_submap_world_pts.empty()) {
+        CameraFrame single = cam;
+        single.T_world_cam = T_world_cam;
+        single.timestamp = cam.timestamp + src.time_shift;  // scratch override; live-tune via scalar widget
+        single.located = true;
+        // Spherical source -> expand single equirect cam to 6 virtual cube faces.
+        auto expanded = expand_source_cams_for_projection(src, {single}, colorize_mask);
+        auto cr = make_colorizer(src.params.view_selector_mode)->project(
+          expanded.cams, expanded.intrinsics, align_submap_world_pts, align_submap_ints,
+          align_submap_world_normals, align_submap_world_times, current_blend_params(src));
+        align_colorize_rgb = std::move(cr.colors);
+        align_colorize_cam_src = align_cam_src;
+        align_colorize_cam_idx = align_cam_idx;
+        align_last_intrinsics = src.intrinsics;
+        align_last_rpy = src.rotation_rpy;
+        align_last_lever = src.lever_arm;
+        align_last_time_shift = src.time_shift;
+        align_colorize_dirty = false;
+        // Ensure the cache is marked live. Without this, the auto-invalidate
+        // above (cached cam_src == -1 at init, current == 0) flipped valid off
+        // right after the button set it on, requiring a second click.
+        align_colorize_valid = true;
+      }
+
+      // --- Reference grid overlay (drawn BEFORE dots so dots stay on top) ---
+      // Lines represent world-straight features projected through the SAME
+      // model as the LiDAR dots: on Rectified = ON (pinhole) they're literally
+      // straight; on Rectified = OFF (raw image) they get warped by the lens
+      // distortion model so the overlay matches the image's geometry. Any bend
+      // you see in a real straight feature vs the grid is residual miscalibration.
+      if (align_grid_show && align_img_w > 0 && align_img_h > 0) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const int N = align_grid_lines;
+        const float img_w = static_cast<float>(align_img_w);
+        const float img_h = static_cast<float>(align_img_h);
+        const float s = align_display_scale;
+        const ImU32 black = IM_COL32(0, 0, 0, 200);
+        const ImU32 white = IM_COL32(255, 255, 255, 220);
+        const double fx = src.intrinsics.fx, fy = src.intrinsics.fy;
+        const double cx_d = src.intrinsics.cx, cy_d = src.intrinsics.cy;
+        const double k1 = src.intrinsics.k1, k2 = src.intrinsics.k2, k3 = src.intrinsics.k3;
+        const double p1 = src.intrinsics.p1, p2 = src.intrinsics.p2;
+        // Brown-Conrady distortion is Pinhole-only. For Spherical, lines are
+        // drawn straight in equirect pixel space -- constant-u corresponds to
+        // a meridian (world-vertical great circle) so verticals ARE straight
+        // in the image; constant-v is only straight for the equator, but the
+        // grid is still useful as a visual reference.
+        const bool do_warp = camera_type_has_brown_conrady(src.camera_type)
+          && !align_rectified && (k1 != 0.0 || k2 != 0.0 || k3 != 0.0 || p1 != 0.0 || p2 != 0.0);
+        // Forward Brown-Conrady: takes ideal-pinhole pixel -> distorted pixel.
+        auto distort_px = [&](double u, double v) {
+          if (!do_warp) return ImVec2(cur.x + static_cast<float>(u) * s, cur.y + static_cast<float>(v) * s);
+          const double xn = (u - cx_d) / fx;
+          const double yn = (v - cy_d) / fy;
+          const double r2 = xn * xn + yn * yn, r4 = r2 * r2, r6 = r4 * r2;
+          const double radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+          const double xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn);
+          const double yd = yn * radial + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn;
+          const double ud = fx * xd + cx_d;
+          const double vd = fy * yd + cy_d;
+          return ImVec2(cur.x + static_cast<float>(ud) * s, cur.y + static_cast<float>(vd) * s);
+        };
+        // Sample each line as 64 segments so the curve is smooth at any zoom.
+        const int segments = 64;
+        std::vector<ImVec2> pts; pts.reserve(segments + 1);
+        auto draw_polyline = [&](const std::vector<ImVec2>& poly) {
+          // Black halo first, white on top -- visible on any background.
+          dl->AddPolyline(poly.data(), static_cast<int>(poly.size()), black, 0, 3.0f);
+          dl->AddPolyline(poly.data(), static_cast<int>(poly.size()), white, 0, 1.0f);
+        };
+        for (int i = 1; i <= N; i++) {
+          const double x_img = (img_w * i) / (N + 1);
+          const double y_img = (img_h * i) / (N + 1);
+          // Vertical line (constant u)
+          pts.clear();
+          for (int k = 0; k <= segments; k++) {
+            const double v = (img_h * k) / segments;
+            pts.push_back(distort_px(x_img, v));
+          }
+          draw_polyline(pts);
+          // Horizontal line (constant v)
+          pts.clear();
+          for (int k = 0; k <= segments; k++) {
+            const double u = (img_w * k) / segments;
+            pts.push_back(distort_px(u, y_img));
+          }
+          draw_polyline(pts);
+        }
+        // Image frame (outline). Warp the four edges the same way so the frame
+        // stays true to the distorted image boundary.
+        auto warp_edge = [&](double u0, double v0, double u1, double v1) {
+          pts.clear();
+          for (int k = 0; k <= segments; k++) {
+            const double t = static_cast<double>(k) / segments;
+            pts.push_back(distort_px(u0 + t * (u1 - u0), v0 + t * (v1 - v0)));
+          }
+          dl->AddPolyline(pts.data(), static_cast<int>(pts.size()), white, 0, 1.5f);
+        };
+        warp_edge(0,     0,     img_w, 0);
+        warp_edge(img_w, 0,     img_w, img_h);
+        warp_edge(img_w, img_h, 0,     img_h);
+        warp_edge(0,     img_h, 0,     0);
+        // Principal point marker -- handy reference for cx/cy. Apply warp so
+        // it sits exactly on the image's actual principal point location.
+        const ImVec2 pp = distort_px(cx_d, cy_d);
+        dl->AddCircleFilled(pp, 4.0f, black);
+        dl->AddCircleFilled(pp, 2.5f, IM_COL32(255, 230, 80, 255));
+      }
+
+      // --- User-placed reference lines ---
+      // Drawn independently of the grid toggle. Each line is a world-straight
+      // line stored in ideal pinhole coords; forward Brown-Conrady warps it to
+      // match the current raw image's distortion. Bright green for contrast vs
+      // the white grid.
+      if (!align_user_lines.empty() && align_img_w > 0 && align_img_h > 0) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float img_w = static_cast<float>(align_img_w);
+        const float img_h = static_cast<float>(align_img_h);
+        const float s = align_display_scale;
+        const double fx = src.intrinsics.fx, fy = src.intrinsics.fy;
+        const double cx_d = src.intrinsics.cx, cy_d = src.intrinsics.cy;
+        const double k1 = src.intrinsics.k1, k2 = src.intrinsics.k2, k3 = src.intrinsics.k3;
+        const double p1 = src.intrinsics.p1, p2 = src.intrinsics.p2;
+        const bool do_warp = camera_type_has_brown_conrady(src.camera_type)
+          && !align_rectified && (k1 != 0.0 || k2 != 0.0 || k3 != 0.0 || p1 != 0.0 || p2 != 0.0);
+        auto distort_px = [&](double u, double v) {
+          if (!do_warp) return ImVec2(cur.x + static_cast<float>(u) * s, cur.y + static_cast<float>(v) * s);
+          const double xn = (u - cx_d) / fx;
+          const double yn = (v - cy_d) / fy;
+          const double r2 = xn * xn + yn * yn, r4 = r2 * r2, r6 = r4 * r2;
+          const double radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+          const double xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn);
+          const double yd = yn * radial + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn;
+          return ImVec2(cur.x + static_cast<float>(fx * xd + cx_d) * s,
+                        cur.y + static_cast<float>(fy * yd + cy_d) * s);
+        };
+        const int segments = 96;
+        const ImU32 halo  = IM_COL32(0, 0, 0, 220);
+        const ImU32 green = IM_COL32(100, 255, 120, 240);
+        std::vector<ImVec2> pts; pts.reserve(segments + 1);
+        for (const auto& [type, coord] : align_user_lines) {
+          pts.clear();
+          if (type == 0) {
+            // Vertical reference: constant u = coord (in ideal pinhole px).
+            for (int i = 0; i <= segments; i++) {
+              const double v = (img_h * i) / segments;
+              pts.push_back(distort_px(coord, v));
+            }
+          } else {
+            // Horizontal reference: constant v = coord.
+            for (int i = 0; i <= segments; i++) {
+              const double u = (img_w * i) / segments;
+              pts.push_back(distort_px(u, coord));
+            }
+          }
+          dl->AddPolyline(pts.data(), static_cast<int>(pts.size()), halo,  0, 3.5f);
+          dl->AddPolyline(pts.data(), static_cast<int>(pts.size()), green, 0, 1.5f);
+        }
       }
 
       // --- Project and draw points ---
@@ -2987,51 +5958,164 @@ void OfflineViewer::setup_ui() {
         const Eigen::Vector3d t_cam = T_cw.translation();
         const double fx = src.intrinsics.fx, fy = src.intrinsics.fy;
         const double cx_d = src.intrinsics.cx, cy_d = src.intrinsics.cy;
-        const bool has_dist = !align_rectified && (src.intrinsics.k1 != 0 || src.intrinsics.k2 != 0 || src.intrinsics.p1 != 0 || src.intrinsics.p2 != 0);
+        const bool is_spherical = (src.camera_type == CameraType::Spherical);
+        const bool has_dist = camera_type_has_brown_conrady(src.camera_type)
+          && !align_rectified && (src.intrinsics.k1 != 0 || src.intrinsics.k2 != 0 || src.intrinsics.p1 != 0 || src.intrinsics.p2 != 0);
         const Eigen::Vector3f cam_pos = T_world_cam.translation().cast<float>();
         const float max_r_sq = align_max_range * align_max_range;
         const float min_r_sq = align_min_range * align_min_range;
-        // Intensity range for color mapping
-        float imin = std::numeric_limits<float>::max(), imax = std::numeric_limits<float>::lowest();
-        for (float v : align_submap_ints) { imin = std::min(imin, v); imax = std::max(imax, v); }
-        if (imin >= imax) { imin = 0; imax = 255; }
+        // Spherical equirect mapping: cam-frame (X fwd, Y left, Z up) ->
+        //   lon = atan2(-py, px)  (range [-pi, pi])
+        //   lat = atan2(pz, sqrt(px^2+py^2))  (range [-pi/2, pi/2])
+        //   u = (lon + pi)/(2*pi) * W   (0..W)
+        //   v = (0.5 - lat/pi) * H      (0..H)
+        // No distortion, no "behind camera" rejection (any finite-range ray is visible).
+
+        // Temporal filter: keep only points within +/- N LiDAR frames of the
+        // camera's timestamp. Matches the subset the real colorize would touch
+        // under time-slice, so the alignment check becomes 1:1 with scene view.
+        // N = 0 disables the filter (whole submap).
+        const bool use_time_filter = (align_nearest_frames > 0) && !align_submap_world_times.empty();
+        const double cam_time_for_filter = cam.timestamp + src.time_shift;  // scratch override
+        const double time_half_window = align_nearest_frames * align_frame_interval_s;
+        auto passes_time_filter = [&](size_t pi) {
+          if (!use_time_filter) return true;
+          if (pi >= align_submap_world_times.size()) return true;
+          return std::abs(align_submap_world_times[pi] - cam_time_for_filter) <= time_half_window;
+        };
+
+        // --- Scalar normalization range (per frame, only over VISIBLE points) ---
+        // Without this, when most points cluster in a narrow sub-band of the
+        // user's max-range the colormap collapses into one colour (the "blob").
+        // Cheap (~1-2 ms per frame for 100k points); adapts to camera movement.
+        float scalar_lo = std::numeric_limits<float>::max();
+        float scalar_hi = std::numeric_limits<float>::lowest();
+        {
+          const int mode = align_point_color_mode;  // 0=Int 1=Range 2=Depth 4=Weight
+          const bool have_ints = !align_submap_ints.empty();
+          const bool cache_ok_for_weight = (align_winner_sm == best_sm && align_winner_src == align_cam_src
+                                            && align_winner_weight_vec.size() == align_submap_world_pts.size());
+          for (size_t pi = 0; pi < align_submap_world_pts.size(); pi++) {
+            if (!passes_time_filter(pi)) continue;
+            const float dsq = (align_submap_world_pts[pi] - cam_pos).squaredNorm();
+            if (dsq > max_r_sq || dsq < min_r_sq) continue;
+            const Eigen::Vector3d p_cam = R_cam * align_submap_world_pts[pi].cast<double>() + t_cam;
+            // For Pinhole, depth = +X (forward); points behind camera get culled.
+            // For Spherical, "depth" degrades to radial distance -- no hemisphere
+            // cull, since the 360 panorama sees in every direction.
+            const double depth = is_spherical ? p_cam.norm() : p_cam.x();
+            if (!is_spherical && depth <= 0.1) continue;
+            float s = 0.0f;
+            if (mode == 0)      s = have_ints ? align_submap_ints[pi] : 0.0f;
+            else if (mode == 1) s = std::sqrt(dsq);
+            else if (mode == 2) s = static_cast<float>(depth);
+            else if (mode == 4) s = cache_ok_for_weight ? align_winner_weight_vec[pi] : 0.0f;
+            else continue;
+            scalar_lo = std::min(scalar_lo, s);
+            scalar_hi = std::max(scalar_hi, s);
+          }
+          if (!(scalar_hi > scalar_lo)) {
+            // All values equal or no visible points -- guard against div-by-zero.
+            scalar_lo = 0.0f; scalar_hi = 1.0f;
+          }
+        }
+        // Intensity range for the brightness threshold gate (keeps working even
+        // when the color mode is Range/Depth/Weight). Uses the submap-level
+        // 5%/95% percentile cache populated when the submap was loaded.
+        const float ithresh_lo = align_intensity_range.x();
+        const float ithresh_hi = std::max(ithresh_lo + 1e-4f, align_intensity_range.y());
         int drawn = 0;
         for (size_t pi = 0; pi < align_submap_world_pts.size(); pi++) {
+          if (!passes_time_filter(pi)) continue;
           const float dsq = (align_submap_world_pts[pi] - cam_pos).squaredNorm();
           if (dsq > max_r_sq || dsq < min_r_sq) continue;
           const Eigen::Vector3d p_cam = R_cam * align_submap_world_pts[pi].cast<double>() + t_cam;
-          const double depth = p_cam.x();
-          if (depth <= 0.1) continue;
-          double xn = -p_cam.y() / depth;
-          double yn = -p_cam.z() / depth;
-          if (has_dist) {
-            const double r2 = xn * xn + yn * yn, r4 = r2 * r2, r6 = r4 * r2;
-            const double radial = 1.0 + src.intrinsics.k1 * r2 + src.intrinsics.k2 * r4 + src.intrinsics.k3 * r6;
-            const double xd = xn * radial + 2.0 * src.intrinsics.p1 * xn * yn + src.intrinsics.p2 * (r2 + 2.0 * xn * xn);
-            const double yd = yn * radial + src.intrinsics.p1 * (r2 + 2.0 * yn * yn) + 2.0 * src.intrinsics.p2 * xn * yn;
-            xn = xd; yn = yd;
+          double u, v;
+          double depth;  // used below for Depth color mode
+          if (is_spherical) {
+            // Equirectangular projection: every direction is visible.
+            const double r = p_cam.norm();
+            if (r < 1e-6) continue;  // point at camera origin -- undefined direction
+            depth = r;
+            const double lon = std::atan2(-p_cam.y(), p_cam.x());          // [-pi, pi]
+            const double lat = std::atan2(p_cam.z(), std::sqrt(p_cam.x()*p_cam.x() + p_cam.y()*p_cam.y()));  // [-pi/2, pi/2]
+            u = (lon + M_PI) / (2.0 * M_PI) * static_cast<double>(align_img_w);
+            v = (0.5 - lat / M_PI) * static_cast<double>(align_img_h);
+          } else {
+            depth = p_cam.x();
+            if (depth <= 0.1) continue;
+            double xn = -p_cam.y() / depth;
+            double yn = -p_cam.z() / depth;
+            if (has_dist) {
+              const double r2 = xn * xn + yn * yn, r4 = r2 * r2, r6 = r4 * r2;
+              const double radial = 1.0 + src.intrinsics.k1 * r2 + src.intrinsics.k2 * r4 + src.intrinsics.k3 * r6;
+              const double xd = xn * radial + 2.0 * src.intrinsics.p1 * xn * yn + src.intrinsics.p2 * (r2 + 2.0 * xn * xn);
+              const double yd = yn * radial + src.intrinsics.p1 * (r2 + 2.0 * yn * yn) + 2.0 * src.intrinsics.p2 * xn * yn;
+              xn = xd; yn = yd;
+            }
+            u = fx * xn + cx_d;
+            v = fy * yn + cy_d;
           }
-          const double u = fx * xn + cx_d;
-          const double v = fy * yn + cy_d;
           if (u < 0 || u >= align_img_w || v < 0 || v >= align_img_h) continue;
-          // Intensity gate
-          const float in_norm = align_submap_ints.empty() ? 0.0f : std::clamp((align_submap_ints[pi] - imin) / (imax - imin), 0.0f, 1.0f);
-          if (align_bright_threshold > 0.0f && in_norm < align_bright_threshold) continue;
-          // Color
+          // Intensity gate -- always against the submap intensity range so the
+          // threshold slider means the same thing regardless of active color mode.
+          const float in_norm_gate = align_submap_ints.empty() ? 0.0f
+            : std::clamp((align_submap_ints[pi] - ithresh_lo) / (ithresh_hi - ithresh_lo), 0.0f, 1.0f);
+          if (align_bright_threshold > 0.0f && in_norm_gate < align_bright_threshold) continue;
+          // Winner/Weight viz requires fresh cache for this submap+source
+          const bool cache_usable = (align_winner_sm == best_sm && align_winner_src == align_cam_src
+                                     && pi < align_winner_frame_idx.size());
+          if (align_point_color_mode == 3) {  // Winner-mask: only points where THIS camera won
+            if (!cache_usable) continue;
+            if (align_winner_frame_idx[pi] != align_cam_idx) continue;
+          }
+          // Color -- scalar modes go through the selected colormap; Winner-mask stays categorical.
+          // When the Colorize-from-this-camera cache is active, use the projected
+          // RGB instead (falls back to scalar for gray-sentinel uncolored points).
           const int a8 = std::clamp(static_cast<int>(align_point_alpha * 255.0f), 0, 255);
           ImU32 col;
-          if (align_point_color_mode == 0) {
-            const int g = static_cast<int>(in_norm * 255.0f);
-            col = IM_COL32(g, g, 0, a8);
-          } else if (align_point_color_mode == 1) {
-            const float rn = std::sqrt(dsq) / align_max_range;
-            const int r = static_cast<int>((1.0f - rn) * 255.0f);
-            const int b = static_cast<int>(rn * 255.0f);
-            col = IM_COL32(r, 80, b, a8);
-          } else {
-            const float dn = std::clamp(static_cast<float>(depth) / align_max_range, 0.0f, 1.0f);
-            const int g = static_cast<int>((1.0f - dn) * 255.0f);
-            col = IM_COL32(0, g, 255 - g, a8);
+          bool used_rgb = false;
+          bool skip_uncolored = false;
+          if (align_colorize_valid && pi < align_colorize_rgb.size()) {
+            const auto& c = align_colorize_rgb[pi];
+            const bool is_sentinel =
+              std::abs(c.x() - 0.5f) < 1e-3f && std::abs(c.y() - 0.5f) < 1e-3f && std::abs(c.z() - 0.5f) < 1e-3f;
+            if (!is_sentinel) {
+              const int rr = std::clamp(static_cast<int>(c.x() * 255.0f), 0, 255);
+              const int gg = std::clamp(static_cast<int>(c.y() * 255.0f), 0, 255);
+              const int bb = std::clamp(static_cast<int>(c.z() * 255.0f), 0, 255);
+              col = IM_COL32(rr, gg, bb, a8);
+              used_rgb = true;
+            } else if (align_colorize_hide_uncolored) {
+              // Colorize cache active + user wants ground-truth view: skip
+              // points this camera didn't actually colour (time-slice / NCC /
+              // incidence / occlusion rejects). Matches scene-view coverage.
+              skip_uncolored = true;
+            }
+          }
+          if (skip_uncolored) continue;
+          // Normalize the active scalar against the per-frame min/max we gathered
+          // in the pre-pass. This is what spreads the full colormap across the
+          // actual visible data range instead of against the slider (which would
+          // give a "blob" when points cluster in a narrow band of the slider).
+          const float inv_scalar_span = 1.0f / (scalar_hi - scalar_lo);
+          auto norm = [&](float s) { return std::clamp((s - scalar_lo) * inv_scalar_span, 0.0f, 1.0f); };
+          if (used_rgb) {
+            // Fall through to the draw below -- col is already set.
+          } else if (align_point_color_mode == 0) {     // Intensity
+            const float t = align_submap_ints.empty() ? 0.0f : norm(align_submap_ints[pi]);
+            col = scalar_to_imu32(align_colormap_sel, t, a8);
+          } else if (align_point_color_mode == 1) {     // Range
+            col = scalar_to_imu32(align_colormap_sel, norm(std::sqrt(dsq)), a8);
+          } else if (align_point_color_mode == 2) {     // Depth
+            col = scalar_to_imu32(align_colormap_sel, norm(static_cast<float>(depth)), a8);
+          } else if (align_point_color_mode == 3) {     // Winner-mask (categorical)
+            col = IM_COL32(80, 255, 120, a8);
+          } else {                                      // Weight
+            if (!cache_usable || align_weight_max_cached <= 0.0f) { col = IM_COL32(120, 120, 120, a8); }
+            else {
+              col = scalar_to_imu32(align_colormap_sel, norm(align_winner_weight_vec[pi]), a8);
+            }
           }
           const ImVec2 sp(cur.x + static_cast<float>(u) * align_display_scale,
                           cur.y + static_cast<float>(v) * align_display_scale);
@@ -3039,16 +6123,2597 @@ void OfflineViewer::setup_ui() {
           drawn++;
         }
         // Status line on top of image
-        char buf[160]; std::snprintf(buf, sizeof(buf),
-          "sm=%d  pts_drawn=%d  native=%dx%d  scale=%.2fx  shift=%.2fs  RPY=(%.2f,%.2f,%.2f)",
+        const char* mode_label = "?";
+        switch (align_point_color_mode) {
+          case 0: mode_label = "Int";    break;
+          case 1: mode_label = "Range";  break;
+          case 2: mode_label = "Depth";  break;
+          case 3: mode_label = "Winner"; break;
+          case 4: mode_label = "Weight"; break;
+        }
+        char buf[224]; std::snprintf(buf, sizeof(buf),
+          "sm=%d  pts_drawn=%d  native=%dx%d  scale=%.2fx  shift=%.2fs  RPY=(%.2f,%.2f,%.2f)  %s[%.2f..%.2f]",
           best_sm, drawn, align_img_w, align_img_h, align_display_scale,
-          src.time_shift, src.rotation_rpy.x(), src.rotation_rpy.y(), src.rotation_rpy.z());
+          src.time_shift, src.rotation_rpy.x(), src.rotation_rpy.y(), src.rotation_rpy.z(),
+          mode_label, scalar_lo, scalar_hi);
         dl->AddText(ImVec2(cur.x + 6, cur.y + 6), IM_COL32(255, 255, 0, 255), buf);
       } else if (!cam_ok) {
         ImGui::GetWindowDrawList()->AddText(ImVec2(cur.x + 6, cur.y + 6),
           IM_COL32(255, 80, 80, 255), "Camera not locatable (timestamp out of trajectory range).");
       }
       ImGui::EndChild();
+    }
+    ImGui::End();
+  });
+
+  // Virtual LiDAR cameras: walks the trajectory at a user interval, renders
+  // 6-face cube (or a subset) from the LiDAR data at each anchor with locked
+  // pose + zero-distortion pinhole intrinsics. Output is a set of JPGs that
+  // Metashape imports as control-anchor cameras; real cameras BA-refine
+  // against them. Automation of the "hand-placed marker" workflow at scale.
+  viewer->register_ui_callback("virtual_cameras_window", [this] {
+    if (!show_virtual_cameras_window) return;
+    ImGui::SetNextWindowSize(ImVec2(540, 560), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Virtual LiDAR Cameras", &show_virtual_cameras_window)) { ImGui::End(); return; }
+
+    // Output dir
+    ImGui::TextDisabled("Output folder");
+    char dir_buf[512];
+    std::snprintf(dir_buf, sizeof(dir_buf), "%s", vc_output_dir.c_str());
+    ImGui::SetNextItemWidth(-110);
+    if (ImGui::InputText("##vc_dir", dir_buf, sizeof(dir_buf))) vc_output_dir = dir_buf;
+    ImGui::SameLine();
+    if (ImGui::Button("Browse##vc")) {
+      const std::string chosen = pfd::select_folder("Choose output dir for virtual cameras",
+        vc_output_dir.empty() ? (loaded_map_path.empty() ? "." : loaded_map_path) : vc_output_dir).result();
+      if (!chosen.empty()) vc_output_dir = chosen;
+    }
+    ImGui::Separator();
+
+    // Placement-mode radio. "Waypoints" walks the trajectory dropping anchors
+    // every N metres (legacy). "Per RGB camera" places a virtual LiDAR camera
+    // at each real RGB frame's estimated world pose -- the 1:1 co-located mode
+    // intended for SFM anchoring; cheap to match because the virtual twin
+    // shares the same viewpoint as the real image (within a few cm).
+    ImGui::TextDisabled("Placement mode");
+    ImGui::RadioButton("Waypoints along trajectory##vcmode", &vc_placement_mode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Per RGB camera (co-located)##vcmode", &vc_placement_mode, 1);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Emits one virtual LiDAR-intensity image per real RGB frame at the frame's\n"
+      "estimated world pose (from the Colorize extrinsic). Virtual + real sit in\n"
+      "the same bundle with ~10 cm offset -- SFM matching is nearly guaranteed\n"
+      "to fire, giving BA a locked LiDAR-frame anchor for every real photo.\n"
+      "Requires the source to have been 'Located' in the Colorize window.");
+    ImGui::Separator();
+
+    if (vc_placement_mode == 0) {
+
+    // Placement
+    ImGui::TextDisabled("Placement");
+    ImGui::SetNextItemWidth(160);
+    ImGui::DragFloat("Interval (m)##vc", &vc_interval_m, 0.5f, 1.0f, 500.0f, "%.1f");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Distance between consecutive virtual cameras along the trajectory.\n"
+      "5-10 m = dense BA constraints, 20-50 m = lighter. Denser is usually\n"
+      "safer for feature-sparse LiDARs (Livox Horizon).");
+    ImGui::SetNextItemWidth(160);
+    ImGui::DragFloat("Context radius (m)##vc", &vc_context_radius_m, 1.0f, 5.0f, 500.0f, "%.0f");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "LiDAR points within this radius of an anchor are included in its render.\n"
+      "Smaller = faster render, tighter depth. Larger = more context / background.");
+    ImGui::Separator();
+
+    // Face selection
+    ImGui::TextDisabled("Cube faces to render");
+    const char* face_labels[6] = { "+X (fwd)", "-X (back)", "+Y (left)", "-Y (right)", "+Z (up/sky)", "-Z (down/gnd)" };
+    for (int f = 0; f < 6; f++) {
+      if (f) ImGui::SameLine();
+      ImGui::Checkbox((std::string(face_labels[f]) + "##vcf" + std::to_string(f)).c_str(), &vc_face_enabled[f]);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "+Z (sky) is off by default -- rarely has useful features.\n"
+      "-Z (down/ground) is critical on Livox Horizon: road markings are the best\n"
+      "matchable content. Keep ON unless you have a reason to drop it.");
+    ImGui::Separator();
+
+    // Resolution
+    ImGui::TextDisabled("Face resolution");
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputInt("pixels/side##vc", &vc_face_size, 64, 256);
+    vc_face_size = std::clamp(vc_face_size, 256, 8192);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(" /2##vcres")) vc_face_size = std::max(256, vc_face_size / 2);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(" x2##vcres")) vc_face_size = std::min(8192, vc_face_size * 2);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Pixels per cube-face side. 1920 is a good balance; 3840 for Pandar 128\n"
+      "density to extract many features; 1024 for quick test runs.");
+    ImGui::Separator();
+
+    // Filters
+    ImGui::TextDisabled("Filters");
+    ImGui::Checkbox("Ground only (requires aux_ground.bin)##vc", &vc_ground_only);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Render only points tagged as ground by PatchWork++. On Livox Horizon this\n"
+      "concentrates the feature-rich regions (asphalt, road markings, kerbs) so\n"
+      "the matcher has a better shot. Requires a prior PatchWork++ classify run\n"
+      "that wrote aux_ground.bin per frame.");
+    ImGui::Checkbox("Also render RGB (requires aux_rgb.bin)##vc", &vc_render_rgb);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "In addition to intensity, render an RGB image per face using colors from\n"
+      "a prior Colorize Apply run. Doubles the render time + disk but gives the\n"
+      "matcher both modalities. SIFT works on intensity so this is optional.");
+    ImGui::Checkbox("Embed UTM in EXIF##vc", &vc_embed_exif_gps);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Write virtual cameras' world positions into EXIF GPS tags (using UTM from\n"
+      "gnss_datum.json + our session-local offset). Lets Metashape/RealityScan\n"
+      "seed pose priors from the EXIF even without the BlocksExchange import.");
+    ImGui::Separator();
+
+    // Action buttons
+    ImGui::BeginDisabled(vc_running);
+    if (ImGui::Button("Preview placement (no render)##vc")) {
+      // Fill vc_preview_anchors from the trajectory at current interval.
+      if (!trajectory_built) build_trajectory();
+      std::vector<TrajRecord> tr;
+      tr.reserve(trajectory_data.size());
+      for (const auto& rec : trajectory_data) {
+        tr.push_back({rec.stamp, rec.pose, rec.cumulative_dist});
+      }
+      auto anchors = place_virtual_cameras(tr, vc_interval_m);
+      vc_preview_anchors.clear();
+      vc_preview_orient.clear();
+      vc_preview_anchors.reserve(anchors.size());
+      vc_preview_orient.reserve(anchors.size());
+      for (const auto& a : anchors) {
+        vc_preview_anchors.push_back(a.T_world_cam.translation().cast<float>());
+        vc_preview_orient.push_back(a.T_world_cam.rotation().cast<float>());
+      }
+      vc_anchors_placed_last = anchors.size();
+      vc_status = "Preview: " + std::to_string(anchors.size()) + " anchors placed along "
+                  + std::to_string(static_cast<int>(tr.empty() ? 0 : tr.back().cumulative_dist)) + " m of trajectory";
+      logger->info("[VirtualCams] {}", vc_status);
+    }
+    ImGui::SameLine();
+    const bool can_render = !vc_output_dir.empty() &&
+                            std::any_of(std::begin(vc_face_enabled), std::end(vc_face_enabled), [](bool b){ return b; });
+    ImGui::BeginDisabled(!can_render);
+    if (ImGui::Button("Render all##vc")) {
+      vc_running = true;
+      vc_status = "TODO: render worker not yet implemented; placement + UI + preview are in. "
+                  "Files would land in: " + vc_output_dir;
+      // NOTE: the render worker goes here next session. It will:
+      //  1. Walk trajectory via place_virtual_cameras.
+      //  2. Build a per-anchor CalibrationContext by filtering world_points
+      //     within vc_context_radius_m (optionally ground-only).
+      //  3. For each enabled face, call render_intensity_image with
+      //     cube_face_intrinsics(vc_face_size) and T_world_cam * cube_face_rotation(f).
+      //  4. Save JPG + optional RGB render, populate EXIF if enabled.
+      //  5. Emit a manifest.json with per-anchor poses for BlocksExchange.
+      vc_running = false;
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+
+    if (!vc_status.empty()) {
+      ImGui::Separator();
+      ImGui::TextWrapped("%s", vc_status.c_str());
+    }
+
+    } else {
+      // ---------------- Per RGB camera mode ----------------
+      // Lazy-seed factory scanner presets on first enter.
+      vc_pcam_seed_factory_presets();
+
+      // --- Presets dropdown (scanner-tuned defaults).
+      {
+        std::vector<const char*> names;
+        for (const auto& p : vc_pcam_presets) names.push_back(p.name.c_str());
+        vc_pcam_preset_idx = std::clamp(vc_pcam_preset_idx, 0,
+                                         static_cast<int>(vc_pcam_presets.size()) - 1);
+        ImGui::SetNextItemWidth(220);
+        ImGui::Combo("Preset##vcp", &vc_pcam_preset_idx, names.data(),
+                      static_cast<int>(names.size()));
+        ImGui::SameLine();
+        if (ImGui::Button("Apply##vcp_preset") && !vc_pcam_presets.empty()) {
+          vc_pcam_apply_preset(vc_pcam_presets[vc_pcam_preset_idx]);
+          vc_status = std::string("Applied preset: ") + vc_pcam_presets[vc_pcam_preset_idx].name;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Overwrites the context + render + face + output settings below with a\n"
+          "scanner-specific defaults bundle. Currently factory-only; save/rename\n"
+          "and persistence to disk land in a later pass.");
+        ImGui::Separator();
+      }
+
+      if (image_sources.empty()) {
+        ImGui::TextDisabled("No image sources loaded. Open Colorize > Image folder > Add folder...");
+      } else {
+        // Single source dropdown drives everything: preview, test matches, and
+        // batch export. The earlier multi-select checkboxes were redundant with
+        // this dropdown for the common case, so they've been removed.
+        std::vector<std::string> src_labels;
+        for (size_t i = 0; i < image_sources.size(); i++) {
+          src_labels.push_back(std::string(image_sources[i].name) + " [" +
+            camera_type_label(image_sources[i].camera_type) + ", " +
+            std::to_string(image_sources[i].frames.size()) + " frames]");
+        }
+        std::vector<const char*> lptrs;
+        for (auto& s : src_labels) lptrs.push_back(s.c_str());
+        vc_pcam_active_src = std::clamp(vc_pcam_active_src, 0,
+                                         static_cast<int>(image_sources.size()) - 1);
+        {
+          ImGui::SetNextItemWidth(360);
+          if (ImGui::Combo("Source##vcp", &vc_pcam_active_src, lptrs.data(), static_cast<int>(lptrs.size()))) {
+            vc_pcam_preview_frame = 0;
+            vc_pcam_preview_dirty = true;
+          }
+          auto& src = image_sources[vc_pcam_active_src];
+          const int nframes = static_cast<int>(src.frames.size());
+          if (nframes > 0) {
+            int f = std::clamp(vc_pcam_preview_frame, 0, nframes - 1);
+            ImGui::SetNextItemWidth(260);
+            // Slider scrubs without triggering a render -- the context rebuild
+            // is expensive enough that live-rendering every drag step feels
+            // jerky and makes it hard to land on a specific frame. We only
+            // trigger the preview on release (or on the arrow / Jump paths).
+            ImGui::SetNextItemWidth(220);
+            if (ImGui::SliderInt("##vcp_frame_slider", &f, 0, nframes - 1, "%d")) {
+              vc_pcam_preview_frame = f;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+              vc_pcam_preview_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Drag to scrub without rendering. Releases trigger the preview.\n"
+              "Ctrl+click to type an exact frame, or use the Jump box beside it.");
+            ImGui::SameLine();
+            if (ImGui::ArrowButton("##vcp_prev", ImGuiDir_Left)) {
+              vc_pcam_preview_frame = std::max(0, f - 1);
+              vc_pcam_preview_dirty = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::ArrowButton("##vcp_next", ImGuiDir_Right)) {
+              vc_pcam_preview_frame = std::min(nframes - 1, f + 1);
+              vc_pcam_preview_dirty = true;
+            }
+            // Explicit "jump to frame" input: type a number + Enter. Renders
+            // only when the user presses Enter (EnterReturnsTrue), so typing
+            // intermediate digits doesn't thrash the preview.
+            ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+            int jump = vc_pcam_preview_frame;
+            if (ImGui::InputInt("Jump##vcp_jump", &jump, 0, 0,
+                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+              vc_pcam_preview_frame = std::clamp(jump, 0, nframes - 1);
+              vc_pcam_preview_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Type an exact frame number and press Enter to jump there.");
+            if (!src.frames[f].located) {
+              ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1),
+                "Frame not located -- run Colorize > Locate first.");
+            }
+          }
+        }
+        ImGui::Separator();
+
+        // --- Context window knobs (shared struct; set per-type defaults below).
+        ImGui::TextDisabled("Context window");
+        if (ImGui::Button("Pinhole defaults##vcp")) {
+          vc_pcam_ctx_opts.use_time_window = false;
+          vc_pcam_ctx_opts.n_frames_before = 15;
+          vc_pcam_ctx_opts.n_frames_after  = 15;
+          vc_pcam_ctx_opts.directional_filter = true;
+          vc_pcam_ctx_opts.directional_threshold_deg = 60.0f;
+          vc_pcam_ctx_opts.min_range = 0.5f;
+          vc_pcam_ctx_opts.max_range = 80.0f;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Spherical (360) defaults##vcp")) {
+          vc_pcam_ctx_opts.use_time_window = true;
+          vc_pcam_ctx_opts.time_before_s   = 20.0;
+          vc_pcam_ctx_opts.time_after_s    = 20.0;
+          vc_pcam_ctx_opts.directional_filter = false;
+          vc_pcam_ctx_opts.min_range = 0.5f;
+          vc_pcam_ctx_opts.max_range = 80.0f;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Spherical presets use a wider time window and disable the directional\n"
+          "filter so the faces looking backward/sideways have LiDAR context to\n"
+          "render against, not just the instantaneous forward-scanning frames.");
+
+        ImGui::Checkbox("Use time window##vcp", &vc_pcam_ctx_opts.use_time_window);
+        if (vc_pcam_ctx_opts.use_time_window) {
+          float tb = static_cast<float>(vc_pcam_ctx_opts.time_before_s);
+          float ta = static_cast<float>(vc_pcam_ctx_opts.time_after_s);
+          ImGui::SetNextItemWidth(100); ImGui::DragFloat("before (s)##vcp", &tb, 0.1f, 0.1f, 120.0f, "%.1f");
+          ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::DragFloat("after (s)##vcp", &ta, 0.1f, 0.1f, 120.0f, "%.1f");
+          vc_pcam_ctx_opts.time_before_s = tb; vc_pcam_ctx_opts.time_after_s = ta;
+        } else {
+          ImGui::SetNextItemWidth(100); ImGui::DragInt("N before##vcp", &vc_pcam_ctx_opts.n_frames_before, 1, 0, 1000);
+          ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::DragInt("N after##vcp", &vc_pcam_ctx_opts.n_frames_after, 1, 0, 1000);
+        }
+        ImGui::Checkbox("Directional filter##vcp", &vc_pcam_ctx_opts.directional_filter);
+        if (vc_pcam_ctx_opts.directional_filter) {
+          ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+          ImGui::DragFloat("deg##vcp", &vc_pcam_ctx_opts.directional_threshold_deg, 1.0f, 5.0f, 180.0f, "%.0f");
+        }
+        ImGui::SetNextItemWidth(100); ImGui::DragFloat("min range (m)##vcp", &vc_pcam_ctx_opts.min_range, 0.05f, 0.1f, 50.0f, "%.1f");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::DragFloat("max range (m)##vcp", &vc_pcam_ctx_opts.max_range, 1.0f, 5.0f, 500.0f, "%.0f");
+        ImGui::Separator();
+
+        // --- Render knobs (splat + intensity + colormap).
+        ImGui::TextDisabled("Render");
+
+        // Splat mode + its parameters. Three modes: Formula (1/depth),
+        // Fixed (one size for everything), Stepped (user-defined bins).
+        const char* splat_modes[] = { "Formula (1/depth)", "Fixed", "Linear ramp" };
+        int splat_mode_idx = static_cast<int>(vc_pcam_render_opts.splat_mode);
+        ImGui::SetNextItemWidth(160);
+        if (ImGui::Combo("Splat mode##vcp", &splat_mode_idx, splat_modes, IM_ARRAYSIZE(splat_modes))) {
+          vc_pcam_render_opts.splat_mode = static_cast<IntensityRenderOptions::SplatMode>(splat_mode_idx);
+          vc_pcam_preview_dirty = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Formula: splat = clamp(round(3 * ref / depth), min, max). Smooth 1/depth taper.\n"
+          "Fixed: one radius for every point, regardless of distance.\n"
+          "Linear ramp: user-defined (depth, size) knots. Size lerps between knots\n"
+          "             so each knot meets the next without a step. Past the last\n"
+          "             knot the size stays flat.");
+
+        switch (vc_pcam_render_opts.splat_mode) {
+          case IntensityRenderOptions::SplatMode::Formula: {
+            ImGui::SetNextItemWidth(120);
+            float nd = static_cast<float>(vc_pcam_render_opts.near_depth_m);
+            if (ImGui::DragFloat("Ref depth (m)##vcp", &nd, 0.1f, 0.5f, 20.0f, "%.2f")) {
+              vc_pcam_render_opts.near_depth_m = nd; vc_pcam_preview_dirty = true;
+            }
+            ImGui::SameLine(); ImGui::SetNextItemWidth(80);
+            if (ImGui::DragInt("Min splat##vcp", &vc_pcam_render_opts.min_splat_px, 1, 0, 10)) vc_pcam_preview_dirty = true;
+            ImGui::SameLine(); ImGui::SetNextItemWidth(80);
+            if (ImGui::DragInt("Max splat##vcp", &vc_pcam_render_opts.max_splat_px, 1, 1, 20)) vc_pcam_preview_dirty = true;
+            break;
+          }
+          case IntensityRenderOptions::SplatMode::Fixed: {
+            ImGui::SetNextItemWidth(120);
+            if (ImGui::DragInt("Splat size (px)##vcp", &vc_pcam_render_opts.fixed_splat_px, 1, 0, 20)) vc_pcam_preview_dirty = true;
+            break;
+          }
+          case IntensityRenderOptions::SplatMode::LinearRamp: {
+            auto& ranges = vc_pcam_render_opts.splat_ranges;
+            // Seed a first knot the first time the user opens this mode so the
+            // table isn't empty and confusing.
+            if (ranges.empty()) ranges.push_back({0.0, 5});
+            int remove_idx = -1;
+            for (size_t i = 0; i < ranges.size(); i++) {
+              ImGui::PushID(static_cast<int>(i));
+              // First knot is locked to 0 m so the function always covers depth 0+.
+              ImGui::SetNextItemWidth(100);
+              if (i == 0) {
+                ImGui::BeginDisabled();
+                float d0 = 0.0f;
+                ImGui::DragFloat("at (m)", &d0, 0.0f, 0.0f, 0.0f, "%.2f");
+                ImGui::EndDisabled();
+                ranges[0].start_depth_m = 0.0;
+              } else {
+                float d = static_cast<float>(ranges[i].start_depth_m);
+                if (ImGui::DragFloat("at (m)", &d, 0.1f, 0.01f, 500.0f, "%.2f")) {
+                  ranges[i].start_depth_m = d; vc_pcam_preview_dirty = true;
+                }
+              }
+              ImGui::SameLine(); ImGui::SetNextItemWidth(80);
+              if (ImGui::DragInt("size (px)", &ranges[i].splat_px, 1, 0, 20)) vc_pcam_preview_dirty = true;
+              if (i > 0) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X")) remove_idx = static_cast<int>(i);
+              }
+              ImGui::PopID();
+            }
+            if (remove_idx >= 0) {
+              ranges.erase(ranges.begin() + remove_idx);
+              vc_pcam_preview_dirty = true;
+            }
+            if (ImGui::SmallButton("+ Add knot##vcp_sr")) {
+              // New knot 2 m past the last one, size one smaller (typical taper).
+              const auto& last = ranges.back();
+              ranges.push_back({last.start_depth_m + 2.0, std::max(1, last.splat_px - 1)});
+              vc_pcam_preview_dirty = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Adds a (depth, size) knot. Between consecutive knots the size\n"
+              "interpolates linearly. Past the last knot the size stays flat.");
+            break;
+          }
+        }
+
+        if (ImGui::Checkbox("Round splats##vcp_round", &vc_pcam_render_opts.round_splats)) vc_pcam_preview_dirty = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Off = square (dy/dx AABB stamp, cheapest).\n"
+          "On = disk (dx*dx+dy*dy <= r*r gate). Matches the 3D viewer's rounded\n"
+          "points and avoids the faint axis-aligned edges a square stamp imprints\n"
+          "at coarse splat sizes.");
+
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Non-linear intensity##vcp", &vc_pcam_render_opts.non_linear_intensity)) vc_pcam_preview_dirty = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Gamma-lift + top-5%% clamp so retroreflective markings spike to white.\n"
+          "Off = linear (2nd-99th percentile) stretch -- softer, may match better\n"
+          "on some scenes. A/B against Metashape matching to decide.");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(140);
+        const char* cmap_names[] = { "Grayscale", "Inverted", "Turbo", "Viridis", "Cividis" };
+        int cmap_idx = static_cast<int>(vc_pcam_render_opts.colormap);
+        if (ImGui::Combo("Scale##vcp", &cmap_idx, cmap_names, IM_ARRAYSIZE(cmap_names))) {
+          vc_pcam_render_opts.colormap = static_cast<IntensityRenderOptions::Colormap>(cmap_idx);
+          vc_pcam_preview_dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Grayscale##vcp_gs", &vc_pcam_render_opts.return_to_grayscale_after_colormap)) {
+          vc_pcam_preview_dirty = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Force the final output to single-channel grayscale regardless of the\n"
+          "Scale choice. Scale = Grayscale or Inverted are already single-channel\n"
+          "so the flag is a no-op there; Turbo/Viridis/Cividis normally produce\n"
+          "RGB -- with this flag ON they pass through cv::applyColorMap and then\n"
+          "get BT.601-converted back to luminance. The colormap's non-linear hue\n"
+          "sweep acts as a contrast remap on the way, pulling out faint features\n"
+          "(road markings, sign glyphs) a flat linear grayscale washes out.\n"
+          "LightGlue / SIFT get single-channel input either way.");
+
+        // Intensity range lock. Per-frame percentile drift makes the same scene
+        // look like it's being re-exposed between renders; locking the 2nd /
+        // 95th / 99th percentiles from a representative preview frame freezes
+        // the synthetic-exposure curve for everything that follows.
+        if (vc_pcam_render_opts.intensity_locked) {
+          ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1),
+            "Intensity locked: %.1f / %.1f / %.1f",
+            vc_pcam_render_opts.intensity_locked_imin,
+            vc_pcam_render_opts.intensity_locked_ibulk,
+            vc_pcam_render_opts.intensity_locked_imax);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Clear lock##vcp_lock")) {
+            vc_pcam_render_opts.intensity_locked = false;
+            vc_pcam_preview_dirty = true;
+          }
+        } else {
+          ImGui::BeginDisabled(!vc_pcam_have_last_percentiles);
+          if (ImGui::SmallButton("Lock range from preview##vcp_lock")) {
+            vc_pcam_render_opts.intensity_locked = true;
+            vc_pcam_render_opts.intensity_locked_imin  = vc_pcam_last_imin;
+            vc_pcam_render_opts.intensity_locked_ibulk = vc_pcam_last_ibulk;
+            vc_pcam_render_opts.intensity_locked_imax  = vc_pcam_last_imax;
+            vc_pcam_preview_dirty = true;
+          }
+          ImGui::EndDisabled();
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            vc_pcam_have_last_percentiles
+              ? "Capture (2nd / 95th / 99th) intensity percentiles from the last\n"
+                "preview's context and use them for every subsequent render. Stops\n"
+                "contrast from drifting frame to frame."
+              : "Run a preview first -- the lock grabs percentiles from its context.");
+        }
+        ImGui::Separator();
+
+        // --- Cube faces (Spherical only).
+        const bool any_spherical =
+          (vc_pcam_active_src >= 0 && vc_pcam_active_src < static_cast<int>(image_sources.size()) &&
+           image_sources[vc_pcam_active_src].camera_type == CameraType::Spherical);
+        if (any_spherical) {
+          ImGui::TextDisabled("Cube faces (Spherical sources)");
+          const char* face_labels[6] = { "Front", "Back", "Left", "Right", "Up", "Down" };
+          for (int f = 0; f < 6; f++) {
+            if (f) ImGui::SameLine();
+            ImGui::Checkbox((std::string(face_labels[f]) + "##vcpf" + std::to_string(f)).c_str(), &vc_face_enabled[f]);
+          }
+          ImGui::SetNextItemWidth(120);
+          ImGui::DragInt("Face size (px)##vcp", &vc_face_size, 64, 256, 8192);
+          // Face-size buttons also rescale the pixel-valued splat knobs so a
+          // 4096->8192 doubling keeps the effective angular splat size.
+          auto scale_splats_fs = [this](double mul) {
+            auto& ro = vc_pcam_render_opts;
+            auto si = [mul](int v) { return std::max(0, static_cast<int>(std::round(v * mul))); };
+            ro.min_splat_px   = si(ro.min_splat_px);
+            ro.max_splat_px   = std::max(ro.min_splat_px, si(ro.max_splat_px));
+            ro.fixed_splat_px = si(ro.fixed_splat_px);
+            for (auto& r : ro.splat_ranges) r.splat_px = si(r.splat_px);
+            vc_pcam_preview_dirty = true;
+          };
+          ImGui::SameLine();
+          if (ImGui::SmallButton(" /2##vcp_fs")) {
+            vc_face_size = std::max(256, vc_face_size / 2);
+            scale_splats_fs(0.5);
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton(" x2##vcp_fs")) {
+            vc_face_size = std::min(8192, vc_face_size * 2);
+            scale_splats_fs(2.0);
+          }
+          ImGui::Separator();
+        }
+
+        // --- Pinhole render size (shown when any enabled source is Pinhole).
+        //     Default 0 = native intrinsics; override here to super-sample the
+        //     rasterizer (more pixels, sharper per-splat placement) when the
+        //     LiDAR density can support it. x2 pushes a 3840x2160 cam to
+        //     7680x4320; /2 halves. Splat sizes don't auto-scale, so if you
+        //     double the canvas you may want to bump splat px too.
+        const bool any_pinhole =
+          (vc_pcam_active_src >= 0 && vc_pcam_active_src < static_cast<int>(image_sources.size()) &&
+           image_sources[vc_pcam_active_src].camera_type == CameraType::Pinhole);
+        if (any_pinhole) {
+          ImGui::TextDisabled("Pinhole render size");
+          // Eagerly resolve 0 -> native on display so the drag shows the
+          // actual pixel count (e.g. 3840) instead of a meaningless "0".
+          // The batch / preview paths still accept 0 as a sentinel but it
+          // never leaves this block unset now.
+          const auto& psrc_here = image_sources[vc_pcam_active_src];
+          if (vc_pcam_render_w <= 0) vc_pcam_render_w = psrc_here.intrinsics.width;
+          if (vc_pcam_render_h <= 0) vc_pcam_render_h = psrc_here.intrinsics.height;
+          ImGui::SetNextItemWidth(100);
+          ImGui::DragInt("W##vcp_pw", &vc_pcam_render_w, 8, 256, 16000);
+          ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+          ImGui::DragInt("H##vcp_ph", &vc_pcam_render_h, 8, 144, 12000);
+          // Helper: scale every pixel-valued splat knob by `mul` so a canvas
+          // resize preserves the effective angular splat size. Depth-valued
+          // fields (near_depth_m, LinearRamp start_depth_m) are NOT scaled --
+          // those live in world metres and are independent of canvas pixels.
+          auto scale_splats = [this](double mul) {
+            auto& ro = vc_pcam_render_opts;
+            auto scale_int = [mul](int v) {
+              return std::max(0, static_cast<int>(std::round(v * mul)));
+            };
+            ro.min_splat_px   = scale_int(ro.min_splat_px);
+            ro.max_splat_px   = std::max(ro.min_splat_px, scale_int(ro.max_splat_px));
+            ro.fixed_splat_px = scale_int(ro.fixed_splat_px);
+            for (auto& r : ro.splat_ranges) r.splat_px = scale_int(r.splat_px);
+            vc_pcam_preview_dirty = true;
+          };
+
+          ImGui::SameLine();
+          if (ImGui::SmallButton(" /2##vcp_ph_half")) {
+            // Resolve native-if-zero, then halve. Splat sizes halve too.
+            const auto& asrc = image_sources[vc_pcam_active_src];
+            if (vc_pcam_render_w <= 0) vc_pcam_render_w = asrc.intrinsics.width;
+            if (vc_pcam_render_h <= 0) vc_pcam_render_h = asrc.intrinsics.height;
+            vc_pcam_render_w = std::max(256, vc_pcam_render_w / 2);
+            vc_pcam_render_h = std::max(144, vc_pcam_render_h / 2);
+            scale_splats(0.5);
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton(" x2##vcp_ph_dbl")) {
+            const auto& asrc = image_sources[vc_pcam_active_src];
+            if (vc_pcam_render_w <= 0) vc_pcam_render_w = asrc.intrinsics.width;
+            if (vc_pcam_render_h <= 0) vc_pcam_render_h = asrc.intrinsics.height;
+            vc_pcam_render_w = std::min(16000, vc_pcam_render_w * 2);
+            vc_pcam_render_h = std::min(12000, vc_pcam_render_h * 2);
+            scale_splats(2.0);
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Native##vcp_ph_nat")) {
+            vc_pcam_render_w = 0;
+            vc_pcam_render_h = 0;
+          }
+          ImGui::Separator();
+        }
+
+        // --- Output format.
+        ImGui::TextDisabled("Output");
+        ImGui::RadioButton("PNG##vcp", &vc_pcam_format, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("JPG##vcp", &vc_pcam_format, 1);
+        if (vc_pcam_format == 1) {
+          ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+          ImGui::SliderInt("quality##vcp", &vc_pcam_jpg_quality, 60, 100);
+        }
+        ImGui::Separator();
+
+        // --- Action buttons.
+        // "Have source" is implicit now -- the dropdown picks one.
+        const bool have_source = !image_sources.empty();
+        ImGui::BeginDisabled(vc_running || !have_source);
+        const bool preview_clicked = ImGui::Button("Refresh preview##vcp");
+        ImGui::SameLine();
+        const bool test_matches_clicked = ImGui::Button("Test matches##vcp");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Runs the auto-calibrate LightGlue script between the active source's\n"
+          "real image and the currently rendered preview. Reports total matches\n"
+          "plus high/mid/low quality buckets so you can tune the rasterization\n"
+          "knobs for the best match yield.");
+        ImGui::SameLine();
+        const bool can_batch = have_source && !vc_output_dir.empty();
+        ImGui::BeginDisabled(!can_batch);
+        const bool batch_clicked = ImGui::Button("Export cameras##vcp");
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        if (!can_batch && have_source && vc_output_dir.empty()) {
+          ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "Pick an output folder first.");
+        }
+        // Tuning knobs for the match tester (kept separate from ac_* so each
+        // tool keeps its own feel).
+        ImGui::SetNextItemWidth(120);
+        ImGui::SliderFloat("LG min score##vcp", &vc_pcam_lg_min_score, 0.05f, 0.95f, "%.2f");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+        ImGui::DragInt("LG max kp##vcp", &vc_pcam_lg_max_kp, 64, 128, 8192);
+
+        // --- Preview render (blocking; cheap enough for a single frame).
+        if ((preview_clicked || vc_pcam_preview_dirty) && have_source) {
+          vc_pcam_preview_dirty = false;
+          // Drop old textures so we don't leak GL.
+          for (auto& t : vc_pcam_preview_textures) if (t.tex) glDeleteTextures(1, &t.tex);
+          vc_pcam_preview_textures.clear();
+
+          auto& psrc = image_sources[vc_pcam_active_src];
+          if (!psrc.frames.empty()) {
+            const int fidx = std::clamp(vc_pcam_preview_frame, 0, static_cast<int>(psrc.frames.size()) - 1);
+            const auto& pcam = psrc.frames[fidx];
+            if (!pcam.located) {
+              vc_status = "Preview: frame not located; run Colorize > Locate on this source first.";
+            } else {
+              if (!trajectory_built) build_trajectory();
+              const auto timed_traj = timed_traj_snapshot();
+              const Eigen::Vector3f anchor_pos = pcam.T_world_cam.translation().cast<float>();
+              const Eigen::Vector3f anchor_fwd = pcam.T_world_cam.rotation().col(0).cast<float>().normalized();
+              CalibrationContext ctx = build_calibration_context(
+                submaps, timed_traj, pcam.timestamp,
+                anchor_pos, anchor_fwd, vc_pcam_ctx_opts,
+                [this](int si) { return load_hd_for_submap(si, false); });
+
+              // Snapshot intensity percentiles so "Lock range from preview"
+              // has a ready value to clamp to.
+              if (!ctx.intensities.empty()) {
+                compute_intensity_percentiles(ctx.intensities,
+                                              vc_pcam_last_imin,
+                                              vc_pcam_last_ibulk,
+                                              vc_pcam_last_imax);
+                vc_pcam_have_last_percentiles = true;
+              }
+
+              auto upload_tex = [](const cv::Mat& img, const std::string& label,
+                                    std::vector<VcamPreviewTex>& out) {
+                VcamPreviewTex t; t.label = label; t.w = img.cols; t.h = img.rows;
+                glGenTextures(1, &t.tex);
+                glBindTexture(GL_TEXTURE_2D, t.tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                if (img.channels() == 1) {
+                  // Broadcast single-channel luminance to RGB -- simpler than
+                  // juggling GL_LUMINANCE across core-profile drivers.
+                  cv::Mat rgb; cv::cvtColor(img, rgb, cv::COLOR_GRAY2RGB);
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rgb.cols, rgb.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data);
+                } else {
+                  cv::Mat rgb; cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rgb.cols, rgb.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data);
+                }
+                glBindTexture(GL_TEXTURE_2D, 0);
+                out.push_back(t);
+              };
+
+              if (psrc.camera_type == CameraType::Spherical) {
+                const int fs = vc_face_size;
+                const PinholeIntrinsics K = cube_face_intrinsics(fs);
+                for (int fi = 0; fi < 6; fi++) {
+                  if (!vc_face_enabled[fi]) continue;
+                  Eigen::Isometry3d T_face_in_cam = Eigen::Isometry3d::Identity();
+                  T_face_in_cam.linear() = cube_face_rotation(fi);
+                  const Eigen::Isometry3d T_world_face = pcam.T_world_cam * T_face_in_cam;
+                  auto r = render_intensity_image(ctx, T_world_face, K, fs, fs, vc_pcam_render_opts);
+                  upload_tex(r.image, vc_face_label(fi), vc_pcam_preview_textures);
+                }
+              } else {
+                const int W = (vc_pcam_render_w > 0) ? vc_pcam_render_w : psrc.intrinsics.width;
+                const int H = (vc_pcam_render_h > 0) ? vc_pcam_render_h : psrc.intrinsics.height;
+                // Scale intrinsics when W/H override differs from native so FOV
+                // stays constant -- without this, x2 would double the sensor
+                // extent while keeping fx/fy fixed, producing a 2x-wider FOV.
+                PinholeIntrinsics Kp = psrc.intrinsics;
+                const double sx = static_cast<double>(W) / std::max(1, psrc.intrinsics.width);
+                const double sy = static_cast<double>(H) / std::max(1, psrc.intrinsics.height);
+                Kp.fx *= sx; Kp.cx *= sx;
+                Kp.fy *= sy; Kp.cy *= sy;
+                Kp.width = W; Kp.height = H;
+                auto r = render_intensity_image(ctx, pcam.T_world_cam, Kp, W, H, vc_pcam_render_opts);
+                upload_tex(r.image, psrc.name, vc_pcam_preview_textures);
+              }
+              vc_status = "Preview: " + std::to_string(vc_pcam_preview_textures.size()) +
+                          " face(s), context " + std::to_string(ctx.world_points.size()) + " points";
+            }
+          }
+        }
+
+        // --- Test matches. Reuses auto-calibrate's LightGlue pipeline: dumps
+        //     the real image + the rendered preview to temp files, shells out
+        //     to lightglue_match.py, loads confidences, buckets them. Gives a
+        //     fast "is this rasterization good enough for BA matches?" signal
+        //     without running the full extrinsic / intrinsics refinement.
+        if (test_matches_clicked && have_source) {
+          // Drop any previously allocated match viz textures before rebuilding.
+          for (auto& r : vc_pcam_match_results) {
+            if (r.real_tex) glDeleteTextures(1, &r.real_tex);
+            if (r.rend_tex) glDeleteTextures(1, &r.rend_tex);
+          }
+          vc_pcam_match_results.clear();
+          vc_pcam_match_viz_idx = 0;
+          vc_pcam_match_log.clear();
+          auto& psrc = image_sources[vc_pcam_active_src];
+          if (psrc.frames.empty()) {
+            vc_pcam_match_log = "No frames on active source.";
+          } else {
+            const int fidx = std::clamp(vc_pcam_preview_frame, 0, static_cast<int>(psrc.frames.size()) - 1);
+            const auto& pcam = psrc.frames[fidx];
+            if (pcam.filepath.empty() || !boost::filesystem::exists(pcam.filepath)) {
+              vc_pcam_match_log = "Real image not found: " + pcam.filepath;
+            } else if (vc_pcam_preview_textures.empty()) {
+              vc_pcam_match_log = "Run 'Preview renders' first -- match tester needs a rendered image on disk.";
+            } else {
+              // Resolve LightGlue script like auto-calibrate does.
+              std::string script = ac_python_script_path;
+              if (script.empty() && boost::filesystem::exists("/ros2_ws/src/glim/scripts/lightglue_match.py")) {
+                script = "/ros2_ws/src/glim/scripts/lightglue_match.py";
+              }
+              if (script.empty()) {
+                vc_pcam_match_log = "lightglue_match.py not found (set ac_python_script_path in Auto-calibrate window).";
+              } else {
+                const std::string py = ac_python_interpreter.empty() ? std::string("python3") : ac_python_interpreter;
+                boost::filesystem::path tmp_dir = boost::filesystem::temp_directory_path() / "glim_vcam_match";
+                boost::filesystem::create_directories(tmp_dir);
+
+                // Re-render each face into a temp PNG and dump the paired real
+                // slice. For Spherical we slice the real equirect into the same
+                // 6 faces the rendered side just used, so the pairing is direct.
+                cv::Mat real_full = cv::imread(pcam.filepath);
+                if (real_full.empty()) {
+                  vc_pcam_match_log = "Failed to load real image from " + pcam.filepath;
+                } else {
+                  // Pre-slice the real equirect for Spherical sources.
+                  std::array<std::shared_ptr<cv::Mat>, 6> real_faces;
+                  if (psrc.camera_type == CameraType::Spherical) {
+                    real_faces = slice_equirect_cubemap(real_full, vc_face_size);
+                  }
+                  // Upload a cv::Mat to a GL texture, handling 1-channel and 3-channel
+                  // inputs. Returns 0 on empty Mat. Used for the match-viz side-by-side.
+                  auto upload_tex_mat = [](const cv::Mat& img) -> unsigned int {
+                    if (img.empty()) return 0;
+                    unsigned int tex = 0;
+                    glGenTextures(1, &tex);
+                    glBindTexture(GL_TEXTURE_2D, tex);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    cv::Mat rgb;
+                    if (img.channels() == 1) cv::cvtColor(img, rgb, cv::COLOR_GRAY2RGB);
+                    else                      cv::cvtColor(img, rgb, cv::COLOR_BGR2RGB);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rgb.cols, rgb.rows, 0,
+                                 GL_RGB, GL_UNSIGNED_BYTE, rgb.data);
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                    return tex;
+                  };
+
+                  auto run_match_one = [&](const cv::Mat& real_img,
+                                            const cv::Mat& rendered_img,
+                                            const std::string& label) {
+                    const std::string rp = (tmp_dir / (std::string("real_") + label + ".png")).string();
+                    const std::string gp = (tmp_dir / (std::string("rend_") + label + ".png")).string();
+                    const std::string jp = (tmp_dir / (std::string("matches_") + label + ".json")).string();
+                    // lightglue_match.py expects both images sized identically.
+                    // Render is already at face_size (spherical) or native intrinsics (pinhole).
+                    cv::Mat real_resized;
+                    cv::resize(real_img, real_resized, cv::Size(rendered_img.cols, rendered_img.rows));
+                    cv::imwrite(rp, real_resized);
+                    // Convert 8UC3 colormapped render to 8UC3 BGR, or keep single-channel grayscale.
+                    cv::imwrite(gp, rendered_img);
+                    char args[128];
+                    std::snprintf(args, sizeof(args), " --max-kp %d --min-score %.3f",
+                                  vc_pcam_lg_max_kp, vc_pcam_lg_min_score);
+                    const std::string cmd = py + " " + script + " " + rp + " " + gp + " " + jp + args + " 2>&1";
+                    logger->info("[VirtualCams] {}", cmd);
+                    const int rc = std::system(cmd.c_str());
+                    VcamMatchResult res; res.label = label;
+                    if (rc == 0) {
+                      std::vector<float> confidences;
+                      auto raw = load_lightglue_matches(jp, &confidences);
+                      res.stats = compute_match_quality(confidences);
+                      res.match_pairs.reserve(raw.size());
+                      res.match_scores.reserve(raw.size());
+                      for (size_t i = 0; i < raw.size(); i++) {
+                        res.match_pairs.emplace_back(raw[i].first.cast<float>(), raw[i].second.cast<float>());
+                        res.match_scores.push_back(i < confidences.size() ? confidences[i] : 1.0f);
+                      }
+                    } else {
+                      logger->warn("[VirtualCams] lightglue_match.py returned {} for {}", rc, label);
+                    }
+                    // Texture uploads for the viz window. Tied to render-space so
+                    // match UVs index into them directly.
+                    res.real_tex = upload_tex_mat(real_resized);
+                    res.rend_tex = upload_tex_mat(rendered_img);
+                    res.real_w = real_resized.cols; res.real_h = real_resized.rows;
+                    res.rend_w = rendered_img.cols; res.rend_h = rendered_img.rows;
+                    vc_pcam_match_results.push_back(std::move(res));
+                  };
+
+                  // Re-render face-by-face (or just once for pinhole) so the
+                  // rendered side is an on-disk PNG the script can eat.
+                  if (!trajectory_built) build_trajectory();
+                  const auto t_traj = timed_traj_snapshot();
+                  const Eigen::Vector3f apos = pcam.T_world_cam.translation().cast<float>();
+                  const Eigen::Vector3f afwd = pcam.T_world_cam.rotation().col(0).cast<float>().normalized();
+                  CalibrationContext tctx = build_calibration_context(
+                    submaps, t_traj, pcam.timestamp, apos, afwd, vc_pcam_ctx_opts,
+                    [this](int si) { return load_hd_for_submap(si, false); });
+
+                  if (psrc.camera_type == CameraType::Spherical) {
+                    const int fs = vc_face_size;
+                    const PinholeIntrinsics K = cube_face_intrinsics(fs);
+                    for (int fi = 0; fi < 6; fi++) {
+                      if (!vc_face_enabled[fi]) continue;
+                      if (!real_faces[fi]) continue;
+                      Eigen::Isometry3d T_face_in_cam = Eigen::Isometry3d::Identity();
+                      T_face_in_cam.linear() = cube_face_rotation(fi);
+                      const Eigen::Isometry3d T_world_face = pcam.T_world_cam * T_face_in_cam;
+                      cv::Mat rendered = render_intensity_image(
+                        tctx, T_world_face, K, fs, fs, vc_pcam_render_opts).image;
+                      run_match_one(*real_faces[fi], rendered, vc_face_label(fi));
+                    }
+                  } else {
+                    const int W = (vc_pcam_render_w > 0) ? vc_pcam_render_w : psrc.intrinsics.width;
+                    const int H = (vc_pcam_render_h > 0) ? vc_pcam_render_h : psrc.intrinsics.height;
+                    PinholeIntrinsics Kt = psrc.intrinsics;
+                    const double sx = static_cast<double>(W) / std::max(1, psrc.intrinsics.width);
+                    const double sy = static_cast<double>(H) / std::max(1, psrc.intrinsics.height);
+                    Kt.fx *= sx; Kt.cx *= sx;
+                    Kt.fy *= sy; Kt.cy *= sy;
+                    Kt.width = W; Kt.height = H;
+                    cv::Mat rendered = render_intensity_image(
+                      tctx, pcam.T_world_cam, Kt, W, H, vc_pcam_render_opts).image;
+                    run_match_one(real_full, rendered, psrc.name);
+                  }
+                  // Log which labels were actually matched (disabled faces are
+                  // skipped earlier) -- visible in the status line so a mismatch
+                  // between the face checkboxes and the runner is easy to spot.
+                  std::string labels_tested;
+                  for (const auto& r : vc_pcam_match_results) {
+                    if (!labels_tested.empty()) labels_tested += ", ";
+                    labels_tested += r.label;
+                  }
+                  vc_pcam_match_log = "Test matches: " +
+                    std::to_string(vc_pcam_match_results.size()) + " face(s) evaluated (" +
+                    labels_tested + ").";
+                  logger->info("[VirtualCams] {}", vc_pcam_match_log);
+                  // Auto-open the side-by-side viz so the user sees matches
+                  // immediately rather than hunting for a button.
+                  vc_pcam_match_viz_show = !vc_pcam_match_results.empty();
+                  vc_pcam_match_viz_idx  = 0;
+                }
+              }
+            }
+          }
+        }
+
+        // --- Match-test results panel.
+        if (!vc_pcam_match_results.empty()) {
+          ImGui::Separator();
+          ImGui::TextDisabled("Match test (LightGlue, min-score %.2f, max-kp %d)",
+                               vc_pcam_lg_min_score, vc_pcam_lg_max_kp);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("View matches##vcp_viz")) {
+            vc_pcam_match_viz_show = true;
+          }
+          int sum_total = 0, sum_high = 0, sum_mid = 0, sum_low = 0;
+          for (const auto& r : vc_pcam_match_results) {
+            sum_total += r.stats.total;
+            sum_high  += r.stats.high;
+            sum_mid   += r.stats.mid;
+            sum_low   += r.stats.low;
+            ImGui::Text("  %-7s  total %4d", r.label.c_str(), r.stats.total);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.35f, 1.0f), "  %d high", r.stats.high);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "  %d mid", r.stats.mid);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "  %d low", r.stats.low);
+          }
+          if (vc_pcam_match_results.size() > 1) {
+            ImGui::Text("  %-7s  total %4d", "TOTAL", sum_total);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.35f, 1.0f), "  %d high", sum_high);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "  %d mid", sum_mid);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "  %d low", sum_low);
+          }
+        }
+        if (!vc_pcam_match_log.empty()) {
+          ImGui::TextDisabled("%s", vc_pcam_match_log.c_str());
+        }
+
+        // --- Batch export (blocking -- user sees a frozen UI during the run,
+        // progress goes to the status line. Threading is a later optimisation).
+        if (batch_clicked) {
+          vc_pcam_cancel = false;
+          vc_pcam_progress_cur = 0;
+          // Total = located_frames * faces_for_active_source. The dropdown is
+          // the single source of truth now; batch runs on the active source only.
+          int total = 0;
+          {
+            const auto& s = image_sources[vc_pcam_active_src];
+            int per_cam = 1;
+            if (s.camera_type == CameraType::Spherical) {
+              per_cam = 0;
+              for (int f = 0; f < 6; f++) if (vc_face_enabled[f]) per_cam++;
+            }
+            if (per_cam > 0) {
+              for (const auto& c : s.frames) if (c.located) total += per_cam;
+            }
+          }
+          vc_pcam_progress_total = total;
+          const std::string ext = (vc_pcam_format == 0) ? ".png" : ".jpg";
+          boost::filesystem::create_directories(vc_output_dir);
+
+          if (!trajectory_built) build_trajectory();
+          const auto batch_timed_traj = timed_traj_snapshot();
+
+          auto sanitise = [](std::string s) {
+            for (auto& ch : s) if (ch == '/' || ch == '\\' || ch == ' ' || ch == ':' || ch == '?') ch = '_';
+            return s;
+          };
+
+          std::vector<int> jpg_params;
+          if (vc_pcam_format == 1) {
+            jpg_params = { cv::IMWRITE_JPEG_QUALITY, vc_pcam_jpg_quality };
+          }
+
+          int written = 0;
+          {
+            auto& s = image_sources[vc_pcam_active_src];
+            const std::string sname = sanitise(s.name);
+            const bool is_sph = (s.camera_type == CameraType::Spherical);
+            std::vector<int> faces_to_render;
+            if (is_sph) { for (int f = 0; f < 6; f++) if (vc_face_enabled[f]) faces_to_render.push_back(f); }
+            else        { faces_to_render.push_back(-1); }  // sentinel = pinhole, no face label
+
+            for (size_t fi = 0; fi < s.frames.size(); fi++) {
+              if (vc_pcam_cancel) break;
+              const auto& c = s.frames[fi];
+              if (!c.located) continue;
+
+              // Build context once per frame (same context reused across faces).
+              const Eigen::Vector3f apos = c.T_world_cam.translation().cast<float>();
+              const Eigen::Vector3f afwd = c.T_world_cam.rotation().col(0).cast<float>().normalized();
+              CalibrationContext ctx = build_calibration_context(
+                submaps, batch_timed_traj, c.timestamp, apos, afwd,
+                vc_pcam_ctx_opts, [this](int sm) { return load_hd_for_submap(sm, false); });
+
+              for (int face : faces_to_render) {
+                if (vc_pcam_cancel) break;
+                cv::Mat img;
+                if (face < 0) {
+                  const int W = (vc_pcam_render_w > 0) ? vc_pcam_render_w : s.intrinsics.width;
+                  const int H = (vc_pcam_render_h > 0) ? vc_pcam_render_h : s.intrinsics.height;
+                  PinholeIntrinsics Kb = s.intrinsics;
+                  const double sx = static_cast<double>(W) / std::max(1, s.intrinsics.width);
+                  const double sy = static_cast<double>(H) / std::max(1, s.intrinsics.height);
+                  Kb.fx *= sx; Kb.cx *= sx;
+                  Kb.fy *= sy; Kb.cy *= sy;
+                  Kb.width = W; Kb.height = H;
+                  img = render_intensity_image(ctx, c.T_world_cam, Kb, W, H, vc_pcam_render_opts).image;
+                } else {
+                  const int fs = vc_face_size;
+                  const PinholeIntrinsics K = cube_face_intrinsics(fs);
+                  Eigen::Isometry3d T_face_in_cam = Eigen::Isometry3d::Identity();
+                  T_face_in_cam.linear() = cube_face_rotation(face);
+                  const Eigen::Isometry3d T_world_face = c.T_world_cam * T_face_in_cam;
+                  img = render_intensity_image(ctx, T_world_face, K, fs, fs, vc_pcam_render_opts).image;
+                }
+                char frame_buf[16]; std::snprintf(frame_buf, sizeof(frame_buf), "%04zu", fi);
+                std::string path = vc_output_dir + "/LidarCam_" + sname;
+                if (face >= 0) path += std::string("_") + vc_face_label(face);
+                path += std::string("_") + frame_buf + ext;
+                cv::imwrite(path, img, jpg_params);
+                written++;
+                vc_pcam_progress_cur = written;
+              }
+            }
+          }
+          vc_status = (vc_pcam_cancel ? "Cancelled after " : "Done: ") +
+                      std::to_string(written) + "/" + std::to_string(total) + " images written to " + vc_output_dir;
+          logger->info("[VirtualCams/per-cam] {}", vc_status);
+        }
+
+        // --- Thumbnail row. Click any thumbnail to open a large preview window.
+        if (!vc_pcam_preview_textures.empty()) {
+          ImGui::Separator();
+          ImGui::TextDisabled("Preview (click a thumbnail to enlarge)");
+          const float thumb_w = 180.0f;
+          for (size_t ti = 0; ti < vc_pcam_preview_textures.size(); ti++) {
+            const auto& t = vc_pcam_preview_textures[ti];
+            const float thumb_h = (t.w > 0) ? (thumb_w * static_cast<float>(t.h) / static_cast<float>(t.w)) : thumb_w;
+            ImGui::BeginGroup();
+            ImGui::PushID(static_cast<int>(ti));
+            if (ImGui::ImageButton("thumb",
+                                    reinterpret_cast<ImTextureID>(static_cast<intptr_t>(t.tex)),
+                                    ImVec2(thumb_w, thumb_h))) {
+              vc_pcam_focused_tex = static_cast<int>(ti);
+            }
+            ImGui::PopID();
+            ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "%s", t.label.c_str());
+            ImGui::EndGroup();
+            ImGui::SameLine();
+          }
+          ImGui::NewLine();
+        }
+
+        if (!vc_status.empty()) {
+          ImGui::Separator();
+          ImGui::TextWrapped("%s", vc_status.c_str());
+        }
+      }
+    }
+
+    // 3D-viewer preview: show anchors as small spheres so the user can eyeball
+    // the spacing before committing to a render.
+    if (!vc_preview_anchors.empty()) {
+      auto vw = guik::LightViewer::instance();
+      for (size_t i = 0; i < vc_preview_anchors.size(); i++) {
+        Eigen::Affine3f tf = Eigen::Affine3f::Identity();
+        tf.translate(vc_preview_anchors[i]);
+        tf.linear() = vc_preview_orient[i];
+        tf = tf * Eigen::Scaling(Eigen::Vector3f(0.20f, 0.20f, 0.20f));
+        // Cyan so anchors stand out against the green trajectory line.
+        vw->update_drawable("vc_anchor_" + std::to_string(i),
+          glk::Primitives::sphere(),
+          guik::FlatColor(0.1f, 0.85f, 0.95f, 0.95f, tf));
+        // Forward-direction line, same cyan.
+        const Eigen::Vector3f pos = vc_preview_anchors[i];
+        const Eigen::Vector3f fwd = vc_preview_orient[i].col(0).normalized();
+        std::vector<Eigen::Vector3f> verts = { pos, pos + fwd * 0.8f };
+        vw->update_drawable("vc_anchor_fwd_" + std::to_string(i),
+          std::make_shared<glk::ThinLines>(verts.data(), static_cast<int>(verts.size()), false),
+          guik::FlatColor(0.1f, 0.85f, 0.95f, 0.9f));
+      }
+    }
+
+    ImGui::End();
+
+    // --- Enlarged preview window. Opens when the user clicks a thumbnail;
+    //     closable via the X so a stale focus index doesn't linger after the
+    //     textures it pointed into are recreated.
+    if (vc_pcam_focused_tex >= 0 &&
+        vc_pcam_focused_tex < static_cast<int>(vc_pcam_preview_textures.size())) {
+      const auto& t = vc_pcam_preview_textures[vc_pcam_focused_tex];
+      bool open = true;
+      ImGui::SetNextWindowSize(ImVec2(2100, 2100), ImGuiCond_FirstUseEver);
+      const std::string title = std::string("Preview: ") + t.label + "###vc_pcam_enlarged";
+      if (ImGui::Begin(title.c_str(), &open)) {
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float scale = std::min(avail.x / std::max(1.0f, static_cast<float>(t.w)),
+                                      avail.y / std::max(1.0f, static_cast<float>(t.h)));
+        const ImVec2 sz(t.w * scale, t.h * scale);
+        ImGui::Image(reinterpret_cast<ImTextureID>(static_cast<intptr_t>(t.tex)), sz);
+      }
+      ImGui::End();
+      if (!open) vc_pcam_focused_tex = -1;
+    } else if (vc_pcam_focused_tex >= static_cast<int>(vc_pcam_preview_textures.size())) {
+      // Textures got recreated or cleared -- drop the stale focus.
+      vc_pcam_focused_tex = -1;
+    }
+
+    // --- Match viz window. Side-by-side real / rendered images with LightGlue
+    //     match lines drawn between them. Colour-coded by confidence: green =
+    //     high, amber = mid, red = low -- same bucket thresholds the results
+    //     panel uses. For Spherical sources the face selector picks which pair
+    //     to show. Mirrors the auto-calibrate visualisation so the cognitive
+    //     overhead is zero for anyone who's tuned extrinsics before.
+    if (vc_pcam_match_viz_show && !vc_pcam_match_results.empty()) {
+      vc_pcam_match_viz_idx = std::clamp(
+        vc_pcam_match_viz_idx, 0, static_cast<int>(vc_pcam_match_results.size()) - 1);
+      bool open = true;
+      ImGui::SetNextWindowSize(ImVec2(1400, 900), ImGuiCond_FirstUseEver);
+      if (ImGui::Begin("VC Match viz###vc_pcam_match_viz", &open)) {
+        // Face selector when multiple results are in.
+        if (vc_pcam_match_results.size() > 1) {
+          std::vector<std::string> labels;
+          for (const auto& r : vc_pcam_match_results) {
+            labels.push_back(r.label + " (" + std::to_string(r.stats.total) + ")");
+          }
+          std::vector<const char*> lptrs;
+          for (auto& s : labels) lptrs.push_back(s.c_str());
+          ImGui::SetNextItemWidth(240);
+          ImGui::Combo("Face##vc_viz", &vc_pcam_match_viz_idx, lptrs.data(),
+                        static_cast<int>(lptrs.size()));
+          ImGui::SameLine();
+        }
+        const auto& r = vc_pcam_match_results[vc_pcam_match_viz_idx];
+        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.35f, 1.0f), "%d high", r.stats.high);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "| %d mid", r.stats.mid);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "| %d low", r.stats.low);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(total %d)", r.stats.total);
+        ImGui::Separator();
+
+        if (!r.real_tex || !r.rend_tex) {
+          ImGui::TextDisabled("Match viz unavailable -- textures not uploaded.");
+        } else {
+          // Layout: two images side-by-side, each taking half the content width
+          // minus a small gutter. Scale preserves aspect ratio.
+          const ImVec2 avail = ImGui::GetContentRegionAvail();
+          const float gutter = 12.0f;
+          const float pair_w = std::max(50.0f, (avail.x - gutter) * 0.5f);
+          const float s_real = pair_w / static_cast<float>(std::max(1, r.real_w));
+          const float s_rend = pair_w / static_cast<float>(std::max(1, r.rend_w));
+          const float h_real = s_real * r.real_h;
+          const float h_rend = s_rend * r.rend_h;
+          const float row_h = std::max(h_real, h_rend);
+          const ImVec2 real_pos = ImGui::GetCursorScreenPos();
+          ImGui::Image(reinterpret_cast<ImTextureID>(static_cast<intptr_t>(r.real_tex)),
+                       ImVec2(pair_w, h_real));
+          ImGui::SameLine(0.0f, gutter);
+          const ImVec2 rend_pos = ImGui::GetCursorScreenPos();
+          ImGui::Image(reinterpret_cast<ImTextureID>(static_cast<intptr_t>(r.rend_tex)),
+                       ImVec2(pair_w, h_rend));
+
+          // Match lines. UVs are in render-space (both sides resized to the
+          // same W/H) so left-side scale == right-side scale.
+          ImDrawList* dl = ImGui::GetWindowDrawList();
+          for (size_t i = 0; i < r.match_pairs.size(); i++) {
+            const auto& m = r.match_pairs[i];
+            const float score = i < r.match_scores.size() ? r.match_scores[i] : 1.0f;
+            ImU32 col;
+            if (score >= 0.8f)       col = IM_COL32( 90, 240,  90, 200);  // high -- green
+            else if (score >= 0.5f)  col = IM_COL32(255, 190,  60, 200);  // mid  -- amber
+            else                      col = IM_COL32(240,  90,  90, 180); // low  -- red
+            const ImVec2 a(real_pos.x + m.first.x()  * s_real, real_pos.y + m.first.y()  * s_real);
+            const ImVec2 b(rend_pos.x + m.second.x() * s_rend, rend_pos.y + m.second.y() * s_rend);
+            dl->AddCircleFilled(a, 2.5f, col);
+            dl->AddCircleFilled(b, 2.5f, col);
+            dl->AddLine(a, b, col, 1.0f);
+          }
+          ImGui::Dummy(ImVec2(1.0f, row_h - std::min(h_real, h_rend)));
+          ImGui::TextDisabled(
+            "Left: real (resized to render). Right: LiDAR-rendered virtual. "
+            "Lines: green >= 0.80, amber 0.50-0.80, red < 0.50.");
+        }
+      }
+      ImGui::End();
+      if (!open) vc_pcam_match_viz_show = false;
+    }
+  });
+
+  // Camera Time Matcher: side-by-side scrub to align a dumb-frames source
+  // (no timestamps, e.g. Osmo 360 video frames) to a time-stamped reference
+  // source. User anchors one or two matching moments, enters FPS, clicks
+  // Apply -> right-side frames get synthetic timestamps back-filled then get
+  // located along the trajectory in one shot.
+  viewer->register_ui_callback("time_matcher_window", [this] {
+    if (!show_time_matcher) return;
+    ImGui::SetNextWindowSize(ImVec2(1100, 720), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Camera Time Matcher", &show_time_matcher)) { ImGui::End(); return; }
+    if (image_sources.size() < 2) {
+      ImGui::TextDisabled("Need at least two image sources loaded (one time-stamped, one to be matched).");
+      ImGui::End(); return;
+    }
+
+    // --- Source selectors ---
+    std::vector<std::string> labels;
+    for (size_t i = 0; i < image_sources.size(); i++) labels.push_back("src " + std::to_string(i) + " [" + image_sources[i].name + "]");
+    std::vector<const char*> lptrs; for (auto& s : labels) lptrs.push_back(s.c_str());
+    ImGui::SetNextItemWidth(260);
+    ImGui::Combo("Left (time-stamped)##tm", &tm_left_src,  lptrs.data(), static_cast<int>(lptrs.size()));
+    ImGui::SameLine(560);
+    ImGui::SetNextItemWidth(260);
+    ImGui::Combo("Right (dumb frames)##tm", &tm_right_src, lptrs.data(), static_cast<int>(lptrs.size()));
+
+    tm_left_src  = std::clamp(tm_left_src,  0, static_cast<int>(image_sources.size()) - 1);
+    tm_right_src = std::clamp(tm_right_src, 0, static_cast<int>(image_sources.size()) - 1);
+    auto& srcL = image_sources[tm_left_src];
+    auto& srcR = image_sources[tm_right_src];
+    if (srcL.frames.empty() || srcR.frames.empty()) {
+      ImGui::TextDisabled("One of the selected sources has no frames.");
+      ImGui::End(); return;
+    }
+    tm_left_idx  = std::clamp(tm_left_idx,  0, static_cast<int>(srcL.frames.size()) - 1);
+    tm_right_idx = std::clamp(tm_right_idx, 0, static_cast<int>(srcR.frames.size()) - 1);
+    const auto& camL = srcL.frames[tm_left_idx];
+    const auto& camR = srcR.frames[tm_right_idx];
+
+    // --- Image loader helper (downscaled texture for responsiveness) ---
+    auto load_texture = [](const std::string& path, std::string& loaded_path,
+                           unsigned int& tex, int& tw, int& th) {
+      if (path == loaded_path) return;
+      cv::Mat img = cv::imread(path);
+      if (img.empty()) return;
+      cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+      const int max_tex = 1200;
+      cv::Mat tex_img = img;
+      if (img.cols > max_tex) {
+        const double s = static_cast<double>(max_tex) / img.cols;
+        cv::resize(img, tex_img, cv::Size(), s, s);
+      }
+      if (tex) { glDeleteTextures(1, &tex); tex = 0; }
+      glGenTextures(1, &tex);
+      glBindTexture(GL_TEXTURE_2D, tex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, tex_img.cols, tex_img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, tex_img.data);
+      glBindTexture(GL_TEXTURE_2D, 0);
+      tw = tex_img.cols; th = tex_img.rows;
+      loaded_path = path;
+    };
+    const std::string prev_left_path  = tm_left_loaded_path;
+    const std::string prev_right_path = tm_right_loaded_path;
+    load_texture(camL.filepath, tm_left_loaded_path,  tm_left_tex,  tm_left_tex_w,  tm_left_tex_h);
+    load_texture(camR.filepath, tm_right_loaded_path, tm_right_tex, tm_right_tex_w, tm_right_tex_h);
+    // Reset scale to fit when the frame changed -- different resolutions would
+    // otherwise show at the previous scale and misframe. Auto-fit flag stays
+    // as the user last set it (so if they were zoomed in on the left, stepping
+    // to the next left frame stays zoomed in).
+    if (tm_left_loaded_path  != prev_left_path)  tm_left_scale  = -1.0f;
+    if (tm_right_loaded_path != prev_right_path) tm_right_scale = -1.0f;
+
+    // --- Two-column layout: left preview / right preview ---
+    // Both dimensions scale with window size. Reserve ~260 px at the bottom for
+    // the anchor + rate + apply controls. col_h minimum 240 keeps the image
+    // useful even in a cramped window; above that it grows with the window.
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float col_w = (avail.x - 16.0f) * 0.5f;
+    const float col_h = std::max(240.0f, avail.y - 260.0f);
+
+    auto draw_column = [&](const char* tag, int& idx, int max_idx,
+                           unsigned int tex, int tw, int th, double display_time, bool is_right,
+                           float& scale, bool& auto_fit) {
+      ImGui::BeginChild((std::string("tmcol_") + tag).c_str(), ImVec2(col_w, col_h + 170.0f), true);
+      // Inner scrollable viewport for the image so zoom-in can push past the
+      // visible area without overflowing the outer child.
+      const ImVec2 viewport_size(col_w - 18.0f, col_h);
+      ImGui::BeginChild((std::string("tmview_") + tag).c_str(), viewport_size,
+                        false, ImGuiWindowFlags_HorizontalScrollbar);
+      const ImVec2 canvas_origin = ImGui::GetCursorScreenPos();
+      if (tex && tw > 0 && th > 0) {
+        // Auto-fit: scale tracks current viewport size until the user zooms
+        // manually. Lets the image grow when the window is resized larger.
+        if (auto_fit || scale <= 0.0f) {
+          scale = std::min(viewport_size.x / tw, viewport_size.y / th);
+        }
+        ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(tex)),
+                     ImVec2(tw * scale, th * scale));
+      } else {
+        ImGui::Dummy(viewport_size);
+      }
+      if (apply_wheel_zoom_around_cursor(scale, canvas_origin, 0.05f, 10.0f)) {
+        auto_fit = false;  // user zoomed -- stop auto-fitting until they click Reset.
+      }
+      ImGui::EndChild();
+
+      // Zoom controls
+      if (ImGui::SmallButton((std::string("-##") + tag + "zoom").c_str())) { scale = std::max(0.05f, scale / 1.25f); auto_fit = false; }
+      ImGui::SameLine();
+      if (ImGui::SmallButton((std::string("+##") + tag + "zoom").c_str())) { scale = std::min(10.0f,  scale * 1.25f); auto_fit = false; }
+      ImGui::SameLine();
+      if (ImGui::SmallButton((std::string("Reset##") + tag + "zoom").c_str()) && tex && tw > 0 && th > 0) {
+        auto_fit = true;  // resume auto-fit; scale will be recomputed next frame.
+      }
+      ImGui::SameLine();
+      ImGui::TextDisabled("%s%.2fx", auto_fit ? "fit " : "", scale);
+
+      // Scrub: narrower slider + prominent step buttons for fine tuning.
+      ImGui::SetNextItemWidth(col_w * 0.55f);
+      ImGui::SliderInt((std::string("Frame##") + tag).c_str(), &idx, 0, max_idx);
+      ImGui::SameLine();
+      if (ImGui::ArrowButton((std::string("##") + tag + "prev").c_str(), ImGuiDir_Left))  idx = std::max(0, idx - 1);
+      ImGui::SameLine();
+      if (ImGui::ArrowButton((std::string("##") + tag + "next").c_str(), ImGuiDir_Right)) idx = std::min(max_idx, idx + 1);
+      ImGui::SameLine();
+      ImGui::Text("%d / %d", idx, max_idx);
+      if (is_right && display_time == 0.0) {
+        ImGui::TextDisabled("time: (unstamped)");
+      } else {
+        ImGui::Text("time: %.3f s", display_time);
+      }
+      ImGui::EndChild();
+    };
+
+    const double left_time  = camL.timestamp + effective_time_shift(srcL, camL.timestamp);
+    const double right_time = camR.timestamp;  // dumb source: raw timestamp (often 0)
+    draw_column("L", tm_left_idx,  static_cast<int>(srcL.frames.size()) - 1,
+                tm_left_tex,  tm_left_tex_w,  tm_left_tex_h,  left_time,  false,
+                tm_left_scale,  tm_left_auto_fit);
+    ImGui::SameLine();
+    draw_column("R", tm_right_idx, static_cast<int>(srcR.frames.size()) - 1,
+                tm_right_tex, tm_right_tex_w, tm_right_tex_h, right_time, true,
+                tm_right_scale, tm_right_auto_fit);
+
+    ImGui::Separator();
+
+    // --- Anchor + apply controls ---
+    if (ImGui::Button("Set Anchor 1")) {
+      tm_anchor1_right_idx = tm_right_idx;
+      tm_anchor1_left_time = left_time;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Record the current LEFT time as the anchor for the current RIGHT frame.\n"
+      "With 'Two-anchor mode' OFF: Apply back-fills using anchor1 + FPS.\n"
+      "With 'Two-anchor mode' ON: set a second anchor at a DIFFERENT moment to\n"
+      "solve the actual rate.");
+    ImGui::SameLine();
+    if (tm_anchor1_right_idx >= 0) {
+      ImGui::Text("Anchor1: right[%d] <-> left_t=%.3f", tm_anchor1_right_idx, tm_anchor1_left_time);
+    } else {
+      ImGui::TextDisabled("Anchor 1 not set");
+    }
+
+    ImGui::Checkbox("Two-anchor mode (solve rate)##tm", &tm_two_anchor_mode);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "Two anchors let BA solve the actual frame interval instead of trusting FPS.\n"
+      "Pick the two anchors as far apart as possible (e.g. near-start and near-end\n"
+      "of the dumb source) for best numerical conditioning.");
+
+    if (tm_two_anchor_mode) {
+      if (ImGui::Button("Set Anchor 2")) {
+        tm_anchor2_right_idx = tm_right_idx;
+        tm_anchor2_left_time = left_time;
+      }
+      ImGui::SameLine();
+      if (tm_anchor2_right_idx >= 0) {
+        ImGui::Text("Anchor2: right[%d] <-> left_t=%.3f", tm_anchor2_right_idx, tm_anchor2_left_time);
+      } else {
+        ImGui::TextDisabled("Anchor 2 not set");
+      }
+    } else {
+      ImGui::SetNextItemWidth(140);
+      ImGui::DragFloat("Right FPS##tm", &tm_right_fps, 0.1f, 0.1f, 240.0f, "%.2f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Frame rate of the dumb source as exported. Exact-rate assumption -- if\n"
+        "the export dropped frames unevenly, use Two-anchor mode instead.");
+    }
+
+    // Show solved rate when in two-anchor mode and both anchors set.
+    double effective_interval = 0.0;
+    bool ready_to_apply = false;
+    if (tm_two_anchor_mode) {
+      if (tm_anchor1_right_idx >= 0 && tm_anchor2_right_idx >= 0 &&
+          tm_anchor1_right_idx != tm_anchor2_right_idx) {
+        effective_interval = (tm_anchor2_left_time - tm_anchor1_left_time) /
+                             static_cast<double>(tm_anchor2_right_idx - tm_anchor1_right_idx);
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
+          "Solved rate: %.4f FPS (interval %.5f s)",
+          effective_interval > 1e-9 ? 1.0 / effective_interval : 0.0,
+          effective_interval);
+        ready_to_apply = true;
+      } else {
+        ImGui::TextDisabled("Set both anchors to solve the rate.");
+      }
+    } else {
+      if (tm_anchor1_right_idx >= 0 && tm_right_fps > 0.01f) {
+        effective_interval = 1.0 / static_cast<double>(tm_right_fps);
+        ready_to_apply = true;
+      }
+    }
+
+    ImGui::Separator();
+
+    ImGui::BeginDisabled(!ready_to_apply);
+    if (ImGui::Button("Apply to all frames + Locate##tm")) {
+      // Back-fill timestamps: t[i] = anchor1_left_time + (i - anchor1_right_idx) * effective_interval.
+      for (size_t i = 0; i < srcR.frames.size(); i++) {
+        const double dt = (static_cast<int>(i) - tm_anchor1_right_idx) * effective_interval;
+        srcR.frames[i].timestamp = tm_anchor1_left_time + dt;
+      }
+      // Persist the anchor state on the source so the next session reload
+      // reapplies the back-fill automatically (dumb frames have no EXIF time
+      // to fall back to). User needs to Save config after this for it to stick.
+      srcR.tm_anchor1_idx  = tm_anchor1_right_idx;
+      srcR.tm_anchor1_time = tm_anchor1_left_time;
+      srcR.tm_anchor2_idx  = tm_two_anchor_mode ? tm_anchor2_right_idx : -1;
+      srcR.tm_anchor2_time = tm_two_anchor_mode ? tm_anchor2_left_time : 0.0;
+      srcR.tm_fps          = tm_right_fps;
+      // Back-filled timestamps are in LiDAR-time base already (anchor was the
+      // LEFT camera's effective time, which is left EXIF + left time_shift).
+      // Downstream colorize does `effective_t = frame.timestamp + src.time_shift`,
+      // so zeroing out time_shift here prevents a double-shift. Leaves the knob
+      // free for later fine-tune nudges.
+      srcR.time_shift = 0.0;
+      // Locate the right source along the trajectory using the new timestamps.
+      if (!trajectory_built) build_trajectory();
+      const auto timed_traj = timed_traj_snapshot();
+      // Honor srcR's locate_mode -- Time Matcher back-fills timestamps, then
+      // the source gets placed via whichever trajectory the user picked.
+      const int located = Colorizer::locate_by_time(srcR, trajectory_for(srcR, timed_traj));
+      logger->info("[TimeMatcher] Back-filled {} timestamps, located {}/{} frames",
+                   srcR.frames.size(), located, srcR.frames.size());
+    }
+    ImGui::EndDisabled();
+    if (!ready_to_apply) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("(set anchors + rate first)");
+    }
+
+    ImGui::End();
+  });
+
+  // Auto-calibration window (LightGlue-assisted)
+  viewer->register_ui_callback("auto_calibrate_window", [this] {
+    if (!ac_show) return;
+    ImGui::SetNextWindowSize(ImVec2(460, 520), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Auto-calibrate (LightGlue)", &ac_show)) {
+      if (image_sources.empty()) { ImGui::TextDisabled("No image sources loaded."); ImGui::End(); return; }
+      ac_cam_src = std::clamp(ac_cam_src, 0, static_cast<int>(image_sources.size()) - 1);
+      auto& src = image_sources[ac_cam_src];
+      if (src.frames.empty()) { ImGui::TextDisabled("Selected source has no frames."); ImGui::End(); return; }
+      ac_cam_idx = std::clamp(ac_cam_idx, 0, static_cast<int>(src.frames.size()) - 1);
+      const auto& cam = src.frames[ac_cam_idx];
+
+      // --- Anchor ---
+      ImGui::TextDisabled("Anchor camera");
+      if (image_sources.size() > 1) {
+        std::vector<std::string> labels;
+        for (size_t i = 0; i < image_sources.size(); i++) labels.push_back("src " + std::to_string(i));
+        std::vector<const char*> lptrs; for (auto& s : labels) lptrs.push_back(s.c_str());
+        ImGui::SetNextItemWidth(100); ImGui::Combo("Source##ac", &ac_cam_src, lptrs.data(), lptrs.size());
+        ImGui::SameLine();
+      }
+      ImGui::SetNextItemWidth(200);
+      ImGui::SliderInt("Image##ac", &ac_cam_idx, 0, static_cast<int>(src.frames.size()) - 1);
+      ImGui::SameLine();
+      if (ImGui::ArrowButton("##ac_prev", ImGuiDir_Left)) ac_cam_idx = std::max(0, ac_cam_idx - 1);
+      ImGui::SameLine();
+      if (ImGui::ArrowButton("##ac_next", ImGuiDir_Right)) ac_cam_idx = std::min(static_cast<int>(src.frames.size()) - 1, ac_cam_idx + 1);
+      ImGui::TextDisabled("%s  t=%.3f", boost::filesystem::path(cam.filepath).filename().string().c_str(), cam.timestamp);
+      ImGui::Separator();
+
+      // --- Accumulation ---
+      ImGui::TextDisabled("LiDAR context accumulation");
+      ImGui::Checkbox("Use time window (instead of N frames)##ac", &ac_use_time_window);
+      if (ac_use_time_window) {
+        ImGui::SetNextItemWidth(100); ImGui::DragFloat("before (s)", &ac_time_before_s, 0.1f, 0.1f, 30.0f, "%.1f");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::DragFloat("after (s)", &ac_time_after_s, 0.1f, 0.1f, 30.0f, "%.1f");
+      } else {
+        ImGui::SetNextItemWidth(100); ImGui::DragInt("N before", &ac_n_frames_before, 1, 0, 500);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(100); ImGui::DragInt("N after", &ac_n_frames_after, 1, 0, 500);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Frames before/after the anchor camera's nearest LiDAR frame.\n"
+          "Set small for Livox Horizon single-direction; larger for Pandar 128.");
+      }
+      ImGui::Checkbox("Directional filter##ac", &ac_directional_filter);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Skip frames whose heading disagrees with the anchor's -- avoids mixing outbound & return pass.");
+      if (ac_directional_filter) {
+        ImGui::SameLine(); ImGui::SetNextItemWidth(80);
+        ImGui::DragFloat(" deg threshold##ac", &ac_directional_threshold_deg, 1.0f, 5.0f, 180.0f, "%.0f");
+      }
+      ImGui::SetNextItemWidth(100); ImGui::DragFloat("min range##ac", &ac_min_range, 0.05f, 0.1f, 50.0f, "%.1f");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+      ImGui::DragFloat("max range##ac", &ac_max_range, 1.0f, 5.0f, 200.0f, "%.1f");
+
+      ImGui::Separator();
+      // --- Render ---
+      ImGui::TextDisabled("Intensity render (LightGlue input)");
+      // Auto-populate render W/H from source intrinsics on first open or if still at sentinel 0
+      if (ac_render_width <= 0 || ac_render_height <= 0) {
+        ac_render_width  = src.intrinsics.width;
+        ac_render_height = src.intrinsics.height;
+      }
+      ImGui::SetNextItemWidth(80); ImGui::DragInt("W##ac", &ac_render_width, 8, 320, 8000);
+      ImGui::SameLine(); ImGui::SetNextItemWidth(80);
+      ImGui::DragInt("H##ac", &ac_render_height, 8, 240, 5000);
+      ImGui::SameLine();
+      if (ImGui::Button("Native##ac")) { ac_render_width = src.intrinsics.width; ac_render_height = src.intrinsics.height; }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Snap to source camera's native resolution (%dx%d).", src.intrinsics.width, src.intrinsics.height);
+      ImGui::TextDisabled("Default: native (one-time calib). Lower values only to save LightGlue time on CPU.");
+
+      ImGui::Separator();
+      // --- LightGlue tuning ---
+      ImGui::TextDisabled("LightGlue tuning");
+      ImGui::SetNextItemWidth(100); ImGui::DragInt("max keypoints", &ac_max_kp, 32, 256, 8192);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Max keypoints per image extracted by SuperPoint.\n"
+        "Increase (e.g. 4096) if the rendered intensity image has sparse features (few LiDAR returns, sparse context).");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+      ImGui::DragFloat("min score", &ac_min_score, 0.01f, 0.0f, 1.0f, "%.2f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "LightGlue match score threshold. Lower (e.g. 0.1) if you see few matches.\n"
+        "PnP-RANSAC will still filter outliers -- a noisier match pool with RANSAC is often better than too few.");
+
+      ImGui::Separator();
+      // --- Python interpreter override ---
+      {
+        char pybuf[512];
+        std::snprintf(pybuf, sizeof(pybuf), "%s", ac_python_interpreter.c_str());
+        ImGui::SetNextItemWidth(300);
+        if (ImGui::InputText("Python##ac", pybuf, sizeof(pybuf))) ac_python_interpreter = pybuf;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Python interpreter to run lightglue_match.py. Default 'python3'.\n"
+          "Set to a full path (e.g. /home/you/venv/bin/python) if LightGlue is in a venv\n"
+          "or a different Python than what 'python3' points to.\n"
+          "Tip: installing with 'python3 -m pip install ...' ensures the default works.");
+      }
+
+      ImGui::Separator();
+      // --- Intrinsics optimization ---
+      ImGui::Checkbox("Refine intrinsics too (second pass)##ac", &ac_optimize_intrinsics);
+      if (ac_optimize_intrinsics) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Lock extrinsic##ac", &ac_lock_extrinsic_for_intr);
+      }
+
+      // Time-shift sweep
+      ImGui::Separator();
+      ImGui::Checkbox("Fine-tune time shift (sweep)##ac", &ac_sweep_on);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Run the calibration multiple times, varying time_shift from (current - neg) to (current + pos)\n"
+        "in the given step. Each iteration is recorded; nothing is applied until you click Apply\n"
+        "on one of the result rows. Best row highlighted by inliers / (residual + 1).");
+      if (ac_sweep_on) {
+        ImGui::Indent();
+        ImGui::SetNextItemWidth(90); ImGui::DragFloat("neg (s)##acsw", &ac_sweep_neg_range_s, 0.005f, 0.0f, 1.0f, "%.3f");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+        ImGui::DragFloat("pos (s)##acsw", &ac_sweep_pos_range_s, 0.005f, 0.0f, 1.0f, "%.3f");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+        ImGui::DragFloat("step (s)##acsw", &ac_sweep_step_s, 0.001f, 0.001f, 0.5f, "%.3f");
+        const int est = 1 + static_cast<int>((ac_sweep_neg_range_s + ac_sweep_pos_range_s) / std::max(0.001f, ac_sweep_step_s));
+        ImGui::TextDisabled("Will run %d iterations per Run click.", est);
+        ImGui::Unindent();
+      }
+
+      ImGui::Separator();
+      // --- Run ---
+      if (ac_running) {
+        ImGui::TextColored(ImVec4(1, 1, 0, 1), "Running: %s", ac_status.c_str());
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.25f, 0.25f, 1.0f));
+        if (ImGui::Button(ac_cancel_requested ? "Stopping..." : "Stop")) {
+          ac_cancel_requested = true;
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Stop after the current iteration.\nSweep results already produced are kept and shown in the table.");
+      } else {
+        if (ImGui::Button("Run auto-calibrate")) {
+          ac_running = true;
+          ac_cancel_requested = false;
+          ac_status = "Building context...";
+          // Capture values by copy for thread-safety
+          const int cam_src_i = ac_cam_src;
+          const int cam_i = ac_cam_idx;
+          std::thread([this, cam_src_i, cam_i]() {
+            try {
+              auto& src2 = image_sources[cam_src_i];
+              const auto& cam2 = src2.frames[cam_i];
+              // Backup for revert AND for time-shift sweep restore
+              ac_backup_lever = src2.lever_arm;
+              ac_backup_rpy = src2.rotation_rpy;
+              ac_backup_intrinsics = src2.intrinsics;
+              ac_have_backup = true;
+              const double saved_time_shift = src2.time_shift;
+
+              // Body wrapped in an inner lambda so sweep mode can invoke it per iteration.
+              // Early-exits become `return;` -- they exit the current iteration only.
+              auto run_once = [&]() {
+
+              if (!trajectory_built) build_trajectory();
+              const auto timed_traj = timed_traj_snapshot();
+
+              // Current T_world_cam (using current extrinsic guess). Anchor-aware
+              // so autocalibrator sweeps respect per-moment drift when anchors are set.
+              const auto cc2 = effective_calib(src2, cam2.timestamp);
+              const double ts = cam2.timestamp + cc2.time_shift;
+              const Eigen::Isometry3d T_world_lidar_anchor = Colorizer::interpolate_pose(timed_traj, ts);
+              const Eigen::Isometry3d T_lidar_cam = Colorizer::build_extrinsic(cc2.lever_arm, cc2.rotation_rpy);
+              const Eigen::Isometry3d T_world_cam_init = T_world_lidar_anchor * T_lidar_cam;
+              const Eigen::Vector3f anchor_forward = T_world_lidar_anchor.rotation().col(0).cast<float>().normalized();
+              const Eigen::Vector3f anchor_pos = T_world_cam_init.translation().cast<float>();
+
+              // --- Build calibration context (shared helper in auto_calibrate) ---
+              ac_status = "Gathering LiDAR frames...";
+              CalibContextOptions ctx_opts;
+              ctx_opts.n_frames_before = ac_n_frames_before;
+              ctx_opts.n_frames_after  = ac_n_frames_after;
+              ctx_opts.use_time_window = ac_use_time_window;
+              ctx_opts.time_before_s   = ac_time_before_s;
+              ctx_opts.time_after_s    = ac_time_after_s;
+              ctx_opts.directional_filter = ac_directional_filter;
+              ctx_opts.directional_threshold_deg = ac_directional_threshold_deg;
+              ctx_opts.min_range = ac_min_range;
+              ctx_opts.max_range = ac_max_range;
+              CalibrationContext ctx = build_calibration_context(
+                submaps, timed_traj, ts, anchor_pos, anchor_forward, ctx_opts,
+                [this](int sm_idx) { return load_hd_for_submap(sm_idx, false); });
+              logger->info("[AutoCalib] Context: {} points (frames window {} directional={})",
+                ctx.world_points.size(),
+                ac_use_time_window
+                  ? fmt::format("time +/-{:.1f}s", std::max(ac_time_before_s, ac_time_after_s))
+                  : fmt::format("N {}/{} frames", ac_n_frames_before, ac_n_frames_after),
+                ac_directional_filter);
+              {
+                const auto& p = T_world_cam_init.translation();
+                logger->info("[AutoCalib] Anchor cam world pos: ({:.3f}, {:.3f}, {:.3f})  anchor_pos used for filter: ({:.3f}, {:.3f}, {:.3f})",
+                  p.x(), p.y(), p.z(), anchor_pos.x(), anchor_pos.y(), anchor_pos.z());
+                logger->info("[AutoCalib] Src lever: ({:.4f}, {:.4f}, {:.4f}) rpy: ({:.3f}, {:.3f}, {:.3f}) time_shift: {:.3f}",
+                  src2.lever_arm.x(), src2.lever_arm.y(), src2.lever_arm.z(),
+                  src2.rotation_rpy.x(), src2.rotation_rpy.y(), src2.rotation_rpy.z(),
+                  src2.time_shift);
+                logger->info("[AutoCalib] Cam timestamp: {:.3f} (trajectory range [{:.3f}..{:.3f}])",
+                  cam2.timestamp, timed_traj.empty() ? 0.0 : timed_traj.front().stamp, timed_traj.empty() ? 0.0 : timed_traj.back().stamp);
+              }
+
+              // --- Render intensity image always (so the user can SEE the sparse rendering
+              //     even when we bail out below). The render is cheap -- the expensive parts
+              //     are LightGlue + PnP, which we still gate behind the sparsity check.
+              ac_status = "Rendering LiDAR intensity...";
+              PinholeIntrinsics K_render = src2.intrinsics;
+              const double sx = static_cast<double>(ac_render_width) / src2.intrinsics.width;
+              const double sy = static_cast<double>(ac_render_height) / src2.intrinsics.height;
+              K_render.fx *= sx; K_render.fy *= sy;
+              K_render.cx *= sx; K_render.cy *= sy;
+              K_render.width = ac_render_width; K_render.height = ac_render_height;
+              auto render = render_intensity_image(ctx, T_world_cam_init, K_render, ac_render_width, ac_render_height);
+              {
+                // Count non-zero pixels in the rendered image to detect empty renders
+                long nonzero = 0;
+                for (int yy = 0; yy < render.image.rows; yy++) {
+                  const uint8_t* row = render.image.ptr<uint8_t>(yy);
+                  for (int xx = 0; xx < render.image.cols; xx++) if (row[xx] > 0) nonzero++;
+                }
+                logger->info("[AutoCalib] Rendered {}x{}, {} non-zero pixels ({:.2f}%% fill)",
+                  render.image.cols, render.image.rows, nonzero,
+                  100.0 * nonzero / (render.image.cols * render.image.rows));
+              }
+
+              // --- Prepare the real image at the same render resolution (downscaled) ---
+              cv::Mat real = cv::imread(cam2.filepath);
+              if (real.empty()) { ac_status = "Failed: could not read camera image"; return; }
+              cv::Mat real_resized;
+              cv::resize(real, real_resized, cv::Size(ac_render_width, ac_render_height));
+              cv::Mat real_gray;
+              cv::cvtColor(real_resized, real_gray, cv::COLOR_BGR2GRAY);
+
+              // --- Write both images immediately so the match viz has something to display even on failure
+              if (ac_work_dir.empty()) {
+                ac_work_dir = (boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("glim-autocalib-%%%%")).string();
+              }
+              boost::filesystem::create_directories(ac_work_dir);
+              const std::string real_path = ac_work_dir + "/real.png";
+              const std::string rend_path = ac_work_dir + "/rendered.png";
+              const std::string json_path = ac_work_dir + "/matches.json";
+              cv::imwrite(real_path, real_gray);
+              cv::imwrite(rend_path, render.image);
+              // Signal the UI thread to (re)load these textures for the viz
+              ac_match_pairs.clear();
+              ac_match_scores.clear();
+              ac_match_render_w = ac_render_width;
+              ac_match_render_h = ac_render_height;
+              ac_match_viz_needs_reload = true;
+
+              // NOW bail if the context was too sparse for a meaningful calibration.
+              if (ctx.world_points.size() < 1000) {
+                ac_status = "Failed: context too sparse (" + std::to_string(ctx.world_points.size()) + " pts). See match viz below to inspect the render.";
+                return;
+              }
+
+              // --- Run Python LightGlue ---
+              ac_status = "Running LightGlue...";
+
+              // Resolve script path relative to loaded_map_path or fall back to install share dir.
+              std::string script = ac_python_script_path;
+              if (script.empty()) {
+                // Try a few defaults
+                const char* candidates[] = {
+                  "/ros2_ws/src/glim/scripts/lightglue_match.py",
+                };
+                for (const char* c : candidates) { if (boost::filesystem::exists(c)) { script = c; break; } }
+              }
+              if (script.empty()) { ac_status = "Failed: lightglue_match.py not found (set ac_python_script_path)"; return; }
+              const std::string py = ac_python_interpreter.empty() ? std::string("python3") : ac_python_interpreter;
+              char lg_args[128];
+              std::snprintf(lg_args, sizeof(lg_args), " --max-kp %d --min-score %.3f", ac_max_kp, ac_min_score);
+              const std::string cmd = py + " " + script + " " + real_path + " " + rend_path + " " + json_path + lg_args + " 2>&1";
+              logger->info("[AutoCalib] {}", cmd);
+              const int rc = std::system(cmd.c_str());
+              if (rc != 0) { ac_status = "Failed: lightglue_match.py returned " + std::to_string(rc); return; }
+
+              // --- Load matches and convert to 2D↔3D ---
+              std::vector<float> confidences;
+              auto raw_matches = load_lightglue_matches(json_path, &confidences);
+
+              // Capture match pairs in RENDER-SPACE for the visualization (both images are at render res).
+              ac_match_pairs.clear();
+              ac_match_scores.clear();
+              ac_match_pairs.reserve(raw_matches.size());
+              ac_match_scores.reserve(raw_matches.size());
+              for (size_t i = 0; i < raw_matches.size(); i++) {
+                ac_match_pairs.emplace_back(raw_matches[i].first.cast<float>(), raw_matches[i].second.cast<float>());
+                ac_match_scores.push_back(i < confidences.size() ? confidences[i] : 1.0f);
+              }
+              ac_match_render_w = ac_render_width;
+              ac_match_render_h = ac_render_height;
+              // Signal the UI thread to free & recreate textures. We CANNOT touch GL
+              // from here -- GL calls only on the main thread (the GL context owner).
+              ac_match_viz_needs_reload = true;
+
+              if (raw_matches.empty()) { ac_status = "Failed: 0 matches returned (try lowering min-score or raising max-kp)"; return; }
+              // The real matches are in RESIZED coords; scale back to full image to match intrinsics' native
+              const double sx_back = static_cast<double>(src2.intrinsics.width) / ac_render_width;
+              const double sy_back = static_cast<double>(src2.intrinsics.height) / ac_render_height;
+              for (auto& p : raw_matches) { p.first.x() *= sx_back; p.first.y() *= sy_back; }
+              auto corrs = matches_to_correspondences(raw_matches, confidences, render, ctx);
+              ac_last_matches = static_cast<int>(corrs.size());
+              if (corrs.size() < 12) { ac_status = "Failed: only " + std::to_string(corrs.size()) + " usable correspondences (see Match viz below)"; return; }
+
+              // --- PnP refinement ---
+              ac_status = "Solving PnP...";
+              Eigen::Isometry3d T_world_cam_new;
+              int inliers = 0; double residual = 0.0;
+              if (!refine_extrinsic_pnp(corrs, src2.intrinsics, T_world_cam_init, T_world_cam_new, inliers, residual)) {
+                ac_status = "Failed: PnP did not converge"; return;
+              }
+              ac_last_inliers = inliers;
+              ac_residual_before = 0.0;  // not computed for now
+              ac_residual_after = residual;
+
+              // Compute proposed new extrinsic BUT don't apply yet -- sanity-check first.
+              const Eigen::Isometry3d T_lidar_cam_new = T_world_lidar_anchor.inverse() * T_world_cam_new;
+              const Eigen::Vector3d proposed_lever = T_lidar_cam_new.translation();
+              const Eigen::Matrix3d Rn = T_lidar_cam_new.rotation();
+              const double p_pitch = std::asin(-std::clamp(Rn(2, 0), -1.0, 1.0));
+              const double r_roll  = std::atan2(Rn(2, 1), Rn(2, 2));
+              const double y_yaw   = std::atan2(Rn(1, 0), Rn(0, 0));
+              const Eigen::Vector3d proposed_rpy = Eigen::Vector3d(r_roll, p_pitch, y_yaw) * (180.0 / M_PI);
+
+              // Sanity checks: reject absurd results so we never write km-offset lever arms or wild rotations.
+              const double lever_shift = (proposed_lever - ac_backup_lever).norm();
+              // Per-axis RPY shift, wrapped for +/-180 deg equivalence.
+              auto wrap_deg = [](double d) { while (d >  180.0) d -= 360.0; while (d < -180.0) d += 360.0; return std::abs(d); };
+              const double rpy_shift = std::max({wrap_deg(proposed_rpy.x() - ac_backup_rpy.x()),
+                                                 wrap_deg(proposed_rpy.y() - ac_backup_rpy.y()),
+                                                 wrap_deg(proposed_rpy.z() - ac_backup_rpy.z())});
+              const bool residual_ok = residual <= ac_max_residual_px;
+              const bool lever_ok    = lever_shift <= ac_max_lever_shift_m;
+              const bool rpy_ok      = rpy_shift <= ac_max_rotation_shift_deg;
+
+              if (!residual_ok || !lever_ok || !rpy_ok) {
+                char buf[512]; std::snprintf(buf, sizeof(buf),
+                  "REJECTED: residual=%.1fpx (max %.1f) lever_shift=%.3fm (max %.2f) rpy_shift=%.2f deg (max %.1f). Values NOT applied.",
+                  residual, ac_max_residual_px, lever_shift, ac_max_lever_shift_m, rpy_shift, ac_max_rotation_shift_deg);
+                ac_status = buf;
+                logger->warn("[AutoCalib] {}", ac_status);
+                logger->warn("[AutoCalib] proposed lever=({:.3f},{:.3f},{:.3f}) rpy=({:.2f},{:.2f},{:.2f})",
+                  proposed_lever.x(), proposed_lever.y(), proposed_lever.z(),
+                  proposed_rpy.x(), proposed_rpy.y(), proposed_rpy.z());
+                return;  // leave src2.lever_arm / rotation_rpy unchanged
+              }
+
+              // Store as proposed -- DO NOT write to src yet.
+              ac_proposed_lever = proposed_lever;
+              ac_proposed_rpy = proposed_rpy;
+              ac_proposed_has_intrinsics = false;
+
+              // --- Optional intrinsics refinement ---
+              // Refinement runs on a tentative PinholeIntrinsics copy; user still has to Apply.
+              if (ac_optimize_intrinsics) {
+                ac_status = "Refining intrinsics...";
+                Eigen::Isometry3d T_tmp = T_world_cam_new;
+                PinholeIntrinsics intr_tmp = src2.intrinsics;
+                double rms_intr = 0.0;
+                if (refine_intrinsics_lm(corrs, intr_tmp, T_tmp, ac_lock_extrinsic_for_intr, rms_intr)) {
+                  ac_residual_after = rms_intr;
+                  ac_proposed_intrinsics = intr_tmp;
+                  ac_proposed_has_intrinsics = true;
+                  if (!ac_lock_extrinsic_for_intr) {
+                    const Eigen::Isometry3d T_lidar_cam_n2 = T_world_lidar_anchor.inverse() * T_tmp;
+                    ac_proposed_lever = T_lidar_cam_n2.translation();
+                    const Eigen::Matrix3d R2 = T_lidar_cam_n2.rotation();
+                    const double p2 = std::asin(-std::clamp(R2(2, 0), -1.0, 1.0));
+                    const double r2 = std::atan2(R2(2, 1), R2(2, 2));
+                    const double y2 = std::atan2(R2(1, 0), R2(0, 0));
+                    ac_proposed_rpy = Eigen::Vector3d(r2, p2, y2) * (180.0 / M_PI);
+                  }
+                } else {
+                  logger->warn("[AutoCalib] Intrinsics LM refine failed, keeping extrinsic-only result");
+                }
+              }
+              ac_has_proposed = true;
+
+              char buf[256];
+              std::snprintf(buf, sizeof(buf), "OK: %d matches, %d inliers, residual=%.2fpx",
+                ac_last_matches, inliers, ac_residual_after);
+              ac_status = buf;
+              logger->info("[AutoCalib] {}", ac_status);
+              };  // end run_once lambda
+
+              // Build list of time_shifts to sweep (single entry if sweep is off)
+              std::vector<float> time_shifts;
+              if (ac_sweep_on) {
+                const float base = static_cast<float>(saved_time_shift);
+                const float step = std::max(0.001f, ac_sweep_step_s);
+                for (float dt = -ac_sweep_neg_range_s; dt <= ac_sweep_pos_range_s + 1e-4f; dt += step) {
+                  time_shifts.push_back(base + dt);
+                }
+              } else {
+                time_shifts.push_back(static_cast<float>(saved_time_shift));
+              }
+              ac_sweep_total = static_cast<int>(time_shifts.size());
+              ac_sweep_progress = 0;
+              ac_sweep_results.clear();
+
+              for (float ts : time_shifts) {
+                if (ac_cancel_requested) break;  // user clicked Stop
+                src2.time_shift = ts;
+                ac_sweep_progress++;
+                if (ac_sweep_on) {
+                  char sbuf[96]; std::snprintf(sbuf, sizeof(sbuf), "Sweep %d/%d: time_shift=%+.3fs",
+                    ac_sweep_progress, ac_sweep_total, ts);
+                  ac_status = sbuf;
+                }
+                ac_has_proposed = false;
+                ac_last_matches = 0; ac_last_inliers = 0; ac_residual_after = 0.0;
+                run_once();
+                AcSweepResult r;
+                r.time_shift = ts;
+                r.matches = ac_last_matches;
+                r.inliers = ac_last_inliers;
+                r.residual = static_cast<float>(ac_residual_after);
+                r.success = ac_has_proposed;
+                r.has_intrinsics = ac_proposed_has_intrinsics;
+                if (ac_has_proposed) {
+                  r.lever = ac_proposed_lever;
+                  r.rpy = ac_proposed_rpy;
+                  if (ac_proposed_has_intrinsics) r.intrinsics = ac_proposed_intrinsics;
+                } else {
+                  r.reject_reason = ac_status;
+                }
+                ac_sweep_results.push_back(r);
+              }
+
+              // Restore time_shift (none of the sweep values should stick unless user applies one)
+              src2.time_shift = saved_time_shift;
+
+              if (ac_sweep_on) {
+                // Pick best by inliers / (residual + 1)
+                int best_i = -1; float best_score = -1.0f;
+                for (int i = 0; i < static_cast<int>(ac_sweep_results.size()); i++) {
+                  const auto& r = ac_sweep_results[i];
+                  if (!r.success) continue;
+                  const float score = r.inliers / (r.residual + 1.0f);
+                  if (score > best_score) { best_score = score; best_i = i; }
+                }
+                // Clear single-proposed since sweep produces a list
+                ac_has_proposed = false;
+                if (best_i >= 0) {
+                  char sbuf[192]; std::snprintf(sbuf, sizeof(sbuf),
+                    "Sweep done: %d/%d succeeded. Best = row %d (ts=%+.3fs, %d inliers, %.2fpx). Click Apply on the row you trust.",
+                    static_cast<int>(std::count_if(ac_sweep_results.begin(), ac_sweep_results.end(),
+                      [](const AcSweepResult& x){ return x.success; })),
+                    ac_sweep_total, best_i + 1,
+                    ac_sweep_results[best_i].time_shift, ac_sweep_results[best_i].inliers, ac_sweep_results[best_i].residual);
+                  ac_status = sbuf;
+                } else {
+                  ac_status = "Sweep done: no successful runs. Try a different anchor, wider time window, or lower min-score.";
+                }
+                logger->info("[AutoCalib] {}", ac_status);
+              } else if (ac_has_proposed) {
+                ac_status = std::string(ac_status) + " -- review & click Apply to commit.";
+              }
+            } catch (const std::exception& e) {
+              ac_status = std::string("Failed: ") + e.what();
+              logger->error("[AutoCalib] Exception: {}", e.what());
+            }
+            ac_running = false;
+          }).detach();
+        }
+        ImGui::SameLine();
+        if (ac_have_backup && ImGui::Button("Revert last run")) {
+          auto& s = image_sources[ac_cam_src];
+          s.lever_arm = ac_backup_lever;
+          s.rotation_rpy = ac_backup_rpy;
+          s.intrinsics = ac_backup_intrinsics;
+          ac_have_backup = false;
+          ac_status = "Reverted to pre-run extrinsic + intrinsics.";
+        }
+      }
+      if (!ac_status.empty()) ImGui::TextDisabled("%s", ac_status.c_str());
+      if (ac_last_matches > 0) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Last run");
+        ImGui::Text("matches: %d   inliers: %d   residual: %.2fpx", ac_last_matches, ac_last_inliers, ac_residual_after);
+        if (!ac_match_scores.empty()) {
+          const auto q = compute_match_quality(ac_match_scores);
+          ImGui::Text("  quality:  "); ImGui::SameLine();
+          ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.35f, 1.0f), "%d high", q.high); ImGui::SameLine();
+          ImGui::TextDisabled(" | "); ImGui::SameLine();
+          ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "%d mid", q.mid); ImGui::SameLine();
+          ImGui::TextDisabled(" | "); ImGui::SameLine();
+          ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "%d low", q.low);
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "LightGlue confidence buckets: high >= %.2f, mid %.2f..%.2f, low < %.2f.",
+            q.high_thresh, q.mid_thresh, q.high_thresh, q.mid_thresh);
+        }
+
+        // Proposed vs current, side-by-side. User must click Apply to commit.
+        if (ac_has_proposed) {
+          const auto& s2 = image_sources[ac_cam_src];
+          ImGui::TextDisabled("                    current                        proposed");
+          ImGui::Text("lever: (%7.4f, %7.4f, %7.4f)   (%7.4f, %7.4f, %7.4f)",
+            s2.lever_arm.x(), s2.lever_arm.y(), s2.lever_arm.z(),
+            ac_proposed_lever.x(), ac_proposed_lever.y(), ac_proposed_lever.z());
+          ImGui::Text("RPY  : (%7.3f, %7.3f, %7.3f)   (%7.3f, %7.3f, %7.3f)",
+            s2.rotation_rpy.x(), s2.rotation_rpy.y(), s2.rotation_rpy.z(),
+            ac_proposed_rpy.x(), ac_proposed_rpy.y(), ac_proposed_rpy.z());
+          if (ac_proposed_has_intrinsics) {
+            ImGui::Text("f    : (%.2f, %.2f) -> (%.2f, %.2f)",
+              s2.intrinsics.fx, s2.intrinsics.fy,
+              ac_proposed_intrinsics.fx, ac_proposed_intrinsics.fy);
+            ImGui::Text("c    : (%.2f, %.2f) -> (%.2f, %.2f)",
+              s2.intrinsics.cx, s2.intrinsics.cy,
+              ac_proposed_intrinsics.cx, ac_proposed_intrinsics.cy);
+            ImGui::Text("k1   : %.4f -> %.4f   k2: %.4f -> %.4f   k3: %.4f -> %.4f",
+              s2.intrinsics.k1, ac_proposed_intrinsics.k1,
+              s2.intrinsics.k2, ac_proposed_intrinsics.k2,
+              s2.intrinsics.k3, ac_proposed_intrinsics.k3);
+          }
+          ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.25f, 1.0f));
+          if (ImGui::Button("Apply to source")) {
+            auto& s = image_sources[ac_cam_src];
+            s.lever_arm = ac_proposed_lever;
+            s.rotation_rpy = ac_proposed_rpy;
+            if (ac_proposed_has_intrinsics) s.intrinsics = ac_proposed_intrinsics;
+            ac_has_proposed = false;
+            ac_status = "Applied to source.";
+            logger->info("[AutoCalib] Proposed values applied to src[{}]", ac_cam_src);
+          }
+          ImGui::PopStyleColor();
+          ImGui::SameLine();
+          if (ImGui::Button("Reject##acprop")) {
+            ac_has_proposed = false;
+            ac_status = "Rejected. No changes applied.";
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Discard proposed values without applying.");
+        } else {
+          const auto& s2 = image_sources[ac_cam_src];
+          ImGui::TextDisabled("lever: (%.4f, %.4f, %.4f)", s2.lever_arm.x(), s2.lever_arm.y(), s2.lever_arm.z());
+          ImGui::TextDisabled("RPY : (%.3f, %.3f, %.3f)", s2.rotation_rpy.x(), s2.rotation_rpy.y(), s2.rotation_rpy.z());
+          ImGui::TextDisabled("f   : (%.2f, %.2f)  c: (%.2f, %.2f)", s2.intrinsics.fx, s2.intrinsics.fy, s2.intrinsics.cx, s2.intrinsics.cy);
+          ImGui::TextDisabled("dist: k1=%.4f k2=%.4f p1=%.4f p2=%.4f k3=%.4f",
+            s2.intrinsics.k1, s2.intrinsics.k2, s2.intrinsics.p1, s2.intrinsics.p2, s2.intrinsics.k3);
+        }
+      }
+
+      // Sanity-check threshold controls (fold so they don't clutter the window)
+      // Sweep results table
+      if (!ac_sweep_results.empty()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Sweep results (%zu runs)  -- green = best by inliers/(residual+1)", ac_sweep_results.size());
+        // Find best row (successful only)
+        int best_i = -1; float best_score = -1.0f;
+        for (int i = 0; i < static_cast<int>(ac_sweep_results.size()); i++) {
+          const auto& r = ac_sweep_results[i];
+          if (!r.success) continue;
+          const float score = r.inliers / (r.residual + 1.0f);
+          if (score > best_score) { best_score = score; best_i = i; }
+        }
+        if (ImGui::BeginTable("##sweeptable", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInner)) {
+          ImGui::TableSetupColumn("ts (s)");
+          ImGui::TableSetupColumn("matches");
+          ImGui::TableSetupColumn("inliers");
+          ImGui::TableSetupColumn("resid (px)");
+          ImGui::TableSetupColumn("status");
+          ImGui::TableSetupColumn("");
+          ImGui::TableHeadersRow();
+          for (int i = 0; i < static_cast<int>(ac_sweep_results.size()); i++) {
+            const auto& r = ac_sweep_results[i];
+            ImGui::TableNextRow();
+            if (i == best_i) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(40, 90, 40, 180));
+            ImGui::TableSetColumnIndex(0); ImGui::Text("%+.3f", r.time_shift);
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%d", r.matches);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%d", r.inliers);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", r.residual);
+            ImGui::TableSetColumnIndex(4); ImGui::Text("%s", r.success ? "OK" : "fail");
+            ImGui::TableSetColumnIndex(5);
+            if (r.success) {
+              ImGui::PushID(i);
+              if (ImGui::SmallButton("Apply")) {
+                auto& s = image_sources[ac_cam_src];
+                s.lever_arm = r.lever;
+                s.rotation_rpy = r.rpy;
+                s.time_shift = r.time_shift;
+                if (r.has_intrinsics) s.intrinsics = r.intrinsics;
+                char sbuf[128]; std::snprintf(sbuf, sizeof(sbuf),
+                  "Applied sweep row %d (ts=%+.3f, %d inliers, %.2fpx)",
+                  i + 1, r.time_shift, r.inliers, r.residual);
+                ac_status = sbuf;
+                logger->info("[AutoCalib] {}", ac_status);
+              }
+              ImGui::PopID();
+            }
+          }
+          ImGui::EndTable();
+        }
+        if (ImGui::Button("Clear sweep results##acsw")) ac_sweep_results.clear();
+      }
+
+      if (ImGui::CollapsingHeader("Sanity thresholds##ac")) {
+        ImGui::SetNextItemWidth(100); ImGui::DragFloat("max residual (px)", &ac_max_residual_px, 0.5f, 1.0f, 200.0f, "%.1f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reject result if PnP reprojection residual exceeds this.\n20px is a loose default for LightGlue on LiDAR intensity.");
+        ImGui::SetNextItemWidth(100); ImGui::DragFloat("max lever shift (m)", &ac_max_lever_shift_m, 0.05f, 0.01f, 10.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reject if the proposed lever differs from pre-run by more than this distance.\n1m is conservative for small-rig setups.");
+        ImGui::SetNextItemWidth(100); ImGui::DragFloat("max RPY shift ( deg)", &ac_max_rotation_shift_deg, 0.5f, 0.1f, 90.0f, "%.1f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reject if any axis of RPY differs from pre-run by more than this.\n15 deg is conservative; a well-tuned manual cal should shift <5 deg.");
+      }
+
+      // --- Match visualization (side-by-side real | rendered with lines between matches) ---
+      // Show viz whenever a render exists (matches can be empty on context-too-sparse / LightGlue fail)
+      if (ac_match_render_w > 0 && ac_match_render_h > 0 && !ac_work_dir.empty()) {
+        ImGui::Separator();
+        ImGui::Checkbox("Show match viz##ac", &ac_show_match_viz);
+        // Consume a pending reload from the worker thread (GL calls MUST run here)
+        if (ac_match_viz_needs_reload) {
+          if (ac_real_tex) { glDeleteTextures(1, &ac_real_tex); ac_real_tex = 0; }
+          if (ac_rend_tex) { glDeleteTextures(1, &ac_rend_tex); ac_rend_tex = 0; }
+          ac_match_viz_needs_reload = false;
+        }
+        if (ac_show_match_viz) {
+          // Lazy texture load on the UI thread (GL calls MUST run here)
+          if (ac_real_tex == 0) {
+            const std::string rp = ac_work_dir + "/real.png";
+            cv::Mat img = cv::imread(rp);
+            if (!img.empty()) {
+              cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+              glGenTextures(1, &ac_real_tex);
+              glBindTexture(GL_TEXTURE_2D, ac_real_tex);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data);
+              glBindTexture(GL_TEXTURE_2D, 0);
+              ac_real_tex_w = img.cols; ac_real_tex_h = img.rows;
+            }
+          }
+          if (ac_rend_tex == 0) {
+            const std::string rp = ac_work_dir + "/rendered.png";
+            cv::Mat img = cv::imread(rp, cv::IMREAD_GRAYSCALE);
+            if (!img.empty()) {
+              cv::Mat rgb; cv::cvtColor(img, rgb, cv::COLOR_GRAY2RGB);
+              glGenTextures(1, &ac_rend_tex);
+              glBindTexture(GL_TEXTURE_2D, ac_rend_tex);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rgb.cols, rgb.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb.data);
+              glBindTexture(GL_TEXTURE_2D, 0);
+              ac_rend_tex_w = rgb.cols; ac_rend_tex_h = rgb.rows;
+            }
+          }
+
+          if (ac_real_tex && ac_rend_tex) {
+            // Display at capped width (half the ImGui window, each image)
+            const float avail_w = ImGui::GetContentRegionAvail().x;
+            const float pair_w = (avail_w - 8.0f) * 0.5f;  // 8px gap between the two
+            // Aspect-preserving height
+            const float rh = pair_w * static_cast<float>(ac_match_render_h) / static_cast<float>(ac_match_render_w);
+            const ImVec2 real_pos = ImGui::GetCursorScreenPos();
+            ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(ac_real_tex)), ImVec2(pair_w, rh));
+            ImGui::SameLine(0.0f, 8.0f);
+            const ImVec2 rend_pos = ImGui::GetCursorScreenPos();
+            ImGui::Image(reinterpret_cast<void*>(static_cast<intptr_t>(ac_rend_tex)), ImVec2(pair_w, rh));
+
+            // Match lines
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float sx = pair_w / static_cast<float>(ac_match_render_w);
+            const float sy = rh     / static_cast<float>(ac_match_render_h);
+            // Find score range for coloring
+            float smin = 1e9f, smax = -1e9f;
+            for (float s : ac_match_scores) { smin = std::min(smin, s); smax = std::max(smax, s); }
+            if (smax <= smin) { smin = 0.0f; smax = 1.0f; }
+            for (size_t i = 0; i < ac_match_pairs.size(); i++) {
+              const auto& m = ac_match_pairs[i];
+              const ImVec2 a(real_pos.x + m.first.x()  * sx, real_pos.y + m.first.y()  * sy);
+              const ImVec2 b(rend_pos.x + m.second.x() * sx, rend_pos.y + m.second.y() * sy);
+              const float sn = (ac_match_scores[i] - smin) / (smax - smin);
+              const int r = static_cast<int>((1.0f - sn) * 255);  // low score = red
+              const int g = static_cast<int>(sn * 255);           // high score = green
+              const ImU32 col = IM_COL32(r, g, 0, 180);
+              dl->AddCircleFilled(a, 2.5f, col);
+              dl->AddCircleFilled(b, 2.5f, col);
+              dl->AddLine(a, b, col, 1.0f);
+            }
+            ImGui::TextDisabled("matches: %zu  (render %dx%d displayed at %.0fx%.0f each; red=low score, green=high)",
+              ac_match_pairs.size(), ac_match_render_w, ac_match_render_h, pair_w, rh);
+          } else {
+            ImGui::TextDisabled("(loading textures...)");
+          }
+        }
+      }
+    }
+    ImGui::End();
+  });
+
+  // COLMAP exporter: click-to-place handler (runs only when in "place" mode)
+  viewer->register_ui_callback("colmap_place_3d", [this] {
+    if (!ce_placing) return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse) return;
+    static bool mouse_was_down = false;
+    static double mouse_down_time = 0.0;
+    if (ImGui::IsMouseDown(0) && !mouse_was_down) { mouse_was_down = true; mouse_down_time = ImGui::GetTime(); }
+    if (!ImGui::IsMouseReleased(0)) { if (!ImGui::IsMouseDown(0)) mouse_was_down = false; return; }
+    mouse_was_down = false;
+    if (ImGui::GetTime() - mouse_down_time > 0.25) return;  // was a drag
+
+    auto vw = guik::LightViewer::instance();
+    const auto mouse = ImGui::GetMousePos();
+    const Eigen::Vector2i mpos(static_cast<int>(mouse.x), static_cast<int>(mouse.y));
+    const float depth = vw->pick_depth(mpos);
+    if (depth >= 1.0f) return;  // background
+    ce_center = vw->unproject(mpos, depth);
+    ce_region_placed = true;
+    ce_placing = false;
+    ce_status = "Region placed. Adjust size/pos then Export.";
+    logger->info("[COLMAP] Region placed at ({:.2f}, {:.2f}, {:.2f})", ce_center.x(), ce_center.y(), ce_center.z());
+  });
+
+  // COLMAP exporter: cube rendering (wire frame + transparent fill)
+  viewer->register_ui_callback("colmap_cube_render", [this] {
+    auto vw = guik::LightViewer::instance();
+    if (!ce_region_placed) {
+      vw->remove_drawable("colmap_cube_wire");
+      vw->remove_drawable("colmap_cube_fill");
+      return;
+    }
+    Eigen::Affine3f tf = Eigen::Affine3f::Identity();
+    tf.translate(ce_center);
+    // Yaw rotation around world Z so the cube visually aligns with the region
+    // (road / building edge) the user wants to export.
+    tf.rotate(Eigen::AngleAxisf(ce_yaw_deg * static_cast<float>(M_PI) / 180.0f,
+                                Eigen::Vector3f::UnitZ()));
+    // Primitives::cube() is a [-1,1]^3 cube, so scale by half-size
+    tf.scale(Eigen::Vector3f(0.5f * ce_size.x(), 0.5f * ce_size.y(), 0.5f * ce_size.z()));
+    vw->update_drawable("colmap_cube_wire", glk::Primitives::wire_cube(),
+      guik::FlatColor(0.3f, 0.9f, 0.4f, 1.0f, tf));
+    vw->update_drawable("colmap_cube_fill", glk::Primitives::cube(),
+      guik::FlatColor(0.2f, 0.8f, 0.3f, 0.15f, tf).make_transparent());
+  });
+
+  // COLMAP exporter window
+  viewer->register_ui_callback("colmap_export_window", [this] {
+    if (!ce_show) return;
+    ImGui::SetNextWindowSize(ImVec2(420, 520), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("COLMAP Exporter (dev, single-chunk)", &ce_show)) {
+      ImGui::TextDisabled("Places a 3D cube; 2D top-view footprint is used for trimming.\nZ range is ignored (full column exported).");
+      // Shortcut to the virtual-cameras tool -- commonly run alongside a COLMAP
+      // export so the anchor virtuals land in the same package that goes to
+      // Metashape / LichtFeld.
+      if (ImGui::Button("Open Virtual Cameras...##ce")) show_virtual_cameras_window = true;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Open the Virtual Cameras window. Render LiDAR-synthesized locked-pose\n"
+        "anchors along the trajectory -- Metashape uses them as rigid BA anchors\n"
+        "to align real cameras against. Typical workflow: tune here first, then\n"
+        "run the main export below with real cameras + their intrinsics.");
+      ImGui::Separator();
+
+      // Placement
+      if (!ce_region_placed) {
+        ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.2f, 1.0f), "No region placed yet.");
+      } else {
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Region placed.");
+      }
+      if (ImGui::Button(ce_placing ? "Click on map to place..." : "Place region")) { ce_placing = !ce_placing; }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click anywhere on the 3D map to position the cube there (size stays at current XYZ).");
+      ImGui::SameLine();
+      if (ImGui::Button("Clear")) {
+        ce_region_placed = false;
+        auto vw = guik::LightViewer::instance();
+        vw->remove_drawable("colmap_cube_wire");
+        vw->remove_drawable("colmap_cube_fill");
+      }
+
+      ImGui::Separator();
+      ImGui::TextDisabled("Position (world, m)");
+      ImGui::SetNextItemWidth(110); ImGui::DragFloat("X##cep", &ce_center.x(), 0.5f, -1e6f, 1e6f, "%.3f");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::DragFloat("Y##cep", &ce_center.y(), 0.5f, -1e6f, 1e6f, "%.3f");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::DragFloat("Z##cep", &ce_center.z(), 0.5f, -1e6f, 1e6f, "%.3f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drag to move; double-click to type an exact value.");
+
+      ImGui::TextDisabled("Size (m)");
+      ImGui::SetNextItemWidth(110); ImGui::DragFloat("Xs##ces", &ce_size.x(), 1.0f, 1.0f, 2000.0f, "%.1f");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::DragFloat("Ys##ces", &ce_size.y(), 1.0f, 1.0f, 2000.0f, "%.1f");
+      ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::DragFloat("Zs##ces", &ce_size.z(), 1.0f, 1.0f, 2000.0f, "%.1f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Z size is only for the cube preview -- export trimming uses only XY.");
+
+      ImGui::TextDisabled("Yaw (deg, around world Z)");
+      ImGui::SetNextItemWidth(160);
+      ImGui::DragFloat("Yaw##ceyaw", &ce_yaw_deg, 0.5f, -180.0f, 180.0f, "%.1f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Rotate the export region around world Z (top-view yaw). Useful to align\n"
+        "the rectangle with a road / building edge that runs diagonally.\n"
+        "Cube updates live. On export, the world is also rotated so the region's\n"
+        "local X/Y become the output's X/Y (tile comes out axis-aligned).");
+      ImGui::SameLine();
+      if (ImGui::SmallButton("0##yawreset")) ce_yaw_deg = 0.0f;
+      ImGui::SameLine();
+      if (ImGui::SmallButton("+90##yaw")) ce_yaw_deg = std::fmod(ce_yaw_deg + 90.0f + 180.0f, 360.0f) - 180.0f;
+      ImGui::SameLine();
+      if (ImGui::SmallButton("-90##yaw")) ce_yaw_deg = std::fmod(ce_yaw_deg - 90.0f + 180.0f, 360.0f) - 180.0f;
+
+      ImGui::Separator();
+      ImGui::TextDisabled("Export options");
+      // Copy/symlink <-> Undistort are mutually constrained:
+      //   undistort ON  => copy ON    (can't symlink to freshly-rectified JPEGs)
+      //   copy OFF      => undistort OFF  (can't rectify if we're symlinking)
+      // Show both checkboxes always; when the invariant would be violated the
+      // offending box is disabled and synced to the forced value so the UI
+      // reflects exactly what the export will do.
+      {
+        const bool force_copy = ce_undistort_images;
+        if (force_copy) ce_copy_images = true;
+        ImGui::BeginDisabled(force_copy);
+        ImGui::Checkbox("Copy images (else symlink)##ce", &ce_copy_images);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+          if (force_copy)
+            ImGui::SetTooltip(
+              "Forced ON while 'Undistort images' is ON:\n"
+              "the exported JPEGs are freshly rectified -- a symlink would\n"
+              "point at the raw distorted originals and bypass the rectification.");
+          else
+            ImGui::SetTooltip(
+              "Copy is slower + doubles disk use but the export stays valid if\n"
+              "you move/delete the source images. Symlink is cheap but the\n"
+              "export breaks if the sources move.");
+        }
+      }
+      ImGui::SetNextItemWidth(120); ImGui::DragFloat("Overlap margin (m)", &ce_overlap_margin_m, 0.5f, 0.0f, 50.0f, "%.1f");
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cameras outside the trim bounds but within this distance are still included.\nHelps 3DGS get context at the tile boundary.");
+      ImGui::Checkbox("Voxelized HD only##ce", &ce_voxelized_only);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Require voxelized HD (hd_frames_voxelized/). Massive raw HD would produce an unusable points3D.txt.");
+      ImGui::Checkbox("Rotate to Y-up (3DGS)##ce", &ce_rotate_to_y_up);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Rotate the exported world from our Z-up frame to a 3DGS-style Y-up frame.\n"
+        "LichtFeld/gsplat/nerfstudio viewers orbit around Y-up by default -- without\n"
+        "this the scene loads rotated 90 deg. Training math is identical either way,\n"
+        "this is purely viewer ergonomics.");
+      {
+        const bool block_undistort = !ce_copy_images;
+        if (block_undistort) ce_undistort_images = false;
+        ImGui::BeginDisabled(block_undistort);
+        ImGui::Checkbox("Undistort images (PINHOLE)##ce", &ce_undistort_images);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+          if (block_undistort)
+            ImGui::SetTooltip(
+              "Disabled while 'Copy images' is OFF. Undistorting produces fresh\n"
+              "JPEGs on disk -- we can't symlink to them. Enable Copy to unlock.");
+          else
+            ImGui::SetTooltip(
+              "Who applies the k1/k2/k3/p1/p2 distortion -- we do it at export, or\n"
+              "the downstream tool does it at projection. Same physics either way,\n"
+              "just split labour differently.\n"
+              "\n"
+              "ON  (default): we apply distortion NOW via cv::remap using the full\n"
+              "                k1/k2/k3/p1/p2 source lens model. Output images are\n"
+              "                rectified (pinhole-like). cameras.txt declares PINHOLE\n"
+              "                (fx fy cx cy) since there's nothing left to undistort.\n"
+              "                Required by LichtFeld unless 3DGUT is enabled. Forces\n"
+              "                image COPY (symlinks would point at the raw distorted\n"
+              "                sources and undo the rectification).\n"
+              "\n"
+              "OFF: images are copied / symlinked RAW, and cameras.txt carries the\n"
+              "     OPENCV model (fx fy cx cy k1 k2 p1 p2) so the downstream tool\n"
+              "     applies distortion at projection time. Note: COLMAP's OPENCV\n"
+              "     model has no slot for k3 -- if your lens needs k3, pair ON with\n"
+              "     BlocksExchange (which carries the full k1/k2/k3/p1/p2 set).");
+        }
+      }
+      ImGui::Checkbox("Emit Bundler (bundle.out)##ce", &ce_write_bundler);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Additionally write bundle.out + bundle.out.list.txt at the dataset root.\n"
+        "Metashape: File -> Import Cameras... -> Bundler to pick them up\n"
+        "(COLMAP import isn't built in to Metashape). Sparse cloud is included\n"
+        "with 0-length tracks -- enough for camera alignment + color sampling.\n"
+        "Bundler can only represent k1/k2 radial distortion (k3/p1/p2 are lost),\n"
+        "so pair this with 'Undistort images' when possible.");
+      ImGui::Checkbox("Emit BlocksExchange (xml)##ce", &ce_write_blocks_exchange);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Additionally write blocks_exchange.xml at the dataset root.\n"
+        "ContextCapture / RealityCapture / Metashape all import this format.\n"
+        "Supports the FULL Brown-Conrady distortion model (k1/k2/k3/p1/p2),\n"
+        "so it's the better pick when emitting RAW images + OPENCV intrinsics.\n"
+        "Note: 360/equirectangular cameras are NOT handled here yet -- those\n"
+        "would need a cube-face splitter pre-step (planned).");
+
+      // Pose priors only apply to BlocksExchange (Bundler has no accuracy slot).
+      if (ce_write_blocks_exchange) {
+        ImGui::Indent();
+        ImGui::Checkbox("Pose priors (pos/rot accuracy)##ce", &ce_use_pose_priors);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Emit per-photo accuracy hints in blocks_exchange.xml so Metashape's\n"
+          "Optimize Cameras (BA) treats our poses as CONSTRAINED priors instead\n"
+          "of loose initial guesses. Keeps scale + origin nailed to our session\n"
+          "frame during refinement -- critical for multi-tile coherence and\n"
+          "aerial-LiDAR fusion.\n"
+          "\n"
+          "OFF: no accuracy tags emitted. Metashape BA can freely apply a\n"
+          "     similarity transform to the whole block (scale / drift / rotate).\n"
+          "ON:  emit <Accuracy> tags with the sigmas below. BA refines poses\n"
+          "     locally within those bounds.");
+        if (ce_use_pose_priors) {
+          ImGui::BeginDisabled(!ce_use_pose_priors);
+          ImGui::SetNextItemWidth(140);
+          ImGui::DragFloat("Position sigma (m)##cepp", &ce_pose_pos_sigma_m, 0.005f, 0.001f, 10.0f, "%.3f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Position accuracy per photo (metres). Sensible range 0.02-0.10 m\n"
+            "for LiDAR-derived poses. Tighter = less freedom for BA drift,\n"
+            "looser = BA allowed to relocate cameras more.");
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(140);
+          ImGui::DragFloat("Rotation sigma (deg)##cepp", &ce_pose_rot_sigma_deg, 0.1f, 0.01f, 30.0f, "%.2f");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Rotation accuracy per photo (degrees). Sensible range 0.5-3 deg\n"
+            "for LiDAR-derived poses. Tighter = BA trusts the orientation,\n"
+            "looser = BA free to rotate cameras to fit features.");
+          ImGui::EndDisabled();
+        }
+        ImGui::Unindent();
+      }
+
+      // Check voxelized availability
+      const bool have_voxelized = !hd_frames_path.empty() &&
+        boost::filesystem::is_directory(hd_frames_path + "_voxelized");
+      if (ce_voxelized_only && !have_voxelized) {
+        ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.4f, 1.0f), "No voxelized HD found at %s_voxelized",
+          hd_frames_path.empty() ? "(no hd_frames_path)" : hd_frames_path.c_str());
+        ImGui::TextDisabled("Run Tools -> Utils -> Voxelize HD data first.");
+      }
+
+      ImGui::Separator();
+      // Output dir
+      {
+        char buf[1024];
+        std::snprintf(buf, sizeof(buf), "%s", ce_output_dir.c_str());
+        ImGui::SetNextItemWidth(280);
+        if (ImGui::InputText("Output dir##ce", buf, sizeof(buf))) ce_output_dir = buf;
+        ImGui::SameLine();
+        if (ImGui::Button("...##ceout")) {
+          const std::string chosen = pfd::select_folder("Choose output dir for COLMAP export", ce_output_dir).result();
+          if (!chosen.empty()) ce_output_dir = chosen;
+        }
+      }
+
+      // Export button
+      const bool can_export = ce_region_placed && !ce_output_dir.empty() &&
+        (!ce_voxelized_only || have_voxelized) && !ce_running;
+      if (!can_export) ImGui::BeginDisabled();
+      if (ImGui::Button("Export")) {
+        ce_running = true;
+        ce_status = "Gathering points and cameras...";
+        const Eigen::Vector3f center = ce_center;
+        const Eigen::Vector3f size = ce_size;
+        const std::string out_dir = ce_output_dir;
+        const bool copy_img = ce_copy_images;
+        const float overlap = ce_overlap_margin_m;
+        const bool rot_yup = ce_rotate_to_y_up;
+        const float yaw_deg = ce_yaw_deg;
+        const bool undistort = ce_undistort_images;
+        const bool write_bundler = ce_write_bundler;
+        const bool write_blocks_exchange = ce_write_blocks_exchange;
+        const bool use_priors = ce_use_pose_priors && ce_write_blocks_exchange;
+        const float pos_sigma = ce_pose_pos_sigma_m;
+        const float rot_sigma = ce_pose_rot_sigma_deg;
+        std::thread([this, center, size, out_dir, copy_img, overlap, rot_yup, yaw_deg, undistort, write_bundler, write_blocks_exchange, use_priors, pos_sigma, rot_sigma]() {
+          try {
+            // 1. Gather points from hd_frames_voxelized/ (or from loaded voxelized state -- simplest to load here)
+            ExportBounds2D bounds;
+            bounds.x_min = center.x() - 0.5f * size.x();
+            bounds.x_max = center.x() + 0.5f * size.x();
+            bounds.y_min = center.y() - 0.5f * size.y();
+            bounds.y_max = center.y() + 0.5f * size.y();
+            bounds.z_min = center.z() - 0.5f * size.z();
+            bounds.z_max = center.z() + 0.5f * size.z();
+            bounds.yaw_deg = yaw_deg;
+
+            std::vector<ColoredPoint> pts;
+            const std::string vox_dir = hd_frames_path + "_voxelized";
+            if (!boost::filesystem::is_directory(vox_dir)) {
+              ce_status = "Failed: voxelized dir not found: " + vox_dir;
+              ce_running = false;
+              return;
+            }
+            // Walk voxelized frames: each subdir has points.bin and intensities.bin;
+            // aux_rgb.bin may be present (from Apply colorize). We iterate once.
+            if (!trajectory_built) build_trajectory();
+            size_t total_scanned = 0;
+            for (boost::filesystem::directory_iterator it(vox_dir), end; it != end; ++it) {
+              if (!boost::filesystem::is_directory(it->path())) continue;
+              const std::string fdir = it->path().string();
+              const std::string meta = fdir + "/frame_meta.json";
+              if (!boost::filesystem::exists(meta)) continue;
+              std::ifstream ifs(meta);
+              const auto j = nlohmann::json::parse(ifs, nullptr, false);
+              if (j.is_discarded()) continue;
+              const int np = j.value("num_points", 0);
+              if (np == 0) continue;
+              // Frame pose: use frame_meta.json's T_world_lidar if present, else skip
+              // (for voxelized frames we rely on per-frame stored world-frame transforms;
+              //  if not available, we fall back to per-point world coords stored directly)
+              std::vector<Eigen::Vector3f> frame_pts(np);
+              std::vector<float> frame_int(np, 0.0f);
+              std::vector<Eigen::Vector3f> frame_rgb(np, Eigen::Vector3f(0.5f, 0.5f, 0.5f));
+              bool frame_has_rgb = false;
+              { std::ifstream f(fdir + "/points.bin", std::ios::binary);
+                if (!f) continue;
+                f.read(reinterpret_cast<char*>(frame_pts.data()), sizeof(Eigen::Vector3f) * np); }
+              { std::ifstream f(fdir + "/intensities.bin", std::ios::binary);
+                if (f) f.read(reinterpret_cast<char*>(frame_int.data()), sizeof(float) * np); }
+              { std::ifstream f(fdir + "/aux_rgb.bin", std::ios::binary);
+                if (f) {
+                  f.read(reinterpret_cast<char*>(frame_rgb.data()), sizeof(Eigen::Vector3f) * np);
+                  frame_has_rgb = static_cast<bool>(f);
+                }
+              }
+              // If aux_rgb.bin wasn't there, fall back to intensity mapped to
+              // grayscale so the points3D.ply still carries meaningful colour
+              // instead of uniform 0.5 grey. Intensity is scanner-dependent, so
+              // we normalise per-frame by the 99th percentile (same clip the
+              // virtual-camera rasterizer uses) to keep highlights from
+              // saturating a single retroreflective-marking cluster.
+              if (!frame_has_rgb) {
+                std::vector<float> sorted_int(frame_int);
+                std::sort(sorted_int.begin(), sorted_int.end());
+                const float imax = sorted_int.empty()
+                  ? 255.0f
+                  : sorted_int[std::min<size_t>(sorted_int.size() - 1,
+                                                 static_cast<size_t>(0.99 * sorted_int.size()))];
+                const float inv = (imax > 1e-6f) ? 1.0f / imax : 1.0f / 255.0f;
+                for (int i = 0; i < np; i++) {
+                  const float g = std::clamp(frame_int[i] * inv, 0.0f, 1.0f);
+                  frame_rgb[i] = Eigen::Vector3f(g, g, g);
+                }
+              }
+              // Points are expected to already be in world frame (voxelized step saves world coords).
+              for (int i = 0; i < np; i++) {
+                if (!bounds.contains_xy(frame_pts[i])) { total_scanned++; continue; }
+                ColoredPoint cp;
+                cp.xyz = frame_pts[i];
+                cp.rgb = frame_rgb[i];
+                pts.push_back(cp);
+                total_scanned++;
+              }
+            }
+            logger->info("[COLMAP] Filtered {} points within bounds (scanned {})", pts.size(), total_scanned);
+            if (pts.empty()) { ce_status = "Failed: 0 points in region"; ce_running = false; return; }
+
+            // 2. Gather cameras from all image_sources
+            const auto timed_traj = timed_traj_snapshot();
+            std::vector<ExportCameraFrame> cams;
+            std::vector<PinholeIntrinsics> intrs;
+            std::vector<CameraType> cam_types;
+            for (size_t si = 0; si < image_sources.size(); si++) {
+              intrs.push_back(image_sources[si].intrinsics);
+              cam_types.push_back(image_sources[si].camera_type);
+              for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
+                const auto& cf = image_sources[si].frames[fi];
+                if (!cf.located || cf.timestamp <= 0.0) continue;
+                ExportCameraFrame e;
+                e.source_image_path = cf.filepath;
+                e.source_mask_path  = image_sources[si].mask_path;
+                e.source_idx = static_cast<int>(si);
+                const std::string stem = boost::filesystem::path(cf.filepath).stem().string();
+                const std::string ext  = boost::filesystem::path(cf.filepath).extension().string();
+                e.export_name = "src" + std::to_string(si) + "_" + stem + ext;
+                e.T_world_cam = cf.T_world_cam;
+                cams.push_back(std::move(e));
+              }
+            }
+            logger->info("[COLMAP] {} candidate cameras across {} sources", cams.size(), image_sources.size());
+
+            // 3. Write export
+            ExportOptions opt;
+            opt.output_dir = out_dir;
+            // Copy is mandatory when undistorting: the exported images are
+            // freshly-encoded, a symlink would only round back to the raw input.
+            opt.copy_images = copy_img || undistort;
+            // Per-tile recenter DISABLED: every tile exported from the same
+            // session shares the same session-local-UTM frame, so aerial LiDAR
+            // and other sessions can fuse with a single constant offset.
+            opt.re_origin = false;
+            opt.overlap_margin_m = overlap;
+            opt.rotate_to_y_up = rot_yup;
+            opt.export_undistorted = undistort;
+            opt.export_bundler = write_bundler;
+            opt.export_blocks_exchange = write_blocks_exchange;
+            opt.emit_pose_priors = use_priors;
+            opt.pose_pos_sigma_m = pos_sigma;
+            opt.pose_rot_sigma_deg = rot_sigma;
+            std::string err;
+            auto stats = write_colmap_export(bounds, pts, cams, intrs, cam_types, opt, &err);
+            ce_last_points = stats.points_written;
+            ce_last_cameras = stats.cameras_written;
+            ce_last_images = stats.images_copied;
+            ce_last_masks = stats.masks_copied;
+
+            // --- SHIFT.txt: explain the coord frame + how to recover real UTM ---
+            // All tiles from this session land in the SAME session-local frame, so
+            // aerial LiDAR / other sessions can be fused with a single constant
+            // offset. SHIFT.txt is for user reference only, not read by any tool.
+            {
+              std::ofstream sf(out_dir + "/SHIFT.txt");
+              if (sf) {
+                sf << "# GLIM COLMAP export -- coordinate frame notes\n\n";
+                sf << "Exported coordinate frame: GLIM session-local.\n";
+                sf << "Per-tile recentering is OFF, so every tile from this dataset\n";
+                sf << "shares this exact frame. Aerial LiDAR / other sessions fuse\n";
+                sf << "by applying a single constant offset.\n\n";
+                if (rot_yup) {
+                  sf << "Axis mapping (Rotate to Y-up was ON):\n";
+                  sf << "  exported_x =  -session_y   (our Y-left -> X-right)\n";
+                  sf << "  exported_y =  +session_z   (our Z-up   -> Y-up)\n";
+                  sf << "  exported_z =  -session_x   (our X-fwd  -> Z-back)\n";
+                  sf << "  Undo this rotation BEFORE applying UTM offsets below.\n\n";
+                } else {
+                  sf << "Axis mapping: identity (Rotate to Y-up was OFF). Exported\n";
+                  sf << "  axes equal session axes: X fwd, Y left, Z up.\n\n";
+                }
+                if (gnss_datum_available) {
+                  sf << "UTM datum (from gnss_datum.json):\n";
+                  sf << "  zone             = " << gnss_utm_zone << "\n";
+                  sf << "  easting_origin   = " << std::setprecision(12) << gnss_utm_easting_origin << "\n";
+                  sf << "  northing_origin  = " << std::setprecision(12) << gnss_utm_northing_origin << "\n";
+                  sf << "  alt_origin       = " << std::setprecision(6)  << gnss_datum_alt << "\n";
+                  sf << "  datum_lat (WGS84)= " << std::setprecision(10) << gnss_datum_lat << "\n";
+                  sf << "  datum_lon (WGS84)= " << std::setprecision(10) << gnss_datum_lon << "\n\n";
+                  sf << "To recover real UTM coordinates from session-local coords:\n";
+                  sf << "  UTM_easting  = session_x + easting_origin\n";
+                  sf << "  UTM_northing = session_y + northing_origin\n";
+                  sf << "  UTM_alt      = session_z + alt_origin\n";
+                } else {
+                  sf << "No GNSS datum loaded for this session -- the session-local\n";
+                  sf << "frame has no recorded UTM anchor. Coordinates are whatever\n";
+                  sf << "GLIM produced at SLAM time (typically trajectory start = 0).\n";
+                }
+              }
+              // Copy gnss_datum.json straight through for downstream use.
+              const std::string datum_src = glim::GlobalConfig::get_config_path("gnss_datum");
+              if (!datum_src.empty() && boost::filesystem::is_regular_file(datum_src)) {
+                try {
+                  boost::filesystem::copy_file(datum_src, out_dir + "/gnss_datum.json",
+                    boost::filesystem::copy_option::overwrite_if_exists);
+                } catch (const boost::filesystem::filesystem_error& e) {
+                  logger->warn("[COLMAP] gnss_datum.json copy failed: {}", e.what());
+                }
+              }
+            }
+            if (!err.empty()) {
+              ce_status = "Partial: " + err + " (pts=" + std::to_string(stats.points_written) +
+                " cams=" + std::to_string(stats.cameras_written) + ")";
+            } else {
+              char buf[256];
+              std::snprintf(buf, sizeof(buf), "Done: %zu points, %zu cameras, %zu images, %zu masks",
+                stats.points_written, stats.cameras_written, stats.images_copied, stats.masks_copied);
+              ce_status = buf;
+            }
+            logger->info("[COLMAP] {}", ce_status);
+          } catch (const std::exception& e) {
+            ce_status = std::string("Failed: ") + e.what();
+            logger->error("[COLMAP] Exception: {}", e.what());
+          }
+          ce_running = false;
+        }).detach();
+      }
+      if (!can_export) ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (!ce_region_placed) ImGui::SetTooltip("Place a region first.");
+        else if (ce_output_dir.empty()) ImGui::SetTooltip("Choose an output directory.");
+        else if (ce_voxelized_only && !have_voxelized) ImGui::SetTooltip("Voxelized HD not available -- run Voxelize HD first or uncheck the requirement.");
+      }
+
+      if (!ce_status.empty()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Status");
+        ImGui::TextWrapped("%s", ce_status.c_str());
+      }
+      if (ce_last_points > 0) {
+        ImGui::Separator();
+        ImGui::TextDisabled("Last export");
+        ImGui::Text("points: %zu", ce_last_points);
+        ImGui::Text("cameras: %zu", ce_last_cameras);
+        ImGui::Text("images copied: %zu", ce_last_images);
+        ImGui::Text("masks copied: %zu", ce_last_masks);
+      }
     }
     ImGui::End();
   });
@@ -3093,7 +8758,14 @@ void OfflineViewer::setup_ui() {
         ImGui::Combo("Criteria", &rf_criteria, "Range\0GPS Time\0");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Range: remove distant points when closer exist.\nGPS Time: remove overlapping pass points when earlier/later exist.");
         ImGui::SliderFloat("Voxel size (m)", &rf_voxel_size, 0.05f, 5.0f, "%.2f");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Spatial grid cell size for grouping points.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Spatial grid cell size (XY) for grouping points.\nZ extent = voxel size x Height mult.");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+        ImGui::SliderFloat("Height x##rfz", &rf_voxel_height_mult, 0.5f, 5.0f, "%.2fx");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Z-extent multiplier on the voxel. 1.0 = cubic.\n"
+          "2.0 = voxel is 2x taller in Z without enlarging XY --\n"
+          "catches larger vertical pass-to-pass misalignment (GPS Time mode)\n"
+          "without blurring XY spatial resolution.");
 
         if (rf_criteria == 0) {
           ImGui::SliderFloat("Safe range (m)", &rf_safe_range, 5.0f, 50.0f, "%.0f");
@@ -3105,8 +8777,20 @@ void OfflineViewer::setup_ui() {
           ImGui::SliderInt("Min close points", &rf_min_close_pts, 1, 20);
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Minimum close-range points in a voxel before\nthe primary delta applies.");
         } else {
-          ImGui::Combo("Keep", &rf_gps_keep, "Dominant\0Newest\0Oldest\0");
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip("Dominant: keep cluster with most points.\nNewest: keep latest temporal cluster.\nOldest: keep earliest temporal cluster.");
+          ImGui::Combo("Keep", &rf_gps_keep, "Dominant\0Newest\0Oldest\0Newest-Dominant\0Oldest-Dominant\0");
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+            "Strategy for voxels covered by multiple passes (>1 time cluster):\n"
+            "- Dominant: keep cluster with most points.\n"
+            "- Newest:   keep latest temporal cluster.\n"
+            "- Oldest:   keep earliest temporal cluster.\n"
+            "- Newest-Dominant: prefer newest cluster; fall back to overall dominant\n"
+            "  when the newest has < 20%% of voxel points (drops sparse stray newer\n"
+            "  points that otherwise patch the dense older pass).\n"
+            "- Oldest-Dominant: prefer oldest cluster; fall back to overall dominant\n"
+            "  when the oldest has < 20%% of voxel points (lets a denser later pass\n"
+            "  fill adjacent-street voxels without stray older points inside them).\n"
+            "\n"
+            "Voxels with only 1 time cluster are always kept (no holes).");
         }
       } else if (df_mode == 1) {
         // Dynamic filter parameters
@@ -3363,7 +9047,7 @@ void OfflineViewer::setup_ui() {
                   if (all_frames[cf.all_idx].dir == dir) { np = all_frames[cf.all_idx].num_points; break; }
                 }
                 if (np == 0) {
-                  // Might be an accumulation neighbor not in chunk_frame_indices — find from all_frames
+                  // Might be an accumulation neighbor not in chunk_frame_indices -- find from all_frames
                   for (const auto& f : all_frames) { if (f.dir == dir) { np = f.num_points; break; } }
                 }
                 if (np == 0) continue;
@@ -3524,7 +9208,7 @@ void OfflineViewer::setup_ui() {
         ImGui::DragFloat("Chunk size (m)", &sor_chunk_size, 10.0f, 20.0f, 500.0f, "%.0f");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Size of spatial processing cube.\nLarger = more context, more memory.");
       } else if (df_mode == 3) {
-        // Scalar visibility — same pattern as range highlight but for any scalar field
+        // Scalar visibility -- same pattern as range highlight but for any scalar field
         if (!aux_attribute_names.empty()) {
           std::vector<const char*> field_ptrs;
           for (const auto& n : aux_attribute_names) field_ptrs.push_back(n.c_str());
@@ -3769,6 +9453,16 @@ void OfflineViewer::setup_ui() {
 
             const float active_voxel_size = (df_mode == 1) ? df_voxel_size : rf_voxel_size;
             const float inv_voxel = 1.0f / active_voxel_size;
+            // Range mode supports a Z-extent multiplier (rf_voxel_height_mult); Dynamic mode uses cubic voxels.
+            const float inv_voxel_z = (df_mode == 2)
+              ? (1.0f / (active_voxel_size * std::max(0.5f, rf_voxel_height_mult)))
+              : inv_voxel;
+            auto vkey = [inv_voxel, inv_voxel_z](const Eigen::Vector3f& p) {
+              return glim::voxel_key(
+                static_cast<int>(std::floor(p.x() * inv_voxel)),
+                static_cast<int>(std::floor(p.y() * inv_voxel)),
+                static_cast<int>(std::floor(p.z() * inv_voxel_z)));
+            };
             std::unordered_map<uint64_t, std::vector<PointEntry>> voxels;
             int frame_count = 0;
 
@@ -3824,7 +9518,7 @@ void OfflineViewer::setup_ui() {
                 const Eigen::Matrix3f R = T_w_lidar.rotation().cast<float>();
                 const Eigen::Vector3f t_vec = T_w_lidar.translation().cast<float>();
 
-                // PatchWork++ ground classification for this frame (cached → scalar file → recompute)
+                // PatchWork++ ground classification for this frame (cached -> scalar file -> recompute)
                 std::vector<bool> pw_ground;
                 if (df_mode == 1 && df_exclude_ground_pw) {
                   auto cache_it = pw_ground_cache.find(frame_dir);
@@ -3849,7 +9543,7 @@ void OfflineViewer::setup_ui() {
                   const Eigen::Vector3f wp = R * pts[i] + t_vec;
                   const Eigen::Vector3f wn = (R * normals[i]).normalized();
                   const bool gpw = !pw_ground.empty() && pw_ground[i];
-                  const uint64_t key = glim::voxel_key(wp, inv_voxel);
+                  const uint64_t key = vkey(wp);
                   const float gps_t = static_cast<float>(frame_stamp - gps_time_base) + frame_times[i];
                   voxels[key].push_back({wp, range[i], intensity[i], std::abs(wn.z()), gps_t, gpw, frame_count, i});
                 }
@@ -3913,7 +9607,7 @@ void OfflineViewer::setup_ui() {
             } else if (df_mode == 2 && rf_criteria == 1) {
               // --- RANGE MODE (GPS time criteria) ---
               // Per voxel: cluster points by GPS time, keep the dominant cluster
-              const float time_gap = 5.0f;  // seconds — points within this gap are same cluster
+              const float time_gap = 5.0f;  // seconds -- points within this gap are same cluster
               for (const auto& [key, entries] : voxels) {
                 if (entries.size() <= 1) {
                   for (const auto& e : entries) { kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++; }
@@ -3935,16 +9629,33 @@ void OfflineViewer::setup_ui() {
                 }
 
                 if (clusters.size() <= 1) {
-                  // Only one cluster — keep all
+                  // Only one cluster -- keep all
                   for (const auto& e : entries) { kept_points.push_back(e.world_pos); kept_intensities.push_back(e.intensity); kept_ranges.push_back(e.range); preview_kept++; }
                   continue;
                 }
 
                 // Select cluster to keep
                 int best_cluster = 0;
-                if (rf_gps_keep == 0) { for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) { if (clusters[ci].size() > clusters[best_cluster].size()) best_cluster = ci; } }
+                const size_t total_in_voxel = entries.size();
+                const size_t dominant_threshold = (total_in_voxel * 20 + 99) / 100;  // 20%, round up
+                auto dominant = [&]() {
+                  int b = 0;
+                  for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) {
+                    if (clusters[ci].size() > clusters[b].size()) b = ci;
+                  }
+                  return b;
+                };
+                if (rf_gps_keep == 0) { best_cluster = dominant(); }
                 else if (rf_gps_keep == 1) { best_cluster = static_cast<int>(clusters.size()) - 1; }
-                // else rf_gps_keep == 2: best_cluster = 0 (oldest)
+                else if (rf_gps_keep == 2) { best_cluster = 0; }
+                else if (rf_gps_keep == 3) {
+                  best_cluster = static_cast<int>(clusters.size()) - 1;  // prefer newest
+                  if (clusters[best_cluster].size() < dominant_threshold) best_cluster = dominant();
+                }
+                else if (rf_gps_keep == 4) {
+                  best_cluster = 0;  // prefer oldest
+                  if (clusters[best_cluster].size() < dominant_threshold) best_cluster = dominant();
+                }
 
                 // Keep dominant, remove others
                 std::unordered_set<int> keep_set(clusters[best_cluster].begin(), clusters[best_cluster].end());
@@ -4070,7 +9781,7 @@ void OfflineViewer::setup_ui() {
 
               for (const auto& [key, entries] : voxels) {
                 for (const auto& e : entries) {
-                  // Get scalar value — use aux attribute from the submap frame
+                  // Get scalar value -- use aux attribute from the submap frame
                   // For preview, we approximate using intensity/range/normal_z/ground_pw
                   float scalar_val = 0.0f;
                   if (field_name == "intensity") scalar_val = e.intensity;
@@ -4331,7 +10042,7 @@ void OfflineViewer::setup_ui() {
                                     | static_cast<uint64_t>(static_cast<int>(std::floor(chunk_pts[i].y() * col_inv)) + 1048576);
                   if (chunk_pts[i].z() > col_min_z[ck] + ground_z_tol) {
                     chunk_ground[i] = false;  // revoke for MapCleaner voting only
-                    // DO NOT clear chunk_normal_z or chunk_ground_pw — gap-fill needs them for protection
+                    // DO NOT clear chunk_normal_z or chunk_ground_pw -- gap-fill needs them for protection
                     revoked++;
                   }
                 }
@@ -4490,12 +10201,19 @@ void OfflineViewer::setup_ui() {
               // ========== RANGE MODE ==========
               // Build voxel grid from chunk points (ground-only: only ground enters the grid)
               const float inv_voxel = 1.0f / rf_voxel_size;
+              const float inv_voxel_z = 1.0f / (rf_voxel_size * std::max(0.5f, rf_voxel_height_mult));
+              auto vkey = [inv_voxel, inv_voxel_z](const Eigen::Vector3f& p) {
+                return glim::voxel_key(
+                  static_cast<int>(std::floor(p.x() * inv_voxel)),
+                  static_cast<int>(std::floor(p.y() * inv_voxel)),
+                  static_cast<int>(std::floor(p.z() * inv_voxel_z)));
+              };
               struct VoxEntry { size_t idx; float range; float gps_time; };
               std::unordered_map<uint64_t, std::vector<VoxEntry>> voxels;
               for (size_t i = 0; i < chunk_pts.size(); i++) {
                 if (!core_chunk.contains(chunk_pts[i])) continue;
                 if (range_ground_only && (i >= chunk_is_ground_scalar.size() || !chunk_is_ground_scalar[i])) continue;
-                const uint64_t key = glim::voxel_key(chunk_pts[i], inv_voxel);
+                const uint64_t key = vkey(chunk_pts[i]);
                 const float gt = (i < chunk_gps_times.size()) ? chunk_gps_times[i] : 0.0f;
                 voxels[key].push_back({i, chunk_ranges[i], gt});
               }
@@ -4524,7 +10242,7 @@ void OfflineViewer::setup_ui() {
                   }
                 }
               } else {
-                // GPS Time criteria — keep dominant temporal cluster per voxel
+                // GPS Time criteria -- keep dominant temporal cluster per voxel
                 const float time_gap = 5.0f;
                 for (const auto& [key, entries] : voxels) {
                   if (entries.size() <= 1) continue;
@@ -4538,9 +10256,26 @@ void OfflineViewer::setup_ui() {
                   }
                   if (clusters.size() <= 1) continue;
                   int best = 0;
-                  if (rf_gps_keep == 0) { for (int tci = 1; tci < static_cast<int>(clusters.size()); tci++) { if (clusters[tci].size() > clusters[best].size()) best = tci; } }
-                  else if (rf_gps_keep == 1) { best = static_cast<int>(clusters.size()) - 1; }  // newest = last cluster (sorted by time)
-                  // else rf_gps_keep == 2: best = 0 (oldest = first cluster, already default)
+                  const size_t total_in_voxel = entries.size();
+                  const size_t dom_thresh = (total_in_voxel * 20 + 99) / 100;
+                  auto dominant = [&]() {
+                    int b = 0;
+                    for (int tci = 1; tci < static_cast<int>(clusters.size()); tci++) {
+                      if (clusters[tci].size() > clusters[b].size()) b = tci;
+                    }
+                    return b;
+                  };
+                  if (rf_gps_keep == 0) { best = dominant(); }
+                  else if (rf_gps_keep == 1) { best = static_cast<int>(clusters.size()) - 1; }
+                  else if (rf_gps_keep == 2) { best = 0; }
+                  else if (rf_gps_keep == 3) {
+                    best = static_cast<int>(clusters.size()) - 1;
+                    if (clusters[best].size() < dom_thresh) best = dominant();
+                  }
+                  else if (rf_gps_keep == 4) {
+                    best = 0;
+                    if (clusters[best].size() < dom_thresh) best = dominant();
+                  }
                   std::unordered_set<int> keep_set(clusters[best].begin(), clusters[best].end());
                   for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
                     if (!keep_set.count(ei)) is_removed[entries[ei].idx] = true;
@@ -4565,7 +10300,7 @@ void OfflineViewer::setup_ui() {
                 kept_points.size(), removed_points.size(), total_core, range_ground_only);
               } // end mode branch
 
-              // Render (same pattern as regular preview — with intensity buffer)
+              // Render (same pattern as regular preview -- with intensity buffer)
               auto kept_buf2 = std::make_shared<std::vector<Eigen::Vector3f>>(std::move(kept_points));
               auto kept_int2 = std::make_shared<std::vector<float>>(std::move(kept_ints));
               auto removed_buf2 = std::make_shared<std::vector<Eigen::Vector3f>>(std::move(removed_points));
@@ -4716,9 +10451,9 @@ void OfflineViewer::setup_ui() {
           ImGui::Separator();
           bool launch = false;
           bool reuse_ground = false;
-          if (ImGui::Button("Yes — reuse aux_ground.bin")) { reuse_ground = true; launch = true; ImGui::CloseCurrentPopup(); }
+          if (ImGui::Button("Yes -- reuse aux_ground.bin")) { reuse_ground = true; launch = true; ImGui::CloseCurrentPopup(); }
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses ground from last Classify ground to scalar.\nFaster, recommended if ground is already tuned.");
-          if (ImGui::Button("No — recompute PatchWork++")) { reuse_ground = false; launch = true; ImGui::CloseCurrentPopup(); }
+          if (ImGui::Button("No -- recompute PatchWork++")) { reuse_ground = false; launch = true; ImGui::CloseCurrentPopup(); }
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("Runs PatchWork++ fresh per frame.\nSlower, use if ground hasn't been classified yet.");
           ImGui::Separator();
           if (ImGui::Button("Cancel")) { ImGui::CloseCurrentPopup(); }
@@ -4781,7 +10516,7 @@ void OfflineViewer::setup_ui() {
               const auto& chunk = chunks[ci];
               const auto chunk_aabb = chunk.world_aabb();
 
-              // Core area (for writing removals — no overlap)
+              // Core area (for writing removals -- no overlap)
               glim::Chunk core_chunk = chunk;
               core_chunk.half_size = df_chunk_size * 0.5;
 
@@ -4887,7 +10622,7 @@ void OfflineViewer::setup_ui() {
                 std::unordered_map<uint64_t, std::vector<size_t>> cand_vox;
                 for (size_t i = 0; i < chunk_pts.size(); i++) {
                   if (!result.is_dynamic[i]) continue;
-                  if (chunk_ground[i]) { result.is_dynamic[i] = false; continue; }  // ground → force static
+                  if (chunk_ground[i]) { result.is_dynamic[i] = false; continue; }  // ground -> force static
                   cand_vox[glim::voxel_key(chunk_pts[i], inv_rv)].push_back(i);
                 }
                 // BFS clustering
@@ -4911,7 +10646,7 @@ void OfflineViewer::setup_ui() {
                   }
                   clusters.push_back(std::move(ck)); nc++;
                 }
-                // Evaluate clusters — keep only trail-shaped ones
+                // Evaluate clusters -- keep only trail-shaped ones
                 std::unordered_set<uint64_t> trail_voxels;
                 for (int tci = 0; tci < nc; tci++) {
                   Eigen::Vector3f bmin = Eigen::Vector3f::Constant(1e9f), bmax = Eigen::Vector3f::Constant(-1e9f);
@@ -4951,7 +10686,7 @@ void OfflineViewer::setup_ui() {
                 ci + 1, chunks.size(), result.num_dynamic);
             }
 
-            // Write filtered frames — with final ground safety check
+            // Write filtered frames -- with final ground safety check
             rf_status = "Writing filtered frames (ground safety check)...";
             size_t total_removed = 0, total_kept = 0, ground_saved = 0;
             int frames_modified = 0;
@@ -5085,10 +10820,17 @@ void OfflineViewer::setup_ui() {
             logger->info("[DataFilter] Indexed {} HD frames", all_frames.size());
 
             // Step 3: Per-frame removal indices (accumulated across chunks)
-            std::unordered_map<std::string, std::unordered_set<int>> frame_removals;  // frame_dir → set of point indices to remove
+            std::unordered_map<std::string, std::unordered_set<int>> frame_removals;  // frame_dir -> set of point indices to remove
 
             // Step 4: Process each chunk
             const float inv_voxel = 1.0f / rf_voxel_size;
+            const float inv_voxel_z = 1.0f / (rf_voxel_size * std::max(0.5f, rf_voxel_height_mult));
+            auto vkey = [inv_voxel, inv_voxel_z](const Eigen::Vector3f& p) {
+              return glim::voxel_key(
+                static_cast<int>(std::floor(p.x() * inv_voxel)),
+                static_cast<int>(std::floor(p.y() * inv_voxel)),
+                static_cast<int>(std::floor(p.z() * inv_voxel_z)));
+            };
             for (size_t ci = 0; ci < chunks.size(); ci++) {
               const auto& chunk = chunks[ci];
 
@@ -5150,7 +10892,7 @@ void OfflineViewer::setup_ui() {
                 const auto& cf = chunk_frames[cfi];
                 for (int pi = 0; pi < static_cast<int>(cf.world_points.size()); pi++) {
                   if (apply_ground_only && (pi >= static_cast<int>(cf.is_ground.size()) || !cf.is_ground[pi])) continue;
-                  const uint64_t key = glim::voxel_key(cf.world_points[pi], inv_voxel);
+                  const uint64_t key = vkey(cf.world_points[pi]);
                   const float gt = (pi < static_cast<int>(cf.gps_times.size())) ? cf.gps_times[pi] : 0.0f;
                   voxels[key].push_back({cfi, pi, cf.ranges[pi], gt});
                 }
@@ -5181,7 +10923,7 @@ void OfflineViewer::setup_ui() {
                   }
                 }
               } else {
-                // GPS time criteria — keep dominant temporal cluster per voxel
+                // GPS time criteria -- keep dominant temporal cluster per voxel
                 const float time_gap = 5.0f;
                 for (const auto& [key, entries] : voxels) {
                   if (entries.size() <= 1) continue;
@@ -5195,8 +10937,26 @@ void OfflineViewer::setup_ui() {
                   }
                   if (clusters.size() <= 1) continue;
                   int best = 0;
-                  if (rf_gps_keep == 0) { for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) { if (clusters[ci].size() > clusters[best].size()) best = ci; } }
+                  const size_t total_in_voxel = entries.size();
+                  const size_t dom_thresh = (total_in_voxel * 20 + 99) / 100;
+                  auto dominant = [&]() {
+                    int b = 0;
+                    for (int ci = 1; ci < static_cast<int>(clusters.size()); ci++) {
+                      if (clusters[ci].size() > clusters[b].size()) b = ci;
+                    }
+                    return b;
+                  };
+                  if (rf_gps_keep == 0) { best = dominant(); }
                   else if (rf_gps_keep == 1) { best = static_cast<int>(clusters.size()) - 1; }
+                  else if (rf_gps_keep == 2) { best = 0; }
+                  else if (rf_gps_keep == 3) {
+                    best = static_cast<int>(clusters.size()) - 1;
+                    if (clusters[best].size() < dom_thresh) best = dominant();
+                  }
+                  else if (rf_gps_keep == 4) {
+                    best = 0;
+                    if (clusters[best].size() < dom_thresh) best = dominant();
+                  }
                   std::unordered_set<int> keep_set(clusters[best].begin(), clusters[best].end());
                   for (int ei = 0; ei < static_cast<int>(entries.size()); ei++) {
                     if (!keep_set.count(ei)) { frame_removals[chunk_frames[entries[ei].cf_idx].dir].insert(chunk_frames[entries[ei].cf_idx].original_indices[entries[ei].pt_idx]); }
@@ -5205,7 +10965,7 @@ void OfflineViewer::setup_ui() {
               }
             }
 
-            // Step 5: Apply removals — rewrite each affected frame
+            // Step 5: Apply removals -- rewrite each affected frame
             rf_status = "Writing filtered frames...";
             size_t total_removed = 0, total_kept = 0;
             int frames_modified = 0;
@@ -5523,6 +11283,12 @@ void OfflineViewer::main_menu() {
         ImGui::EndMenu();
       }
 
+      ImGui::Separator();
+      if (ImGui::MenuItem("Export COLMAP...", nullptr, ce_show)) { ce_show = !ce_show; }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Open the COLMAP exporter (single-chunk, dev mode).\n"
+        "Place a region cube and export points + cameras for 3DGS training.");
+
       if (ImGui::MenuItem("Quit")) {
         if (pfd::message("Warning", "Quit?").result() == pfd::button::ok) {
           request_to_terminate = true;
@@ -5705,7 +11471,7 @@ void OfflineViewer::main_menu() {
                       render_states[si].current_lod = SubmapLOD::UNLOADED;
                       render_states[si].bbox_computed = false;
                     }
-                    submaps[si].reset();  // null out — all iterators check for null
+                    submaps[si].reset();  // null out -- all iterators check for null
                   }
                 }
 
@@ -5742,6 +11508,13 @@ void OfflineViewer::main_menu() {
     // Tools menu
     // =====================================================================
     if (ImGui::BeginMenu("Tools")) {
+      if (ImGui::MenuItem("Batch process...", nullptr, show_batch_window)) {
+        show_batch_window = !show_batch_window;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Queue multiple apply-to-HD filter/tool runs sequentially using current UI defaults.");
+      ImGui::Separator();
+
       if (ImGui::BeginMenu("Camera")) {
         if (ImGui::MenuItem("Orbit", nullptr, camera_mode_sel == 0)) {
           camera_mode_sel = 0;
@@ -5761,6 +11534,7 @@ void OfflineViewer::main_menu() {
             fps->set_translation_speed(fpv_speed);
             fps->lock_fovy();
             follow_progress = 0.0f;
+            follow_speed_kmh = 30.0f;  // reset to default cruising speed on every mode entry
             follow_playing = true;  // start playing immediately
             follow_yaw_offset = 0.0f;
             follow_pitch_offset = 0.0f;
@@ -5784,18 +11558,48 @@ void OfflineViewer::main_menu() {
           fpv_smooth_init = false;
         }
         ImGui::Separator();
-        // Projection
+        if (ImGui::MenuItem("Axis gizmo", nullptr, show_axis_gizmo)) {
+          show_axis_gizmo = !show_axis_gizmo;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Bottom-left world-axis indicator (X red, Y green, Z blue).\n"
+          "Updates as the camera rotates -- shows the world frame's orientation\n"
+          "relative to your current view.");
+        ImGui::Separator();
+        // Projection -- flip both the camera control AND the projection matrix.
+        // FPV mode replaces projection_control with an FPSCameraControl (which
+        // is a ProjectionControl but NOT a BasicProjectionControl), so we must
+        // always install a fresh BasicProjectionControl here before configuring.
+        // The canvas resize code will overwrite set_size() with the real viewport
+        // on the next frame, so the initial size value is irrelevant.
+        auto install_basic_proj = [](int mode, double ortho_w) {
+          auto vw = guik::LightViewer::instance();
+          auto proj = std::make_shared<guik::BasicProjectionControl>(Eigen::Vector2i(1920, 1080));
+          proj->set_projection_mode(mode);
+          if (mode == 1) proj->set_ortho_width(ortho_w);
+          vw->set_projection_control(proj);
+        };
         if (ImGui::MenuItem("Perspective")) {
           auto vw = guik::LightViewer::instance();
-          // Iridescence default is perspective — just reset orbit
           vw->use_orbit_camera_control();
+          install_basic_proj(0, 0.0);
           camera_mode_sel = 0;
         }
         if (ImGui::MenuItem("Orthographic")) {
           auto vw = guik::LightViewer::instance();
           vw->use_topdown_camera_control(200.0, 0.0);
+          install_basic_proj(1, 200.0);   // ~200m footprint default
           camera_mode_sel = 0;
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Camera Time Matcher", nullptr, show_time_matcher)) {
+          show_time_matcher = !show_time_matcher;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Side-by-side time matcher for dumb-frames sources (Osmo 360 video etc).\n"
+          "Pick a time-stamped source on the left, the dumb source on the right,\n"
+          "scrub both to a matching moment, set an anchor, enter FPS, Apply.\n"
+          "Use Two-anchor mode to solve the actual frame rate from the data.");
         ImGui::Separator();
         // Preset views
         {
@@ -5851,6 +11655,15 @@ void OfflineViewer::main_menu() {
           ImGui::SliderFloat("Smoothness", &follow_smoothness, 0.01f, 0.5f, "%.2f");
           if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Lower = smoother drone-like feel\nHigher = tighter track following");
+          }
+          ImGui::SliderFloat("Height (m)", &follow_height_offset_m, -5.0f, 50.0f, "%.1f");
+          if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+              "Vertical shift above the trajectory spline.\n"
+              "0 = car/operator view. 5-15m = drone-ish chase view.\n"
+              "30m+ = top-down map view.\n"
+              "Heading/pitch still track the path -- combine with mouse-drag\n"
+              "pitch offset to tilt the view downward for a true drone angle.");
           }
           ImGui::EndMenu();
         }
@@ -5944,6 +11757,19 @@ void OfflineViewer::main_menu() {
             ImGui::EndDisabled();
           }
         }
+
+        ImGui::Separator();
+
+        // Livox intensity-0 filter
+        if (!has_hd) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("Livox", nullptr, show_livox_tool)) {
+          show_livox_tool = !show_livox_tool;
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+          if (has_hd) ImGui::SetTooltip("Livox intensity-0 filter: delete / mark-as-2nd-return / interpolate.");
+          else ImGui::SetTooltip("No HD frames available.");
+        }
+        if (!has_hd) ImGui::EndDisabled();
 
         ImGui::Separator();
 
@@ -6060,32 +11886,50 @@ void OfflineViewer::main_menu() {
           if (!folder.empty() && boost::filesystem::exists(folder)) {
             logger->info("[Colorize] Loading images from {}", folder);
             auto source = Colorizer::load_image_folder(folder);
+            // Auto-detect camera_type + intrinsics width/height from the first
+            // image. A 2:1 aspect ratio (within 2%) is the equirectangular
+            // signature (Osmo 360, Insta360, Ricoh Theta, etc.) -> Spherical.
+            // Anything else stays Pinhole (user can still override in the UI).
+            if (!source.frames.empty()) {
+              cv::Mat sample = cv::imread(source.frames[0].filepath, cv::IMREAD_REDUCED_COLOR_4);
+              if (!sample.empty()) {
+                const int w = sample.cols * 4, h = sample.rows * 4;  // undo the reduction
+                source.intrinsics.width  = w;
+                source.intrinsics.height = h;
+                const double aspect = static_cast<double>(w) / std::max(1, h);
+                if (std::abs(aspect - 2.0) < 0.04) {
+                  source.camera_type = CameraType::Spherical;
+                  logger->info("[Colorize] Auto-detected Spherical (equirect) from {}x{} first image", w, h);
+                } else {
+                  logger->info("[Colorize] Assuming Pinhole from {}x{} first image (aspect {:.3f})", w, h, aspect);
+                }
+              }
+            }
             int with_gps = 0, with_time = 0;
             for (const auto& f : source.frames) {
               if (f.lat != 0.0 || f.lon != 0.0) with_gps++;
               if (f.timestamp > 0.0) with_time++;
             }
-            logger->info("[Colorize] Loaded {} images ({} with GPS, {} with timestamp)", source.frames.size(), with_gps, with_time);
+            // Seed ColorizeParams with camera-type-aware defaults so Spherical
+            // sources open with loose time-slice + Weighted Top-1 out of the box.
+            source.params = default_colorize_params_for(source.camera_type);
+            logger->info("[Colorize] Loaded {} images ({}) ({} with GPS, {} with timestamp)",
+                         source.frames.size(), camera_type_label(source.camera_type), with_gps, with_time);
             image_sources.push_back(std::move(source));
             colorize_source_idx = static_cast<int>(image_sources.size()) - 1;
-            // Save colorize config to dump
+            // Build the alt (GPS-derived) trajectory eagerly so 'Coords > own
+            // path' is selectable with no extra click. Skipped silently when
+            // the source has no EXIF GPS/timestamps.
+            if (with_gps > 0 && with_time > 0) {
+              build_camera_trajectory(image_sources.back(), gnss_utm_zone,
+                                       gnss_utm_easting_origin, gnss_utm_northing_origin,
+                                       gnss_datum_alt);
+            }
+            // Save colorize config to dump (shared helper; see image_source_to_json).
             if (!loaded_map_path.empty()) {
               nlohmann::json cfg;
               cfg["sources"] = nlohmann::json::array();
-              for (const auto& s : image_sources) {
-                nlohmann::json sj;
-                sj["path"] = s.path;
-                sj["time_shift"] = s.time_shift;
-                sj["lever_arm"] = {s.lever_arm.x(), s.lever_arm.y(), s.lever_arm.z()};
-                sj["rotation_rpy"] = {s.rotation_rpy.x(), s.rotation_rpy.y(), s.rotation_rpy.z()};
-                sj["fx"] = s.intrinsics.fx; sj["fy"] = s.intrinsics.fy;
-                sj["cx"] = s.intrinsics.cx; sj["cy"] = s.intrinsics.cy;
-                sj["width"] = s.intrinsics.width; sj["height"] = s.intrinsics.height;
-                sj["k1"] = s.intrinsics.k1; sj["k2"] = s.intrinsics.k2;
-                sj["p1"] = s.intrinsics.p1; sj["p2"] = s.intrinsics.p2;
-                sj["k3"] = s.intrinsics.k3;
-                cfg["sources"].push_back(sj);
-              }
+              for (const auto& s : image_sources) cfg["sources"].push_back(image_source_to_json(s));
               std::ofstream ofs(loaded_map_path + "/colorize_config.json");
               ofs << std::setprecision(10) << cfg.dump(2);
               logger->info("[Colorize] Saved config to {}/colorize_config.json", loaded_map_path);
@@ -6121,13 +11965,202 @@ void OfflineViewer::main_menu() {
         }
         ImGui::EndMenu();
       }
-      if (ImGui::MenuItem("Locate Cameras", nullptr, show_colorize_window)) {
+      if (ImGui::MenuItem("Colorize", nullptr, show_colorize_window)) {
         show_colorize_window = !show_colorize_window;
       }
       if (ImGui::MenuItem("Alignment check", nullptr, align_show)) {
         align_show = !align_show;
       }
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Overlay image + projected LiDAR points to assess calibration.");
+      if (ImGui::MenuItem("Auto-calibrate", nullptr, ac_show)) {
+        ac_show = !ac_show;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("LightGlue-assisted extrinsic + intrinsics refinement.");
+      ImGui::Separator();
+      // Utils submenu lives at the bottom of Colorize so anything that's a
+      // follow-on of a Colorize calibration (e.g. virtual cameras keyed off
+      // the Located extrinsic) sits near its upstream step.
+      if (ImGui::BeginMenu("Utils")) {
+        if (ImGui::MenuItem("Virtual Cameras", nullptr, show_virtual_cameras_window)) {
+          show_virtual_cameras_window = !show_virtual_cameras_window;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Render LiDAR-synthesized intensity images at real-camera poses (per-RGB mode)\n"
+          "or along the trajectory (waypoints mode). Drop into Metashape as locked\n"
+          "anchors for SFM/BA -- automates the hand-placed marker workflow for km of\n"
+          "trajectory.");
+        ImGui::EndMenu();
+      }
+      ImGui::EndMenu();
+    }
+
+    // ----- About menu: acknowledgements, grouped by module + third-party libs -----
+    if (ImGui::BeginMenu("About")) {
+      // Helper lambda: a pair of leaf entries (Author, License). The MenuItem text
+      // IS the info; hovering shows expanded context.
+      auto entry = [](const char* author_text, const char* author_tooltip,
+                      const char* license_text, const char* license_tooltip) {
+        if (ImGui::BeginMenu("Author")) {
+          ImGui::TextUnformatted(author_text);
+          if (author_tooltip && *author_tooltip) {
+            ImGui::Separator();
+            ImGui::TextDisabled("%s", author_tooltip);
+          }
+          ImGui::EndMenu();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", author_text);
+        if (ImGui::BeginMenu("License")) {
+          ImGui::TextUnformatted(license_text);
+          if (license_tooltip && *license_tooltip) {
+            ImGui::Separator();
+            ImGui::TextDisabled("%s", license_tooltip);
+          }
+          ImGui::EndMenu();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", license_text);
+      };
+
+      // --- GLIM core (Kenji Koide) ---
+      if (ImGui::BeginMenu("GLIM (core SLAM)")) {
+        entry(
+          "Kenji Koide (AIST)",
+          "Creator of GLIM: versatile 3D LiDAR-IMU mapping framework with interactive map editing.",
+          "MIT",
+          "https://github.com/koide3/glim");
+        ImGui::EndMenu();
+      }
+      if (ImGui::BeginMenu("gtsam_points")) {
+        entry("Kenji Koide (AIST)", "Point-cloud-based GTSAM factors, CPU + GPU variants.",
+              "BSD-2-Clause", "https://github.com/koide3/gtsam_points");
+        ImGui::EndMenu();
+      }
+      if (ImGui::BeginMenu("Iridescence (viewer)")) {
+        entry("Kenji Koide", "ImGui + OpenGL 3D viewer backing GLIM's UI.",
+              "MIT", "https://github.com/koide3/iridescence");
+        ImGui::EndMenu();
+      }
+
+      ImGui::Separator();
+
+      // --- Mobile Mapper (umbrella claim; anything not explicitly attributed below is ours) ---
+      if (ImGui::BeginMenu("Mobile Mapper (this fork)")) {
+        entry("Pablo Vidaurre Sanz + Claude (Anthropic)",
+              "Post-processing pipeline built on top of GLIM: colorize, auto-calibrate, data filters,\n"
+              "voxelize HD, COLMAP export, camera modes, GNSS / coordinates tooling, Livox filters,\n"
+              "alignment check, and all associated UI.\n\n"
+              "Rule of thumb: anything NOT listed elsewhere in About is part of this fork.",
+              "Mobile Mapper EULA v1 (source-available, non-commercial modification only)",
+              "Software: may be USED for any purpose (including commercial) to produce output data.\n"
+              "Modification is permitted for non-commercial purposes (tinkering, academic, evaluation).\n"
+              "Modification FOR COMMERCIAL USE -- direct (reselling a modified version) or indirect\n"
+              "(derivative software that is sold/licensed/commercialized) -- requires written permission.\n"
+              "Output data (point clouds, 3DGS exports, COLMAP datasets): UNRESTRICTED -- yours.\n"
+              "GLIM core files retain their original MIT license.\n"
+              "See LICENSE.mobile-mapper at the repo root for full text.");
+        ImGui::EndMenu();
+      }
+
+      ImGui::Separator();
+
+      // --- Features authored by others (called out individually) ---
+      if (ImGui::BeginMenu("Auto-calibrate -> LightGlue")) {
+        entry("Philipp Lindenberger, Paul-Edouard Sarlin, Marc Pollefeys",
+              "LightGlue: Local Feature Matching at Light Speed. ICCV 2023.\n"
+              "Used for 2D feature matching between the real camera image and the rendered LiDAR\n"
+              "intensity image during auto-calibration. Feature engineering + pipeline integration\n"
+              "by Mobile Mapper; LightGlue itself is attributed here.",
+              "Apache-2.0",
+              "https://github.com/cvg/LightGlue\n"
+              "Note: default SuperPoint weights are CC-BY-NC-SA-4.0 (non-commercial).\n"
+              "For commercial output, swap to ALIKED in scripts/lightglue_match.py.");
+        ImGui::EndMenu();
+      }
+
+      if (ImGui::BeginMenu("Ground segmentation -> PatchWork++")) {
+        entry("Hyungtae Lim et al. (URL team, KAIST)",
+              "Patchwork++: Fast and Robust Ground Segmentation Solving Partial Under-Segmentation\n"
+              "Using 3D Point Cloud. IROS 2022.\n"
+              "Used by the Dynamic filter's ground protection step. Integration + extensions\n"
+              "(frame accumulation, Z-column refinement) by Mobile Mapper.",
+              "BSD-2-Clause",
+              "https://github.com/url-kaist/patchwork-plusplus");
+        ImGui::EndMenu();
+      }
+
+      if (ImGui::BeginMenu("Dynamic filter -> MapCleaner (inspiration)")) {
+        entry("H. Fu et al. -- clean-room reimpl by Mobile Mapper",
+              "MapCleaner: Efficiently Removing Moving Objects from Point Cloud Maps in Autonomous\n"
+              "Driving Scenarios. IEEE RA-L 2024. Conceptual inspiration only; this implementation\n"
+              "is independent with differences in voting, clustering, and chunk handling.",
+              "Algorithm: not 1:1. Our code: MIT.",
+              "Not a fork of original code.");
+        ImGui::EndMenu();
+      }
+
+      ImGui::Separator();
+
+      // --- Third-party libs ---
+      if (ImGui::BeginMenu("Third-party libraries")) {
+        if (ImGui::BeginMenu("GTSAM")) {
+          entry("Frank Dellaert et al. (Georgia Tech)",
+                "Factor graph optimization backend.",
+                "BSD-3-Clause",
+                "https://github.com/borglab/gtsam");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Eigen")) {
+          entry("Benoit Jacob, Gael Guennebaud, et al.",
+                "C++ linear algebra template library.",
+                "MPL-2.0", "https://eigen.tuxfamily.org/");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("OpenCV")) {
+          entry("OpenCV Team", "Computer vision library.",
+                "Apache-2.0", "https://opencv.org/");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Boost")) {
+          entry("Boost community", "Filesystem, program_options, etc.",
+                "Boost Software License 1.0", "https://www.boost.org/");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Dear ImGui")) {
+          entry("Omar Cornut et al.", "Immediate-mode GUI.",
+                "MIT", "https://github.com/ocornut/imgui");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("LightGlue (optional, auto-calib)")) {
+          entry("Philipp Lindenberger, Paul-Edouard Sarlin, Marc Pollefeys",
+                "LightGlue: Local Feature Matching at Light Speed. ICCV 2023.",
+                "Apache-2.0", "https://github.com/cvg/LightGlue");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("libexif")) {
+          entry("libexif contributors", "EXIF metadata parsing.",
+                "LGPL-2.1", "https://libexif.github.io/");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("nlohmann/json")) {
+          entry("Niels Lohmann", "JSON for Modern C++.",
+                "MIT", "https://github.com/nlohmann/json");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("portable-file-dialogs")) {
+          entry("Sam Hocevar", "Native file dialogs.",
+                "WTFPL / BSL-1.0", "https://github.com/samhocevar/portable-file-dialogs");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("FAST-LIVO2 (conceptual influence)")) {
+          entry("Chunran Zheng, Wei Xu, Yunfan Ren, Fu Zhang (HKU-MARS)",
+                "FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry. IEEE TRO 2024.\n"
+                "Not a dependency -- inspired the Weighted view selector, photometric exposure, "
+                "and depth-buffer occlusion approach.",
+                "N/A -- inspiration only, no code reuse",
+                "https://github.com/hku-mars/FAST-LIVO2");
+          ImGui::EndMenu();
+        }
+        ImGui::EndMenu();
+      }
       ImGui::EndMenu();
     }
 
@@ -6200,7 +12233,7 @@ void OfflineViewer::main_menu() {
           // Check zone compatibility
           if (new_zone != ref_utm_zone) {
             logger->warn("[multi-map] UTM zone mismatch: reference zone={}, new map zone={}. "
-                         "Cross-zone alignment is not supported — coordinates may be incorrect.",
+                         "Cross-zone alignment is not supported -- coordinates may be incorrect.",
                          ref_utm_zone, new_zone);
             pfd::message("UTM Zone Mismatch",
               "The new map uses UTM zone " + std::to_string(new_zone) +
@@ -6211,7 +12244,7 @@ void OfflineViewer::main_menu() {
           logger->info("[multi-map] Datum offset: dE={:.3f} m, dN={:.3f} m, dZ={:.3f} m",
                        datum_offset.x(), datum_offset.y(), datum_offset.z());
         } else if (!ref_datum_set && new_has_datum) {
-          // First map with datum — store as reference
+          // First map with datum -- store as reference
           ref_datum_set = true;
           ref_utm_zone = new_zone;
           ref_utm_easting = new_E;
@@ -6325,23 +12358,58 @@ void OfflineViewer::main_menu() {
           if (path.empty() || !boost::filesystem::exists(path)) continue;
           logger->info("[Colorize] Auto-loading images from {}", path);
           auto source = Colorizer::load_image_folder(path);
-          source.time_shift = sj.value("time_shift", 0.0);
-          source.mask_path = sj.value("mask_path", "");
+          image_source_apply_json(source, sj);
+          // If the saved config didn't carry camera_type (pre-Spherical sessions
+          // or manually-edited json), auto-detect from first image's aspect.
+          if (!sj.contains("camera_type") && !source.frames.empty()) {
+            cv::Mat sample = cv::imread(source.frames[0].filepath, cv::IMREAD_REDUCED_COLOR_4);
+            if (!sample.empty()) {
+              const double aspect = static_cast<double>(sample.cols) / std::max(1, sample.rows);
+              if (std::abs(aspect - 2.0) < 0.04) {
+                source.camera_type = CameraType::Spherical;
+                source.params = default_colorize_params_for(CameraType::Spherical);
+                logger->info("[Colorize] Auto-detected Spherical for {} (config had no camera_type)", source.path);
+              }
+            }
+          }
+          // Re-apply Time-Matcher back-fill if the source had been anchored in a
+          // previous session (dumb-frames source lost its timestamps on reload).
+          if (source.tm_anchor1_idx >= 0) {
+            double interval = 0.0;
+            if (source.tm_anchor2_idx >= 0 && source.tm_anchor2_idx != source.tm_anchor1_idx) {
+              interval = (source.tm_anchor2_time - source.tm_anchor1_time) /
+                         static_cast<double>(source.tm_anchor2_idx - source.tm_anchor1_idx);
+            } else if (source.tm_fps > 0.01f) {
+              interval = 1.0 / static_cast<double>(source.tm_fps);
+            }
+            if (interval > 0.0) {
+              for (size_t i = 0; i < source.frames.size(); i++) {
+                const double dt = (static_cast<int>(i) - source.tm_anchor1_idx) * interval;
+                source.frames[i].timestamp = source.tm_anchor1_time + dt;
+              }
+              // Back-filled timestamps are already in LiDAR-time base; the
+              // persisted source.time_shift (if any) was typically 0 from the
+              // Apply step but we don't touch it here -- user may have added a
+              // deliberate nudge after the fact which we should preserve.
+              logger->info("[Colorize] Re-applied Time Matcher back-fill: anchor1=({},{:.3f}) interval={:.5f}",
+                           source.tm_anchor1_idx, source.tm_anchor1_time, interval);
+            }
+          }
+          // Load the mask for the first source into the runtime cache so the
+          // active-source selection on startup has the right mask resident.
           if (!source.mask_path.empty() && boost::filesystem::exists(source.mask_path)) {
             colorize_mask = cv::imread(source.mask_path, cv::IMREAD_UNCHANGED);
             if (!colorize_mask.empty()) logger->info("[Colorize] Auto-loaded mask from {}", source.mask_path);
           }
-          if (sj.contains("lever_arm")) source.lever_arm = Eigen::Vector3d(sj["lever_arm"][0], sj["lever_arm"][1], sj["lever_arm"][2]);
-          if (sj.contains("rotation_rpy")) source.rotation_rpy = Eigen::Vector3d(sj["rotation_rpy"][0], sj["rotation_rpy"][1], sj["rotation_rpy"][2]);
-          source.intrinsics.fx = sj.value("fx", 1920.0); source.intrinsics.fy = sj.value("fy", 1920.0);
-          source.intrinsics.cx = sj.value("cx", 1920.0); source.intrinsics.cy = sj.value("cy", 1080.0);
-          source.intrinsics.width = sj.value("width", 3840); source.intrinsics.height = sj.value("height", 2160);
-          source.intrinsics.k1 = sj.value("k1", 0.0); source.intrinsics.k2 = sj.value("k2", 0.0);
-          source.intrinsics.p1 = sj.value("p1", 0.0); source.intrinsics.p2 = sj.value("p2", 0.0);
-          source.intrinsics.k3 = sj.value("k3", 0.0);
-          logger->info("[Colorize] Restored: {} images, time_shift={:.3f}, lever=[{:.3f},{:.3f},{:.3f}]",
-            source.frames.size(), source.time_shift, source.lever_arm.x(), source.lever_arm.y(), source.lever_arm.z());
+          logger->info("[Colorize] Restored: {} images ({}), time_shift={:.3f}, lever=[{:.3f},{:.3f},{:.3f}]",
+            source.frames.size(), camera_type_label(source.camera_type),
+            source.time_shift, source.lever_arm.x(), source.lever_arm.y(), source.lever_arm.z());
           image_sources.push_back(std::move(source));
+          // Rebuild the alt (GPS-derived) trajectory after reload -- not
+          // serialised, so it's always rebuilt from EXIF on the way back in.
+          build_camera_trajectory(image_sources.back(), gnss_utm_zone,
+                                   gnss_utm_easting_origin, gnss_utm_northing_origin,
+                                   gnss_datum_alt);
         }
         if (!image_sources.empty()) colorize_source_idx = 0;
       }
@@ -6449,7 +12517,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
   // Build set of export-enabled sessions for filtering
   std::unordered_set<int> export_sessions;
   if (sessions.empty()) {
-    // No session tracking (single map) — export all
+    // No session tracking (single map) -- export all
     for (const auto& submap : submaps) {
       if (submap) export_sessions.insert(submap->session_id);
     }
@@ -6465,7 +12533,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
   }
 
   // =====================================================================
-  // HD export path — load frames from disk, transform, write
+  // HD export path -- load frames from disk, transform, write
   // =====================================================================
   if (export_hd && hd_available) {
     progress.set_text("Exporting HD frames");
@@ -6768,7 +12836,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
   }
 
   // Split aux names by element size so double attrs (gps_time) are written as
-  // "property double" in the PLY header — float32 loses ~128 s precision on GPS epoch values.
+  // "property double" in the PLY header -- float32 loses ~128 s precision on GPS epoch values.
   std::vector<std::string> aux_names_float, aux_names_double;
   for (const auto& name : aux_names) {
     if (aux_elem_sizes.at(name) == sizeof(double)) {
@@ -6814,7 +12882,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
 
     // Build per-point valid mask: exclude points where any aux attribute is non-finite or
     // where gps_time == 0.0 exactly (sentinel left by voxels merged before gps_time was
-    // populated — these would corrupt MIN-blend colorisation by pulling the range to zero).
+    // populated -- these would corrupt MIN-blend colorisation by pulling the range to zero).
     std::vector<bool> valid(n, true);
     for (const auto& name : aux_names_float) {
       const float* src = static_cast<const float*>(frame->aux_attributes.at(name).second);
@@ -6895,7 +12963,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     ply.add_prop<float>(name, aux_data_float[name].data(), aux_data_float[name].size());
   }
   for (const auto& name : aux_names_double) {
-    // Written as "property double <name>" — full 64-bit precision in the PLY file.
+    // Written as "property double <name>" -- full 64-bit precision in the PLY file.
     ply.add_prop<double>(name, aux_data_double[name].data(), aux_data_double[name].size());
   }
   if (has_aux_intensity) {
@@ -6996,7 +13064,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
                      jgd_zone_used, jgd2011_zone_name(jgd_zone_used));
       }
 
-      // Phase 1: inverse UTM → lat/lon for all points (zone-independent, cached)
+      // Phase 1: inverse UTM -> lat/lon for all points (zone-independent, cached)
       cached_latlon.resize(n);
       for (size_t i = 0; i < n; i++) {
         const Eigen::Vector3d pt = ply.vertices[i].cast<double>();
@@ -7020,7 +13088,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
   }
 
   // -----------------------------------------------------------------------
-  // Save — either single file or per-tile split
+  // Save -- either single file or per-tile split
   // -----------------------------------------------------------------------
   if (trim_by_tile && gnss_datum_available && !out_x.empty()) {
     // Group points by tile
@@ -7060,7 +13128,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
 
       glk::PLYData tile_ply;
 
-      // Double-precision x, y, z — may be re-projected for JGD2011 per-tile zones
+      // Double-precision x, y, z -- may be re-projected for JGD2011 per-tile zones
       std::vector<double> tx(tn), ty(tn), tz(tn);
 
       // JGD2011 per-tile zone detection: check if this tile's centroid
@@ -7173,7 +13241,7 @@ bool OfflineViewer::export_map(guik::ProgressInterface& progress, const std::str
     }
     glk::save_ply_binary(path, ply);
   } else {
-    // No datum — local coordinates
+    // No datum -- local coordinates
     glk::save_ply_binary(path, ply);
   }
   return true;
@@ -7205,7 +13273,7 @@ std::pair<size_t, size_t> OfflineViewer::apply_range_filter_to_frame(const std::
     f.read(reinterpret_cast<char*>(points.data()), sizeof(Eigen::Vector3f) * num_pts);
   }
 
-  // Build voxel grid: map voxel key → list of point indices
+  // Build voxel grid: map voxel key -> list of point indices
   const float inv_voxel = 1.0f / rf_voxel_size;
   std::unordered_map<uint64_t, std::vector<int>> voxels;
   for (int i = 0; i < num_pts; i++) {
@@ -7226,7 +13294,7 @@ std::pair<size_t, size_t> OfflineViewer::apply_range_filter_to_frame(const std::
     }
 
     if (close_count < rf_min_close_pts) {
-      // No safe-range anchor — apply secondary (far) delta from min range
+      // No safe-range anchor -- apply secondary (far) delta from min range
       const float far_threshold = min_range + rf_far_delta;
       for (int idx : indices) {
         if (range[idx] > far_threshold) {

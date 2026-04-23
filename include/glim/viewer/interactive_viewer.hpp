@@ -93,6 +93,14 @@ protected:
   // Visualization params
   int color_mode;
   std::vector<std::string> aux_attribute_names;
+  // Per-scalar colormap choice (index into glk::colormap_names()). Default-inserts
+  // 0 (TURBO); user pick in the Selection window is remembered per attribute so
+  // switching scalars doesn't churn the colour scale.
+  std::unordered_map<std::string, int> scalar_colormap_per_attr;
+  // Raised when color_mode is auto-promoted during first-submap insert. The LOD
+  // worker uploads SD drawables async, so the initial update_viewer() has no
+  // targets; this flag lets lod_update retry once a drawable has materialised.
+  bool scalar_default_refresh_pending = false;
   Eigen::Vector2f aux_cmap_range;  // 1st–99th percentile range for the active aux attribute
 
   static constexpr size_t AUX_SAMPLE_CAP = 500000;
