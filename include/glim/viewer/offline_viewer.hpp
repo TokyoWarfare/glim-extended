@@ -2,6 +2,9 @@
 
 #include <string>
 #include <vector>
+#include <map>
+#include <cstdint>
+#include <atomic>
 #include <unordered_set>
 #include <Eigen/Geometry>
 #include <glim/mapping/global_mapping.hpp>
@@ -179,15 +182,285 @@ private:
   float follow_smooth_pitch = 0.0f;
   bool follow_smooth_init = false;
 
-  // Data filter tool (range + dynamic modes)
+  // Data Cleaner tool (SOR / Range / Dynamic / Dynamic-Erasor point-removal filters)
   bool show_data_filter = false;
-  int  df_mode = 0;                  // 0=SOR, 1=Dynamic, 2=Range, 3=Scalar
+  int  df_mode = 0;                  // 0=SOR, 1=Range, 2=Dynamic, 3=Dynamic-Erasor
+
+  // Sensor preset (currently only Livox Horizon; Pandar 128 / Velodyne / Ouster
+  // slots will be added once we have data to tune them). On selection, the
+  // preset's algorithm params are copied into the per-mode UI fields below.
+  // Struct definition lives in glim/util/sensor_preset.hpp so other tools can
+  // share the same defaults without including the viewer header.
+  int  df_sensor_preset_idx = 0;
+
+  // Data Display Filter tool -- scalar-driven visibility (split off from
+  // Data Cleaner: semantically different, acts only on what is rendered /
+  // flagged for subsequent tools, never removes points).
+  bool show_data_display_filter = false;
 
   // Scalar visibility tool
   int   sv_field_idx = 0;             // selected scalar field index
-  float sv_threshold = 0.5f;          // split threshold
-  bool  sv_hide_below = false;        // hide points below threshold
-  bool  sv_hide_above = false;        // hide points above threshold
+  float sv_threshold = 0.5f;          // split threshold (A) -- in range mode derived from center - radius
+  float sv_threshold_b = 1.0f;        // upper bound (B)       -- in range mode derived from center + radius
+  bool  sv_range_mode = false;        // false = single-threshold (A), true = range [A, B]
+  // Range-mode center/radius state. A big scalar (e.g. gps_time over a 5 km
+  // session = ~300 s) makes a two-handle slider impossible to land precisely,
+  // so range mode defines the window as center +/- radius instead. Center
+  // comes from a picked 3D point (scalar value at the nearest cache point)
+  // OR direct text entry. Slider max is user-settable so a session that
+  // runs 30 s can have fine resolution while a 600 s one scales up.
+  bool  sv_picking = false;           // armed: next 3D click sets the center
+  float sv_range_center = 0.0f;
+  float sv_range_radius = 5.0f;
+  float sv_range_radius_max = 30.0f;
+  // World-space position of the last successful pick -- rendered as a big
+  // sphere so the user can verify which side of the track they landed on.
+  bool  sv_pick_has_pos = false;
+  Eigen::Vector3f sv_pick_pos = Eigen::Vector3f::Zero();
+  // First-time seed flag: default the field dropdown to gps_time (the
+  // scalar users almost always start with for isolation work) on first
+  // entry to Scalar mode with aux_attribute_names populated.
+  bool  sv_field_initialized = false;
+  // Visibility history log. One entry per "Apply to visibility" click,
+  // appended in order so the user can read the stack top-down ("first gps
+  // time 80-120, then intensity > 50, then ..."). Cleared on Clear
+  // visibility. In-memory only -- the actual stacking lives in the HD
+  // frames' aux_visibility.bin files (additive AND).
+  struct SvHistoryEntry {
+    std::string field;
+    float a = 0.0f;
+    float b = 0.0f;
+    bool  range_mode = false;
+    int   hide_mode = 0;       // 0 = hide below A / outside, 1 = hide above A / inside
+    int   points_hidden = 0;   // added by THIS apply (not cumulative)
+  };
+  std::vector<SvHistoryEntry> sv_history;
+
+  // ---- Data Isolation tool ----
+  // Right-click a LiDAR point to place a cylinder gizmo around it; Apply
+  // sets iso_subvisibility (inherited from InteractiveViewer) so only points
+  // inside the cylinder render. Non-persistent, non-destructive. Clear
+  // restores the full view (AND-combined with aux_visibility.bin).
+  bool  iso_show_window = false;
+  bool  iso_placed = false;            // gizmo placed (waiting for edit / apply)
+  Eigen::Vector3f iso_center = Eigen::Vector3f::Zero();
+  float iso_radius = 5.0f;
+  float iso_height = 10.0f;
+  std::string iso_status;              // last Apply / Clear outcome
+  bool  iso_processing = false;
+
+  // ---- Trimmer (Tools -> Trimmer) ----
+  // Screen-space polygon select over HD points; Delete destructively rewrites
+  // all per-point binary files in affected frames. Three modes:
+  //   Lasso    — mouse-down starts polyline, release auto-closes (first<->last)
+  //   Polygon  — left-click adds vertex, right-click closes
+  //   Rectangle— mouse-down/drag/release produces a 4-corner box
+  // Front-only: points behind the camera never select. Respects both
+  // aux_visibility.bin AND iso_subvisibility (only already-visible points
+  // are candidates). Operates on HD cache built lazily on close.
+  bool  show_trimmer = false;
+  int   trimmer_mode = 0;                    // 0=Lasso, 1=Polygon, 2=Rectangle
+  bool  trimmer_armed = false;               // next viewport action builds selection
+  bool  trimmer_drawing = false;             // mid-drag (lasso/rect)
+  bool  trimmer_closed = false;              // polygon finalised, selection valid
+  std::vector<Eigen::Vector2f> trimmer_vertices;   // screen-space pixel polygon
+  Eigen::Vector2f trimmer_rect_start = Eigen::Vector2f::Zero();
+  // HD cache of candidate points (already visible: vis & iso-mask passed).
+  // Built on first close after arming. Index back to source via parallel
+  // arrays so Delete can group removes by (submap, frame) and rewrite each
+  // HD frame's binaries once.
+  std::vector<Eigen::Vector3f> trim_cache_pts;
+  std::vector<int>             trim_cache_submap_idx;
+  std::vector<int>             trim_cache_frame_idx;
+  std::vector<int>             trim_cache_point_idx;
+  bool                         trim_cache_ready = false;
+  std::vector<uint8_t>         trim_selected;      // 1 = inside polygon
+  int                          trim_status_selected = 0;
+  bool                         trim_processing = false;
+  std::string                  trim_status;
+
+  void trimmer_build_cache();
+  void trimmer_compute_selection();
+  void trimmer_delete_selected();
+  void trimmer_reset();
+  void trimmer_undo_last();
+
+  // In-memory single-shot undo for the most recent trim. We snapshot ONLY
+  // the deleted points' bytes (per per-point file), not the full frame
+  // directories -- a few thousand deleted points cost a few hundred KB
+  // instead of MBs of irrelevant sibling data. On undo we append the bytes
+  // back to each per-point file (re-inserting at the end is fine because
+  // no downstream tool depends on per-point ordering -- LOD, MapCleaner,
+  // etc. all consume the points indiscriminately). frame_meta.json's
+  // num_points is bumped by n_deleted on restore. Cleared at the start of
+  // every new trim, so only the LAST trim is recoverable.
+  struct TrimUndoFrame {
+    std::string frame_dir;
+    int n_deleted = 0;
+    std::map<std::string, std::vector<uint8_t>> deleted_bytes;  // per-file payloads, sized n_deleted * elem_size
+  };
+  std::vector<TrimUndoFrame> trim_undo_buffer;
+
+  // ---- Batch processor (Tools -> Batch) ----
+  // Snapshot-at-add JSON queue of cleaning / export tools that runs serially.
+  // Recipes save to disk so the same pipeline can replay across maps from a
+  // same-day capture / same rig. Tokens in path-shaped fields ($MAP, $HD,
+  // $TIMESTAMP) are resolved at run time so the file is portable.
+  enum class BatchKind {
+    BackupHD,
+    DeleteCloseToSensor,
+    SOR,
+    Range,
+    Dynamic,
+    VoxelizeHD,
+    Colorize,
+    VirtualCameras,
+    RegenerateSDFromHD,
+    ClassifyGround,
+    Erasor
+  };
+  struct BatchEntry {
+    BatchKind        kind = BatchKind::BackupHD;
+    // Serialized JSON snapshot of slider/checkbox state at add-time. Stored
+    // as string in the public header so glim_ros (which inherits from this
+    // class) doesn't need nlohmann/json on its include path -- internal .cpp
+    // parses/dumps at the boundary.
+    std::string      params_json;
+    std::string      note;          // user-editable description
+    std::string      status;        // "pending" / "running" / "done" / "failed: <reason>"
+  };
+  bool                       show_batch_window = false;
+  std::vector<BatchEntry>    batch_queue;
+  bool                       batch_running = false;
+  std::atomic_bool           batch_cancel{false};
+  int                        batch_current_index = -1;
+  std::string                batch_status;     // running state / step counter
+  // Multi-line report from the last Validate run -- mirrors what the log
+  // shows but stays visible in the window so the user doesn't have to flip
+  // to the log pane. Cleared on next Validate / queue mutation.
+  std::string                batch_validation_report;
+  // Edit state. When >= 0, the matching tool's "Add to batch" button label
+  // morphs into "Update batch values" and writes back to batch_queue[idx]
+  // instead of pushing a new entry. Reset on Update / Cancel / window close.
+  int                        batch_edit_index = -1;
+  // Edit-popup fallback for tools that have no dedicated window (currently
+  // only Backup HD: tunable is just one path string, doesn't warrant a full
+  // floating window). Set by the entry's Edit button when the kind doesn't
+  // map to a persistent window.
+  bool                       batch_edit_popup_open = false;
+
+  // Delete close to sensor floating window (Tools -> Utils opens it; Edit
+  // on a batch entry of this kind also opens it pre-filled).
+  bool   show_delete_close_window = false;
+  float  delete_close_threshold   = 2.0f;   // tunable in window
+
+  // Per-tool snapshot helpers. Each reads the current UI globals into a
+  // serialized JSON string ready to feed back into run_X later. Returned as
+  // string to keep nlohmann/json out of this public header.
+  std::string batch_snapshot_backup_hd();
+  std::string batch_snapshot_delete_close();
+  std::string batch_snapshot_sor();
+  std::string batch_snapshot_range();
+  std::string batch_snapshot_dynamic();
+  std::string batch_snapshot_voxelize_hd();
+  std::string batch_snapshot_colorize();
+  std::string batch_snapshot_virtual_cameras();
+  std::string batch_snapshot_regenerate_sd_from_hd();
+  std::string batch_snapshot_classify_ground();
+  std::string batch_snapshot_erasor();
+  // Prefill the Data Cleaner UI globals from a JSON snapshot. Used by the
+  // batch Edit handler to seed the window with the entry's stored values
+  // before letting the user tweak.
+  void batch_prefill_sor(const std::string& params_json);
+  void batch_prefill_range(const std::string& params_json);
+  void batch_prefill_dynamic(const std::string& params_json);
+  void batch_prefill_voxelize_hd(const std::string& params_json);
+  void batch_prefill_colorize(const std::string& params_json);
+  void batch_prefill_virtual_cameras(const std::string& params_json);
+  void batch_prefill_regenerate_sd_from_hd(const std::string& params_json);
+  void batch_prefill_classify_ground(const std::string& params_json);
+  void batch_prefill_erasor(const std::string& params_json);
+
+  // Per-tool runners. Take serialized JSON params, return true on success.
+  // On failure populate `error_out` with a human-readable reason. All runners
+  // are synchronous (caller is the batch worker thread or a std::thread spawned
+  // from the tool's Apply button). Touch rf_status for live reporting but not
+  // rf_processing (UI flag, owned by the caller).
+  bool run_backup_hd(const std::string& params_json, std::string& error_out);
+  bool run_delete_close_to_sensor(const std::string& params_json, std::string& error_out);
+  bool run_sor(const std::string& params_json, std::string& error_out);
+  bool run_range(const std::string& params_json, std::string& error_out);
+  bool run_dynamic(const std::string& params_json, std::string& error_out);
+  bool run_voxelize_hd(const std::string& params_json, std::string& error_out);
+  bool run_colorize(const std::string& params_json, std::string& error_out);
+  bool run_virtual_cameras(const std::string& params_json, std::string& error_out);
+  bool run_regenerate_sd_from_hd(const std::string& params_json, std::string& error_out);
+  bool run_classify_ground(const std::string& params_json, std::string& error_out);
+  bool run_erasor(const std::string& params_json, std::string& error_out);
+
+  // Promoted from a static-in-lambda so batch snapshot can read it.
+  float regen_voxel_size = 0.20f;
+
+  // Dispatcher / queue management.
+  bool run_batch_entry(BatchEntry& entry, std::string& error_out);
+  void run_batch_worker();
+  void batch_add(BatchKind kind, std::string params_json, const std::string& note = "");
+  void batch_save(const std::string& path);
+  bool batch_load(const std::string& path);
+  void batch_autosave();              // writes <map_path>/batch_process.json
+  // Per-entry pre-flight check. Returns true if entry is runnable; populates
+  // `error_out` with the reason if not, and `paths_in` / `paths_out` with the
+  // resolved input / output file paths the run would touch (after $MAP/$HD/
+  // $TIMESTAMP token expansion). Does not touch disk -- inspects params +
+  // map state only. Whole-queue batch_validate() iterates and stamps each
+  // entry's status with "validated" / "invalid: <reason>" plus logs the full
+  // IN/OUT manifest so the user can sanity-check overnight runs.
+  bool batch_validate_entry(const BatchEntry& e,
+                             std::string& error_out,
+                             std::vector<std::string>& paths_in,
+                             std::vector<std::string>& paths_out) const;
+  void batch_validate();
+  // Resolve $MAP / $HD / $TIMESTAMP tokens in a path-shaped string.
+  std::string batch_resolve_path(const std::string& templ) const;
+  static const char* batch_kind_label(BatchKind k);
+  // Hide radio (always hides one side; no "none" because the whole point of
+  // this tool is to isolate a subset):
+  //   single-threshold mode: 0 = hide below A, 1 = hide above A.
+  //   range mode:            0 = hide outside [A,B], 1 = hide inside [A,B].
+  int   sv_hide_mode = 0;
+  // Cached HD points from the last Filter preview so slider / radio changes
+  // can re-render instantly without another HD load. Cleared on Clear preview
+  // or when the field selector changes. `sv_cache_scalars[i]` is the scalar
+  // value of point i; `sv_cache_ints[i]` is the intensity (for any future
+  // intensity colormap on the kept side). `sv_cache_ready` gates re-renders
+  // so the first slider drag after Preview doesn't wipe a half-built cache.
+  std::vector<Eigen::Vector3f> sv_cache_pts;
+  std::vector<float>           sv_cache_scalars;
+  std::vector<float>           sv_cache_ints;
+  bool                         sv_cache_ready = false;
+  // Memoised counts + scalar extents so the UI display doesn't iterate the
+  // whole cache every ImGui frame. Refreshed inside sv_render_from_cache().
+  int   sv_last_kept = 0;
+  int   sv_last_dropped = 0;
+  float sv_last_scalar_min = 0.0f;
+  float sv_last_scalar_max = 0.0f;
+  // When false the "dropped" side is truly hidden (Apply mode). When true
+  // both sides render. The style of the dropped overlay is chosen by
+  // sv_dropped_style -- diagnostic red, faint gray context, or intensity gray.
+  bool  sv_show_dropped = true;
+  // 0 = Red translucent (diagnostic, default for Filter preview).
+  // 1 = Gray flat        (faint context for "is this junk?" assessment).
+  // 2 = Intensity gray   (gray modulated by intensity for more texture).
+  int   sv_dropped_style = 0;
+  // When false, sv_render_from_cache skips the kept overlay (LOD already
+  // renders those points natively after Apply). Reset to true on Clear preview.
+  // Lets the dropped ghost persist past Apply for context.
+  bool  sv_render_kept = true;
+  void sv_render_from_cache();
+  // Trimmer/segmentation gate -- when on, trimmer_build_cache excludes points
+  // that the active scalar preview would drop. Lets the user lasso the kept
+  // subset without first committing Apply to visibility.
+  bool  trim_respect_preview_split = false;
   int   rf_criteria = 0;              // 0=Range, 1=GPS Time
   int   rf_gps_keep = 0;              // 0=Dominant (most points), 1=Newest, 2=Oldest
   float rf_voxel_size = 1.0f;        // metres (range mode default)
@@ -221,6 +494,40 @@ private:
   float df_trail_min_aspect = 5.0f;
   float df_trail_min_density = 11.0f;
   float df_refine_voxel = 0.28f;
+  // Gap-fill: when on, Process Chunk preview also flips KEPT points inside
+  // trail voxels to removed (above trail min-Z). Default OFF to match Apply
+  // path behaviour -- with it on, Preview removes more than Apply will.
+  bool  df_trail_gap_fill = false;
+
+  // Dynamic mode robustness extensions (passed through to MapCleanerFilter).
+  // Defaults preserve original behaviour. See map_cleaner.hpp for semantics.
+  int   df_vote_margin = 0;
+  int   df_min_static_votes = 1;
+  float df_min_baseline_m = 0.0f;
+  int   df_min_dynamic_cluster_size = 0;
+  float df_dynamic_cluster_voxel = 0.3f;
+  // Final-barrier Z-column ground safety. When > 0 AND df_exclude_ground_pw is
+  // on, the write-time safety check also scans each frame's local min-Z per
+  // 1 m XY column and protects any point within this tolerance from deletion.
+  // Independent of PatchWork -- catches ground that PatchWork's single-frame
+  // pass missed. Default 0.3 m. Set to 0 to disable.
+  float df_safety_z_tol_m = 0.3f;
+
+  // Cleaner mode: 0 = Voting (default, single-pass), 1 = Remove-Revert
+  // (Removert-style two-pass, AND-merge for higher precision).
+  int   df_cleaner_mode = 0;
+  float df_coarse_thresh_mult = 2.0f;  // RemoveRevert coarse range_threshold mult
+  float df_coarse_res_mult    = 2.0f;  // RemoveRevert coarse res_h/res_v mult
+
+  // Dynamic-Erasor (Data Cleaner mode 3) -- polar pseudo-occupancy dynamic
+  // removal. Defaults below match the Livox Horizon sensor preset; selecting
+  // a different preset overwrites these in-place.
+  int   df_erasor_num_rings = 30;
+  int   df_erasor_num_sectors = 108;
+  float df_erasor_max_range = 30.0f;
+  float df_erasor_min_range = 1.0f;
+  float df_erasor_ratio_threshold = 0.01f;
+  float df_erasor_v_fov_half_deg = 12.5f;  // Livox Horizon default
 
   // SOR filter params
   float sor_radius = 0.3f;             // search radius (metres)
@@ -243,24 +550,9 @@ private:
   std::vector<LivoxPreviewPoint> livox_preview_data;  // cached kept preview points for intensity toggle
   std::vector<std::string> livox_preview_frame_dirs;  // frames touched by current preview (used by "Apply filter")
 
-  // Batch processor — queue of tool-apply tasks executed sequentially with current UI defaults
-  bool show_batch_window = false;
-  int  batch_selected_tool = 0;
-  bool batch_running = false;
-  bool batch_cancel_requested = false;
-  int  batch_current_task = 0;
-  std::string batch_status;
-  enum class BatchTool {
-    SOR,
-    Range,
-    Dynamic,
-    Scalar,
-    Voxelize,
-    LivoxDelete0,
-    LivoxMark2ndReturn,
-    LivoxInterpolate,
-  };
-  std::vector<BatchTool> batch_queue;
+  // (Batch processor state lives in the upper section -- see "Batch processor
+  // (Tools -> Batch)" earlier in this header. The previous live-defaults
+  // skeleton was replaced by the snapshot-at-add framework.)
 
   // Voxelize HD tool
   bool  show_voxelize_tool = false;
@@ -353,6 +645,11 @@ private:
   float vc_interval_m = 10.0f;
   bool  vc_face_enabled[6] = { true, true, true, true, false, true };  // skip +Z (sky) by default
   int   vc_face_size = 1920;
+  // VC export filter: when on AND a COLMAP export volume has been placed,
+  // skip frames whose camera position falls outside the volume's XY footprint.
+  // Default ON so a placed volume automatically scopes the test export; the
+  // user can disable to export the full source even with a volume placed.
+  bool  vc_pcam_restrict_to_colmap_volume = true;
   float vc_context_radius_m = 60.0f;
   bool  vc_ground_only = false;
   bool  vc_render_rgb = false;
@@ -457,12 +754,17 @@ private:
   bool  ce_region_placed = false;              // has the user placed a region yet?
   std::string ce_output_dir;                   // last chosen output dir
   bool  ce_copy_images = true;                 // false = symlink
-  bool  ce_voxelized_only = true;              // HARD requirement: voxelized data only
+  // Source selection for the points3D.ply cloud. Independent toggles: export
+  // from voxelized HD, raw HD, or both concatenated. Both trimmed to the
+  // region of interest so the output size stays bounded regardless of source.
+  // Default: both ON (user picks whichever looks best downstream; dupes are
+  // tolerated for the testing phase).
+  bool  ce_export_voxelized = true;
+  bool  ce_export_hd        = true;
   float ce_overlap_margin_m = 3.0f;
   bool  ce_rotate_to_y_up = true;              // export with 3DGS-style Y-up world
   float ce_yaw_deg = 0.0f;                      // world-XY yaw of the export region (deg)
   bool  ce_undistort_images = true;             // undistort images (PINHOLE) vs raw (OPENCV)
-  bool  ce_write_bundler = false;               // also emit bundle.out (Metashape-importable)
   bool  ce_write_blocks_exchange = false;       // also emit blocks_exchange.xml (CC/Metashape/RC)
   bool  ce_use_pose_priors = true;              // master toggle for per-photo accuracy hints
   float ce_pose_pos_sigma_m = 0.05f;            // position sigma (m) for BA prior
@@ -554,6 +856,25 @@ private:
   float ac_max_residual_px = 20.0f;
   float ac_max_lever_shift_m = 1.0f;        // max delta from pre-run lever
   float ac_max_rotation_shift_deg = 15.0f;  // max delta from pre-run RPY
+
+  // Range / dataset-wide auto-calibration. Walks a frame range, runs the
+  // single-frame pipeline per frame, drops frames whose top-quality match
+  // count falls below ac_range_min_high_matches, and computes a weighted
+  // average of the surviving extrinsic proposals (Markley quaternion mean
+  // for rotation; weighted vector mean for lever arm). The result is
+  // written to ac_proposed_lever / ac_proposed_rpy + ac_has_proposed=true
+  // so the existing Apply button commits it -- no auto-apply.
+  bool  ac_range_use_all = true;             // ignore start/end, walk every located frame
+  int   ac_range_start = 0;                  // located-frame index (NOT folder index)
+  int   ac_range_end = -1;
+  int   ac_range_min_high_matches = 20;      // drop frames with fewer top-quality matches
+  bool  ac_range_running = false;            // worker active
+  bool  ac_range_cancel = false;             // user clicked Stop
+  int   ac_range_progress = 0;
+  int   ac_range_total = 0;
+  int   ac_range_accepted = 0;               // contributed to average
+  int   ac_range_skipped = 0;                // dropped (too few high matches, sanity gate, render fail, etc)
+  std::string ac_range_status;
   // Winner-mask / Weight viz cache (filled by "Compute assignment" button)
   // Anchor selection (UI-driven). When a row in the anchor table is clicked,
   // align_anchor_selected stores that index and align_anchor_selected_src the

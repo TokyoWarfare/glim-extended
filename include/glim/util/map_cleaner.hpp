@@ -25,7 +25,20 @@ namespace glim {
  */
 class MapCleanerFilter {
 public:
+  // Two cleaner modes:
+  //   Voting       -- single-pass cross-frame vote (default, current behaviour).
+  //   RemoveRevert -- two-pass remove-then-revert (Removert-style):
+  //                   coarse pass with looser threshold/resolution flags wide,
+  //                   fine pass with native params re-checks. A point is
+  //                   dynamic only if BOTH passes agree -- much higher
+  //                   precision, mildly lower recall on subtle dynamics.
+  enum class Mode { Voting = 0, RemoveRevert = 1 };
+
   struct Params {
+    Mode mode;              // see Mode enum above
+    float coarse_thresh_mult;  // RemoveRevert: range_threshold multiplier for coarse pass
+    float coarse_res_mult;     // RemoveRevert: res_h / res_v multiplier for coarse pass
+
     float fov_h;            // horizontal FOV (radians)
     float fov_v;            // vertical FOV (radians)
     float res_h;            // horizontal resolution (radians per pixel)
@@ -41,8 +54,33 @@ public:
 
     bool exclude_ground_pw; // skip ground points using PatchWork++
 
+    // ---- Robustness extensions (defaults preserve current behaviour) ----
+    // Margin between vote_dynamic and vote_static required to flag dynamic.
+    // 0 = simple majority (vote_dynamic > vote_static). Higher values demand
+    // a clear dynamic signal and resist parallax / occlusion noise.
+    int   vote_margin = 0;
+    // Require the point to have been positively observed at least this many
+    // times before letting any dynamic verdict win. Guards against single-
+    // frame range artifacts on the static side. 1 = current behaviour.
+    int   min_static_votes = 1;
+    // Minimum sensor displacement (metres) between voting frames. Forces
+    // parallax between consecutive votes -- kills "same-speed in front"
+    // failure mode where a leading car/cyclist gets static votes from every
+    // frame because it stays at the same relative position. 0 = disabled
+    // (vote every frame, current behaviour).
+    float min_baseline_m = 0.0f;
+    // After voting, cluster the dynamic-flagged points and revert clusters
+    // smaller than this back to static. Filters out single-point dynamic
+    // flags from range image noise. 0 = disabled.
+    int   min_dynamic_cluster_size = 0;
+    // Voxel size used by the post-vote clustering BFS (metres). Same scale
+    // as the trail-refine voxel; only used when min_dynamic_cluster_size > 0.
+    float dynamic_cluster_voxel = 0.3f;
+
     Params()
-      : fov_h(2.0f * M_PI), fov_v(0.524f),
+      : mode(Mode::Voting),
+        coarse_thresh_mult(2.0f), coarse_res_mult(2.0f),
+        fov_h(2.0f * M_PI), fov_v(0.524f),
         res_h(0.0028f), res_v(0.007f),
         range_threshold(0.5f), delta_h(2), delta_v(1),
         lidar_range(70.0f), submap_update_dist(10.0f),

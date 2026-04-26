@@ -71,22 +71,17 @@ struct ExportOptions {
   // symlinks are not valid (would point to distorted source), so copy_images
   // is effectively forced to true.
   bool export_undistorted = true;
-  // Also emit bundler.out alongside the COLMAP files. Bundler uses OpenGL
-  // camera convention (X right, Y up, Z back) -- we convert internally.
-  // Metashape imports Bundler directly (File -> Import Cameras... -> Bundler).
-  bool export_bundler = false;
   // Also emit blocks_exchange.xml alongside the COLMAP files. BlocksExchange
   // is Bentley ContextCapture's format, also accepted by Metashape and
   // RealityCapture. Supports full Brown-Conrady distortion (k1/k2/k3/p1/p2)
-  // unlike Bundler (k1/k2 only), so it's the better option when images are
-  // exported RAW and downstream needs the distortion model.
+  // and Spherical/equirect sources, so it's the one format that covers every
+  // source type our pipeline produces.
   bool export_blocks_exchange = false;
   // Per-photo pose-prior accuracies emitted in BlocksExchange so Metashape BA
   // stays close to the imported poses. OFF -> poses are pure initial estimates,
   // BA can drift scale/origin. ON -> BA treats poses as constrained priors,
   // nailing the block in the session's coordinate frame (key for multi-tile
-  // / aerial-LiDAR fusion with a constant offset). Bundler has no per-camera
-  // accuracy field; these values are ignored there.
+  // / aerial-LiDAR fusion with a constant offset).
   bool   emit_pose_priors    = false;
   double pose_pos_sigma_m    = 0.05;   // position sigma (metres)
   double pose_rot_sigma_deg  = 2.0;    // rotation sigma (degrees)
@@ -115,6 +110,7 @@ ExportStats write_colmap_export(
   const std::vector<ExportCameraFrame>& cameras,        // world frame
   const std::vector<PinholeIntrinsics>& intrinsics_per_source,  // one per source_idx
   const std::vector<CameraType>& camera_type_per_source,         // one per source_idx; Pinhole or Spherical
+  const std::vector<bool>& is_virtual_per_source,                 // one per source_idx; true = LiDAR-rendered anchor (tight BE <Accuracy>)
   const ExportOptions& options,
   std::string* error_msg = nullptr);
 

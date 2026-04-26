@@ -1,4 +1,5 @@
 #include <glim/util/auto_calibrate.hpp>
+#include <glim/util/map_cleaner.hpp>  // classify_ground_patchwork
 
 #include <algorithm>
 #include <cmath>
@@ -90,6 +91,18 @@ CalibrationContext build_calibration_context(
       if (sm_forward.dot(anchor_forward) < cos_thresh) continue;
     }
 
+    // Per-frame ground flag (preferred over PatchWork). load_hd_for_submap
+    // attaches "aux_ground" when ANY HD frame in the submap had its
+    // aux_ground.bin saved (Data Cleaner > Dynamic > Save ground to HD).
+    // Stored as float 0/1 per cloud point, aligned to hd->points order.
+    const float* gnd_attr = nullptr;
+    {
+      const auto it = hd->aux_attributes.find("aux_ground");
+      if (it != hd->aux_attributes.end() && it->second.first == sizeof(float)) {
+        gnd_attr = static_cast<const float*>(it->second.second);
+      }
+    }
+
     for (size_t i = 0; i < hd->size(); i++) {
       const Eigen::Vector3f wp = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
       const float dsq = (wp - anchor_pos).squaredNorm();
@@ -99,7 +112,78 @@ CalibrationContext build_calibration_context(
       if (have_normals) {
         ctx.world_normals.push_back((R_wo * Eigen::Vector3d(hd->normals[i].head<3>())).normalized().cast<float>());
       }
+      // Push ground flag *iff* at least one submap so far has carried the
+      // attribute. Mixed sessions (some submaps with aux_ground, some
+      // without) get treated as "no per-frame data" via the post-loop guard.
+      if (gnd_attr != nullptr) {
+        ctx.is_ground.push_back(gnd_attr[i] >= 0.5f ? 1 : 0);
+      } else if (!ctx.is_ground.empty()) {
+        // This submap missing aux_ground while a previous one had it ->
+        // length mismatch incoming. Mark with 0 (safest fallback: include
+        // the point if the consumer was hoping for ground filtering).
+        ctx.is_ground.push_back(0);
+      }
     }
+  }
+
+  // Per-frame ground flags from aux_ground.bin take precedence -- they're
+  // the original PatchWork verdict in the correct sensor-local frame, so
+  // they classify each point in the context the way PatchWork actually
+  // intends. The fallback below (PatchWork on the accumulated cloud) is
+  // a last-resort estimate that's known to be erratic on aggregated data
+  // because the polar discretization assumes a single sensor centre.
+  //
+  // If the per-point array we just accumulated covers the whole context
+  // (one entry per kept point) and at least one entry is ground, we're
+  // done -- skip the recomputation entirely.
+  bool have_per_frame_ground = (ctx.is_ground.size() == ctx.world_points.size())
+                                 && !ctx.is_ground.empty();
+  if (have_per_frame_ground) {
+    int n_g = 0; for (auto b : ctx.is_ground) if (b) n_g++;
+    std::cerr << "[VC] Using per-frame aux_ground.bin: "
+              << n_g << " / " << ctx.is_ground.size()
+              << " points classified as ground" << std::endl;
+  } else {
+    // Length mismatch (e.g. some submaps had aux_ground.bin and some didn't)
+    // would corrupt the rasterizer's per-point lookup -- safer to wipe and
+    // either fall back to PatchWork or leave it empty.
+    ctx.is_ground.clear();
+  }
+
+  // Optional ground classification fallback. Runs PatchWork++ on the
+  // accumulated points; output is per-point uint8 (1 = ground, 0 = otherwise).
+  // Skipped when not requested, when per-frame data already filled is_ground,
+  // or when the context is empty.
+  //
+  // PatchWork wants points in *sensor-local* frame -- it discretizes the
+  // ground plane at z = 0 and uses sensor_height as the assumed sensor
+  // mounting height. Passing world points directly lands the ground at
+  // arbitrary world-Z (wherever the road happens to be), PatchWork finds
+  // no plane, and every point gets non-ground -> entire context filtered
+  // out at the rasterizer -> blank render. Translate so the anchor sits at
+  // (0, 0, sensor_height) before classifying, then map results back 1:1.
+  if (opts.classify_ground && !have_per_frame_ground && !ctx.world_points.empty()) {
+    std::vector<Eigen::Vector3f> local_pts;
+    local_pts.reserve(ctx.world_points.size());
+    const Eigen::Vector3f shift(-anchor_pos.x(), -anchor_pos.y(),
+                                 -anchor_pos.z() + opts.patchwork_sensor_height);
+    for (const auto& p : ctx.world_points) local_pts.push_back(p + shift);
+
+    auto pw = glim::MapCleanerFilter::classify_ground_patchwork(
+      local_pts,
+      static_cast<int>(local_pts.size()),
+      opts.patchwork_sensor_height,
+      ctx.intensities);
+    ctx.is_ground.assign(pw.begin(), pw.end());
+
+    // Diagnostic: counts feed back into the VC status / log so the user can
+    // see whether classification actually returned ground (a 0/N count is
+    // the symptom of the frame-of-reference bug above).
+    int n_g = 0; for (auto b : pw) if (b) n_g++;
+    std::cerr << "[VC] PatchWork ground classification: "
+              << n_g << " / " << pw.size()
+              << " points classified as ground (sensor_h="
+              << opts.patchwork_sensor_height << ")" << std::endl;
   }
 
   return ctx;
@@ -234,7 +318,29 @@ RenderedIntensity render_intensity_image(
     }
   };
 
+  // Ground-only filter -- when on (and is_ground was populated by the
+  // context builder), points classified as non-ground are skipped before
+  // projection. Falls through cleanly when is_ground is empty (no filter).
+  const bool ground_filter_active = opts.ground_only && !ctx.is_ground.empty()
+                                     && ctx.is_ground.size() == ctx.world_points.size();
+
+  // Whether per-point RGB drives the splat colour. Requires the source mode
+  // to ask for it AND colors_rgb to be populated by the caller. Falls back
+  // to intensity when missing -- safe even if the user toggles a mode that
+  // requires data the context doesn't carry.
+  const bool use_rgb = (opts.source == RenderSource::BootstrapColorizedSplat ||
+                        opts.source == RenderSource::BootstrapColorizedDepth) &&
+                       !ctx.colors_rgb.empty() &&
+                       ctx.colors_rgb.size() == ctx.world_points.size();
+  if (use_rgb) {
+    out.image = cv::Mat::zeros(height, width, CV_8UC3);
+  }
+
   for (size_t pi = 0; pi < ctx.world_points.size(); pi++) {
+    if (ground_filter_active && !ctx.is_ground[pi]) continue;
+    // Skip points whose RGB sampling failed (off-image, masked, behind cam).
+    // Sentinel: x() < 0. Avoids leaking black splats into uncovered areas.
+    if (use_rgb && ctx.colors_rgb[pi].x() < 0.0f) continue;
     const Eigen::Vector3d p_cam = R * ctx.world_points[pi].cast<double>() + t;
     const double depth = p_cam.x();
     if (depth <= 0.2) continue;
@@ -256,19 +362,31 @@ RenderedIntensity render_intensity_image(
     const int iv = static_cast<int>(std::round(v));
     if (iu < 0 || iu >= width || iv < 0 || iv >= height) continue;
 
-    const float iv_raw = ctx.intensities[pi];
-    uint8_t val;
-    if (opts.non_linear_intensity) {
-      if (iv_raw >= ibulk) {
-        const float ti = std::clamp((iv_raw - ibulk) * inv_top_range, 0.0f, 1.0f);
-        val = static_cast<uint8_t>(250.0f + ti * 5.0f);
-      } else {
-        const float lin = std::clamp((iv_raw - imin) * inv_bulk_range, 0.0f, 1.0f);
-        val = static_cast<uint8_t>(std::pow(lin, gamma) * 250.0f);
-      }
+    // Pick the splat colour. RGB path stores BGR (OpenCV convention) so the
+    // resulting image is directly viewable / writable as a colour image
+    // without channel swaps. Intensity path keeps the existing scalar logic.
+    uint8_t val_i = 0;
+    cv::Vec3b val_bgr(0, 0, 0);
+    if (use_rgb) {
+      const auto& c = ctx.colors_rgb[pi];
+      val_bgr = cv::Vec3b(
+        static_cast<uint8_t>(std::clamp(c.z(), 0.0f, 255.0f)),  // B
+        static_cast<uint8_t>(std::clamp(c.y(), 0.0f, 255.0f)),  // G
+        static_cast<uint8_t>(std::clamp(c.x(), 0.0f, 255.0f))); // R
     } else {
-      const float lin = std::clamp((iv_raw - imin) * inv_lin_range, 0.0f, 1.0f);
-      val = static_cast<uint8_t>(lin * 255.0f);
+      const float iv_raw = ctx.intensities[pi];
+      if (opts.non_linear_intensity) {
+        if (iv_raw >= ibulk) {
+          const float ti = std::clamp((iv_raw - ibulk) * inv_top_range, 0.0f, 1.0f);
+          val_i = static_cast<uint8_t>(250.0f + ti * 5.0f);
+        } else {
+          const float lin = std::clamp((iv_raw - imin) * inv_bulk_range, 0.0f, 1.0f);
+          val_i = static_cast<uint8_t>(std::pow(lin, gamma) * 250.0f);
+        }
+      } else {
+        const float lin = std::clamp((iv_raw - imin) * inv_lin_range, 0.0f, 1.0f);
+        val_i = static_cast<uint8_t>(lin * 255.0f);
+      }
     }
 
     const int splat = splat_for(depth);
@@ -281,8 +399,84 @@ RenderedIntensity render_intensity_image(
         float& d_prev = out.depth.at<float>(y2, x2);
         if (d_prev == 0.0f || depth < d_prev) {
           d_prev = static_cast<float>(depth);
-          out.image.at<uint8_t>(y2, x2) = val;
+          if (use_rgb) out.image.at<cv::Vec3b>(y2, x2) = val_bgr;
+          else         out.image.at<uint8_t>(y2, x2) = val_i;
           out.pixel_to_point[static_cast<size_t>(y2) * width + x2] = static_cast<int>(pi);
+        }
+      }
+    }
+  }
+
+  // Depth-aware gap fill. For each empty pixel, look at neighbours within
+  // fill_max_gap_px radius and average those whose depth falls within
+  // fill_max_depth_jump_m of the local mean. Skipped when fill is disabled
+  // (gap_px <= 0). Single in-place pass: we read the input image+depth into
+  // separate buffers so writes don't influence subsequent reads (would
+  // otherwise propagate fills outward unboundedly in one pass).
+  if (opts.fill_max_gap_px > 0) {
+    const cv::Mat src_img   = out.image.clone();
+    const cv::Mat src_depth = out.depth.clone();
+    const int R_fill = std::max(1, opts.fill_max_gap_px);
+    const float dz_max = std::max(0.0f, opts.fill_max_depth_jump_m);
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        if (src_depth.at<float>(y, x) > 0.0f) continue;  // already filled
+        // Two-pass neighbourhood scan: first pick a candidate depth (the
+        // nearest non-empty pixel within the radius), then average all
+        // neighbours within dz_max of that depth. This anchors the fill on
+        // the nearest *foreground* surface so we don't spuriously bridge to
+        // a distant background just because both are within range.
+        float best_d = 0.0f; int best_d2 = INT32_MAX;
+        for (int dy = -R_fill; dy <= R_fill; dy++) {
+          const int yy = y + dy;
+          if (yy < 0 || yy >= height) continue;
+          for (int dx = -R_fill; dx <= R_fill; dx++) {
+            const int xx = x + dx;
+            if (xx < 0 || xx >= width) continue;
+            const float d = src_depth.at<float>(yy, xx);
+            if (d <= 0.0f) continue;
+            const int d2 = dx * dx + dy * dy;
+            if (d2 < best_d2) { best_d2 = d2; best_d = d; }
+          }
+        }
+        if (best_d <= 0.0f) continue;  // no neighbour found
+
+        // Now sum colour over neighbours within dz_max of the anchor depth.
+        // Weight is 1/distance^2 so closer neighbours dominate; gives a soft
+        // anti-alias on splat boundaries.
+        double w_sum = 0.0;
+        double br = 0.0, bg = 0.0, bb = 0.0;
+        double i_sum = 0.0;
+        for (int dy = -R_fill; dy <= R_fill; dy++) {
+          const int yy = y + dy;
+          if (yy < 0 || yy >= height) continue;
+          for (int dx = -R_fill; dx <= R_fill; dx++) {
+            const int xx = x + dx;
+            if (xx < 0 || xx >= width) continue;
+            const float d = src_depth.at<float>(yy, xx);
+            if (d <= 0.0f) continue;
+            if (std::abs(d - best_d) > dz_max) continue;  // depth jump kills this neighbour
+            const int d2 = dx * dx + dy * dy;
+            const double w = 1.0 / std::max(1, d2);
+            w_sum += w;
+            if (use_rgb) {
+              const cv::Vec3b& c = src_img.at<cv::Vec3b>(yy, xx);
+              bb += w * c[0]; bg += w * c[1]; br += w * c[2];
+            } else {
+              i_sum += w * src_img.at<uint8_t>(yy, xx);
+            }
+          }
+        }
+        if (w_sum <= 0.0) continue;
+        const double inv = 1.0 / w_sum;
+        out.depth.at<float>(y, x) = best_d;  // record the (estimated) depth too
+        if (use_rgb) {
+          out.image.at<cv::Vec3b>(y, x) = cv::Vec3b(
+            static_cast<uint8_t>(std::clamp(bb * inv, 0.0, 255.0)),
+            static_cast<uint8_t>(std::clamp(bg * inv, 0.0, 255.0)),
+            static_cast<uint8_t>(std::clamp(br * inv, 0.0, 255.0)));
+        } else {
+          out.image.at<uint8_t>(y, x) = static_cast<uint8_t>(std::clamp(i_sum * inv, 0.0, 255.0));
         }
       }
     }
@@ -294,7 +488,10 @@ RenderedIntensity render_intensity_image(
   // convert the colormapped RGB back to luminance so LightGlue / SIFT still
   // get a single-channel image, but with a contrast curve reshaped by the
   // colormap's non-linear hue sweep.
-  if (opts.colormap != IntensityRenderOptions::Colormap::Grayscale) {
+  // Skipped entirely when the rasterizer already produced a colour image
+  // (RGB sources): colormaps are an intensity-shaping tool, meaningless on
+  // already-coloured pixels and would corrupt them.
+  if (!use_rgb && opts.colormap != IntensityRenderOptions::Colormap::Grayscale) {
     cv::Mat gray = out.image;  // keep reference for potential inversion
     cv::Mat colored;
     switch (opts.colormap) {

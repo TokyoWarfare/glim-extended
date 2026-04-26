@@ -420,6 +420,29 @@ void build_camera_trajectory(ImageSource& src,
   }
 }
 
+int prune_nearby_located_frames(ImageSource& src, float min_dist_m) {
+  if (min_dist_m <= 0.0f) return 0;
+  const float min_dist_sq = min_dist_m * min_dist_m;
+  int removed = 0;
+  bool have_kept = false;
+  Eigen::Vector3f last_kept(0.0f, 0.0f, 0.0f);
+  // Walk in frame-index order. For time-synced sources this equals
+  // chronological; dumb-frames sources (Time Matcher back-filled) also get
+  // frames indexed in capture order, so the scan semantics line up.
+  for (auto& f : src.frames) {
+    if (!f.located) continue;
+    const Eigen::Vector3f p = f.T_world_cam.translation().cast<float>();
+    if (have_kept && (p - last_kept).squaredNorm() < min_dist_sq) {
+      f.located = false;
+      removed++;
+      continue;
+    }
+    last_kept = p;
+    have_kept = true;
+  }
+  return removed;
+}
+
 const std::vector<TimedPose>& trajectory_for(const ImageSource& src,
                                               const std::vector<TimedPose>& slam_trajectory) {
   if (src.params.locate_mode == 2 && !src.camera_trajectory.empty()) {

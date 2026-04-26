@@ -107,7 +107,7 @@ InteractiveViewer::InteractiveViewer() : logger(create_module_logger("viewer")) 
   draw_points = true;
   draw_factors = false;
   draw_spheres = true;
-  draw_coords = true;
+  draw_coords = false;
 
   min_overlap = 0.2f;
   cont_optimize = false;
@@ -811,24 +811,7 @@ void InteractiveViewer::viewer_loop() {
 
       ImGui::SameLine();
       if (ImGui::Button("Unload all")) {
-        lod_load_full_sd = false;
-        lod_load_full_hd = false;
-        loaded_hd_points = 0;
-        total_gpu_bytes = 0;
-        auto vw = guik::LightViewer::instance();
-        for (int i = 0; i < static_cast<int>(render_states.size()); i++) {
-          auto& rs = render_states[i];
-          if (i < static_cast<int>(submaps.size()) && submaps[i]) {
-            const int sid = submaps[i]->id;
-            vw->remove_drawable("submap_" + std::to_string(sid));
-            vw->remove_drawable("bbox_" + std::to_string(sid));
-            vw->remove_drawable("coord_" + std::to_string(sid));
-            vw->remove_drawable("sphere_" + std::to_string(sid));
-          }
-          rs.gpu_bytes = 0;
-          rs.hd_points = 0;
-          rs.current_lod = SubmapLOD::UNLOADED;
-        }
+        unload_all_lod();
       }
       if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Unload all point data, keep bounding boxes only.\nRe-enables distance streaming.");
@@ -1204,7 +1187,9 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
   std::vector<double> all_intensities;
   std::vector<double> all_times;  // gps_time = frame_stamp + per-point time offset
   std::vector<Eigen::Vector4d> all_normals_disk;  // populated when per-frame normals.bin exists; same filter/order as all_points
+  std::vector<float> all_ground;  // 0/1 from aux_ground.bin per frame, kept parallel to all_points
   bool any_frame_had_normals = false;
+  bool any_frame_had_ground  = false;
   const Eigen::Isometry3d T_ep = submap->T_world_origin * submap->T_origin_endpoint_L;
   const Eigen::Isometry3d T_odom0 = submap->frames.front()->T_world_imu;
 
@@ -1227,6 +1212,14 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
     std::vector<float> range(npts);
     std::vector<Eigen::Vector3f> normals_f(npts, Eigen::Vector3f::Zero());
     bool has_normals = false;
+    // aux_ground.bin -- per-frame ground flags from Dynamic filter "Save ground
+    // to HD". When present, propagated up via the returned cloud's aux_attribute
+    // so callers (notably the Virtual-Camera ground_only path) can mask
+    // non-ground points without having to recompute PatchWork on the
+    // accumulated submap (which classifies poorly because the polar
+    // discretization assumes a single sensor centre).
+    std::vector<float> frame_ground;
+    bool has_ground = false;
     { std::ifstream f(frame_dir + "/points.bin", std::ios::binary);
       if (!f) continue;
       f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * npts); }
@@ -1238,6 +1231,10 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
       if (f) f.read(reinterpret_cast<char*>(frame_times.data()), sizeof(float) * npts); }
     { std::ifstream f(frame_dir + "/normals.bin", std::ios::binary);
       if (f) { f.read(reinterpret_cast<char*>(normals_f.data()), sizeof(Eigen::Vector3f) * npts); has_normals = true; any_frame_had_normals = true; } }
+    { std::ifstream f(frame_dir + "/aux_ground.bin", std::ios::binary);
+      if (f) { frame_ground.resize(npts);
+               f.read(reinterpret_cast<char*>(frame_ground.data()), sizeof(float) * npts);
+               has_ground = true; } }
 
     // Transform to submap-local frame (NOT world frame — modal handles pose separately)
     const Eigen::Isometry3d T_w_imu = T_ep * T_odom0.inverse() * frame->T_world_imu;
@@ -1246,6 +1243,7 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
     const Eigen::Matrix3d R = T_origin_lidar.rotation();
     const Eigen::Vector3d t = T_origin_lidar.translation();
 
+    if (has_ground) any_frame_had_ground = true;
     const double frame_stamp = frame->stamp;
     for (int pi = 0; pi < npts; pi++) {
       const float r = has_range ? range[pi] : pts[pi].norm();
@@ -1262,6 +1260,13 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
           all_normals_disk.push_back(Eigen::Vector4d::Zero());  // keep parallel sizing
         }
       }
+      // Ground always accumulates (default 0 if this frame has no aux_ground.bin)
+      // so the parallel array stays the same length as all_points regardless
+      // of which frames carry the file. Whether the aux attribute is attached
+      // to the returned cloud at all is decided post-loop based on
+      // any_frame_had_ground -- avoids confusing consumers with an all-zero
+      // attribute when no frame actually had ground data.
+      all_ground.push_back(has_ground ? frame_ground[pi] : 0.0f);
     }
   }
 
@@ -1280,6 +1285,15 @@ gtsam_points::PointCloudCPU::Ptr InteractiveViewer::load_hd_for_submap(int subma
   // Add times (gps_time = frame_stamp + per-point offset)
   cloud->times_storage = std::move(all_times);
   cloud->times = cloud->times_storage.data();
+
+  // Attach aux_ground only when at least one frame actually carried the file.
+  // build_calibration_context (and any future consumer) checks for this exact
+  // attribute name and prefers it over running PatchWork on the accumulated
+  // submap, which classifies poorly because the polar discretization assumes
+  // a single sensor centre while the submap aggregates many positions.
+  if (any_frame_had_ground && all_ground.size() == all_points.size()) {
+    cloud->add_aux_attribute("aux_ground", all_ground);
+  }
 
   if (compute_covs) {
     // Compute normals and covariances using k-NN (overrides any disk normals loaded above)
@@ -1957,29 +1971,31 @@ void InteractiveViewer::run_modals() {
     new_factors.insert(factors);
     GlobalMappingCallbacks::request_to_optimize();
 
-    // Force full LOD refresh (same as "Unload all") so data re-renders at updated poses
-    if (lod_enabled) {
-      lod_load_full_sd = false;
-      lod_load_full_hd = false;
-      loaded_hd_points = 0;
-      total_gpu_bytes = 0;
-      auto vw = guik::LightViewer::instance();
-      for (int i = 0; i < static_cast<int>(render_states.size()); i++) {
-        auto& rs = render_states[i];
-        if (i < static_cast<int>(submaps.size()) && submaps[i]) {
-          const int sid = submaps[i]->id;
-          vw->remove_drawable("submap_" + std::to_string(sid));
-          vw->remove_drawable("bbox_" + std::to_string(sid));
-          vw->remove_drawable("coord_" + std::to_string(sid));
-          vw->remove_drawable("sphere_" + std::to_string(sid));
-        }
-        rs.gpu_bytes = 0;
-        rs.hd_points = 0;
-        rs.current_lod = SubmapLOD::UNLOADED;
-      }
-      logger->info("[LOD] Full unload for post-optimization refresh");
-    }
+    // Force full LOD refresh so data re-renders at updated poses.
+    if (lod_enabled) unload_all_lod();
   }
+}
+
+void InteractiveViewer::unload_all_lod() {
+  lod_load_full_sd = false;
+  lod_load_full_hd = false;
+  loaded_hd_points = 0;
+  total_gpu_bytes = 0;
+  auto vw = guik::LightViewer::instance();
+  for (int i = 0; i < static_cast<int>(render_states.size()); i++) {
+    auto& rs = render_states[i];
+    if (i < static_cast<int>(submaps.size()) && submaps[i]) {
+      const int sid = submaps[i]->id;
+      vw->remove_drawable("submap_" + std::to_string(sid));
+      vw->remove_drawable("bbox_" + std::to_string(sid));
+      vw->remove_drawable("coord_" + std::to_string(sid));
+      vw->remove_drawable("sphere_" + std::to_string(sid));
+    }
+    rs.gpu_bytes = 0;
+    rs.hd_points = 0;
+    rs.current_lod = SubmapLOD::UNLOADED;
+  }
+  logger->info("[LOD] Full unload");
 }
 
 // ---------------------------------------------------------------------------
@@ -2151,6 +2167,27 @@ void InteractiveViewer::lod_worker_task() {
             }
           }
 
+          // Read aux_visibility.bin (optional -- from Scalar-filter Apply).
+          // Points with visibility == 0 are skipped during the world-transform
+          // accumulation below so they never reach the GPU. All-1s default
+          // when the file is missing, so legacy sessions are unaffected.
+          const auto frame_vis = glim::load_hd_visibility(frame_dir, num_pts);
+
+          // Fetch the in-memory isolation sub-visibility for this frame, if
+          // the Data Isolation tool is active. When active but no entry ->
+          // frame is entirely outside the isolation volume -> hide all its
+          // points. When inactive, treat as all-visible.
+          bool frame_fully_hidden_by_iso = false;
+          const std::vector<uint8_t>* iso_mask = nullptr;
+          if (iso_subvisibility_active) {
+            const auto it = iso_subvisibility.find(frame_dir);
+            if (it == iso_subvisibility.end() || it->second.empty()) {
+              frame_fully_hidden_by_iso = true;
+            } else {
+              iso_mask = &it->second;
+            }
+          }
+
           // Compute optimized world pose for this frame
           const Eigen::Isometry3d T_world_endpoint_L = submap->T_world_origin * submap->T_origin_endpoint_L;
           const Eigen::Isometry3d T_odom_imu0 = submap->frames.front()->T_world_imu;
@@ -2160,9 +2197,17 @@ void InteractiveViewer::lod_worker_task() {
           if (lod_use_voxelized) { R = Eigen::Matrix3f::Identity(); t_vec = Eigen::Vector3f::Zero(); }
           else { R = T_world_lidar.rotation().cast<float>(); t_vec = T_world_lidar.translation().cast<float>(); }
 
-          // Transform points to world frame, filtering by min range
+          // Transform points to world frame, filtering by min range + visibility.
           constexpr float HD_MIN_RANGE = 1.5f;
+          if (frame_fully_hidden_by_iso) {
+            // Skip the whole frame -- still walks the rest of the loop bookkeeping
+            // in case any caller expects normalised behaviour, but leaves all
+            // accumulators unchanged.
+            continue;
+          }
           for (int pi = 0; pi < num_pts; pi++) {
+            if (!frame_vis.empty() && frame_vis[pi] == 0) continue;  // hidden by scalar-filter Apply
+            if (iso_mask && (*iso_mask)[pi] == 0) continue;          // hidden by Data Isolation
             const float r = frame_range.empty() ? frame_points[pi].norm() : frame_range[pi];
             if (!lod_use_voxelized && r < HD_MIN_RANGE) continue;  // skip range filter for voxelized
 
@@ -2393,16 +2438,56 @@ void InteractiveViewer::lod_worker_task() {
         const int n = submap_capture->frame->size();
         const int submap_id = submap_capture->id;
 
-        // Use the same constructor as the non-LOD path (proven to work)
-        auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(submap_capture->frame->points, n);
+        // Data-Isolation SD filter: if the tool is active and this submap has
+        // a mask, drop points outside the cylinder. Empty-mask entries mean
+        // "submap fully outside" -> skip upload entirely so the viewer has
+        // no drawable for it.
+        const std::vector<uint8_t>* iso_sd_mask = nullptr;
+        if (iso_subvisibility_active) {
+          const auto it = iso_subvisibility_sd.find(idx);
+          if (it == iso_subvisibility_sd.end() || it->second.empty()) {
+            render_states[idx].current_lod = SubmapLOD::BBOX;  // fallback -- bbox only
+            return;
+          }
+          iso_sd_mask = &it->second;
+        }
 
-        if (normal_colors_buf) {
-          cloud_buffer->add_color(*normal_colors_buf);
+        // Build filtered point array when a mask is in play. Stays zero-copy
+        // for the unmasked path; mask path is a single pass O(n) copy.
+        std::vector<Eigen::Vector4d> filtered_pts;
+        const Eigen::Vector4d* pts_ptr = submap_capture->frame->points;
+        int upload_n = n;
+        if (iso_sd_mask) {
+          filtered_pts.reserve(n);
+          for (int i = 0; i < n; i++) if ((*iso_sd_mask)[i]) filtered_pts.push_back(submap_capture->frame->points[i]);
+          upload_n = static_cast<int>(filtered_pts.size());
+          if (upload_n == 0) { render_states[idx].current_lod = SubmapLOD::BBOX; return; }
+          pts_ptr = filtered_pts.data();
+        }
+
+        auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(pts_ptr, upload_n);
+
+        if (normal_colors_buf && !normal_colors_buf->empty()) {
+          if (iso_sd_mask) {
+            std::vector<Eigen::Vector4f> filt_nc;
+            filt_nc.reserve(upload_n);
+            for (int i = 0; i < n; i++) if ((*iso_sd_mask)[i]) filt_nc.push_back((*normal_colors_buf)[i]);
+            cloud_buffer->add_color(filt_nc);
+          } else {
+            cloud_buffer->add_color(*normal_colors_buf);
+          }
         }
 
         std::string first_aux_name;
         for (const auto& [name, vals] : *aux_buffers) {
-          cloud_buffer->add_buffer(name, vals);
+          if (iso_sd_mask) {
+            std::vector<float> filt;
+            filt.reserve(upload_n);
+            for (int i = 0; i < n; i++) if ((*iso_sd_mask)[i]) filt.push_back(vals[i]);
+            cloud_buffer->add_buffer(name, filt);
+          } else {
+            cloud_buffer->add_buffer(name, vals);
+          }
           if (first_aux_name.empty()) first_aux_name = name;
         }
 

@@ -17,8 +17,8 @@
     "point_shape_circle": true,
     "point_size_metric": true,
     "point_size": 0.025,
-    "points_alpha": 0.5,
-    "factors_alpha": 0.5
+    "points_alpha": 1.0,
+    "factors_alpha": 1.0
   },
   "interactive_viewer": {
     "viewer_width": 2560,
@@ -32,7 +32,7 @@
     "point_shape_circle": true,
     "point_size_metric": true,
     "point_size": 0.025,
-    "points_alpha": 0.5,
-    "factors_alpha": 0.5
+    "points_alpha": 1.0,
+    "factors_alpha": 1.0
   }
 }

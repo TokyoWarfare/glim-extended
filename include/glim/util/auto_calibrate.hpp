@@ -20,6 +20,16 @@ struct CalibrationContext {
   std::vector<Eigen::Vector3f> world_points;
   std::vector<float>           intensities;
   std::vector<Eigen::Vector3f> world_normals;  // may be empty
+  // Optional per-point ground flags. Populated by build_calibration_context
+  // when CalibContextOptions::classify_ground is on (uses PatchWork++ on the
+  // accumulated points). Same length as world_points when present, empty
+  // otherwise -- consumers should check before indexing.
+  std::vector<uint8_t>         is_ground;
+  // Optional per-point RGB (linear 0-255). Populated by the viewer-side
+  // sampler that projects each context point into the nearest located RGB
+  // camera at render time. Same length as world_points when present, empty
+  // otherwise -- the rasterizer falls back to intensity when missing.
+  std::vector<Eigen::Vector3f> colors_rgb;
   // Anchor info for logging + directional filter
   double anchor_stamp = 0.0;
   Eigen::Vector3f anchor_forward = Eigen::Vector3f::UnitX();  // world-frame forward direction of the anchor LiDAR pose
@@ -41,6 +51,16 @@ struct CalibContextOptions {
   float max_range = 80.0f;
   // Subsample to keep the projected cloud manageable (0 = off)
   int   max_points = 500000;
+  // When true, runs PatchWork++ on the accumulated context points and stores
+  // a per-point ground flag in CalibrationContext::is_ground. Used by
+  // RenderSource consumers that want to mask non-ground points (Ground only
+  // checkbox in the Virtual Camera UI). Off by default -- adds a few-hundred
+  // millisecond classification step per context build.
+  bool  classify_ground = false;
+  // Sensor height (m) used by PatchWork; matches the value the Data Cleaner
+  // path uses in classify_ground_patchwork() calls. Roughly the LiDAR mounting
+  // height above ground; tolerates ~+/- 0.5 m before quality drops.
+  float patchwork_sensor_height = 1.7f;
 };
 
 /// Result of a rendering pass: an intensity image + per-pixel 3D lookup.
@@ -75,10 +95,64 @@ CalibrationContext build_calibration_context(
   const CalibContextOptions& opts,
   std::function<gtsam_points::PointCloudCPU::Ptr(int)> load_hd_for_submap);
 
+/// Per-point data source the rasterizer uses to colour each splat. Lives on
+/// IntensityRenderOptions so the existing single-call render path can dispatch
+/// on it without changing every call site. Modes beyond Intensity require the
+/// caller to populate the corresponding fields on CalibrationContext (e.g.
+/// colors_rgb for Bootstrap colorized) and the rasterizer falls back to
+/// Intensity when the required data is missing. The orthogonal `ground_only`
+/// flag below applies on top of any source.
+enum class RenderSource {
+  Intensity                = 0,  // Per-point intensity (current default).
+  // Two flavours of RGB virtual render -- worth A/B comparing on the same
+  // dataset before committing to one for the SfM alignment workflow.
+  // Neither requires a prior Colorize > Render pass: per-point RGB is
+  // gathered at render time by projecting each LiDAR point into the
+  // nearest located RGB camera and sampling.
+  BootstrapColorizedSplat  = 1,  // Per-point RGB splats + 2D gap fill (cheap;
+                                  //   each point gets the color from its
+                                  //   nearest RGB cam at render time, then
+                                  //   the rasterizer fills inter-splat gaps).
+  BootstrapColorizedDepth  = 2,  // Edge-aware fill of the rendered depth
+                                  //   map, then per-pixel back-project +
+                                  //   RGB sample (denser ground, more
+                                  //   pipeline cost; smoother on flat
+                                  //   surfaces because depth interpolation
+                                  //   averages out per-point Z noise).
+  ShadedDepth              = 3,  // Lambertian shading from per-vertex normals.
+};
+
 /// Tuning knobs for the intensity rasterizer. Defaults match the values the
 /// Auto-calibrate path has used historically -- callers that don't care can
 /// pass the default-constructed struct.
 struct IntensityRenderOptions {
+  // Which per-point signal drives the rasterizer. See RenderSource doc above.
+  // Modes beyond Intensity are work-in-progress and currently fall back to
+  // Intensity in the rasterizer (no crash, unchanged preview) until wired.
+  RenderSource source = RenderSource::Intensity;
+
+  // Orthogonal filter -- when true, only points classified as ground are
+  // splatted (others are skipped). Independent of `source`, so any combo
+  // works (e.g. BootstrapColorized + ground_only = "RGB-textured ground"
+  // for SfM alignment via road markings). Needs the caller to populate
+  // CalibrationContext::is_ground; falls back to "no filter" if missing.
+  bool ground_only = false;
+
+  // Image-space gap fill (used by BootstrapColorizedSplat). Pixels with
+  // no splat color get filled by averaging neighbours, *unless* the depth
+  // jump between neighbours exceeds `fill_max_depth_jump_m` (meters,
+  // along camera forward) -- this prevents bleeding across object
+  // boundaries, e.g. road -> car body, foreground -> background sky.
+  // Set fill_max_gap_px = 0 to disable filling entirely.
+  //
+  // Depth comes free from the rasterizer (RenderedIntensity::depth, CV_32F,
+  // meters). Within continuous surfaces (a road, a wall) inter-splat depth
+  // jumps are typically <2 cm; the default 0.3 m comfortably keeps fills
+  // inside one surface while killing bridges to anything in the
+  // neighbourhood.
+  int   fill_max_gap_px       = 5;     // 0 = disabled, otherwise max neighbourhood radius
+  float fill_max_depth_jump_m = 0.3f;  // skip neighbours whose depth differs by more than this
+
   // How the per-point splat radius is chosen.
   //  - Formula:    clamp(round(3 * near_depth_m / depth), min, max). Smooth 1/depth taper.
   //  - Fixed:      same splat size for every depth (fixed_splat_px).

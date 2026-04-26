@@ -106,6 +106,25 @@ protected:
   static constexpr size_t AUX_SAMPLE_CAP = 500000;
   std::unordered_map<std::string, std::vector<float>> aux_attr_samples;  // filtered (isfinite && >0) samples per attr
   std::unordered_map<std::string, Eigen::Vector2f> hd_attr_ranges;     // per-attribute min/max from HD tile uploads
+  // Non-persistent visibility layer populated by tools like Data Isolation.
+  // Combined with aux_visibility.bin via AND in the HD LOD uploader: a point
+  // renders only if BOTH masks are 1. Empty vector for a frame_dir when
+  // `iso_subvisibility_active` is true means "entire frame hidden" (the
+  // frame fell outside the isolation volume). Missing entries imply all-1s
+  // ONLY when `iso_subvisibility_active` is false.
+  std::unordered_map<std::string, std::vector<uint8_t>> iso_subvisibility;
+  bool iso_subvisibility_active = false;
+  // Per-submap SD-level isolation mask (index = submap index). Used by the
+  // SD LOD upload to filter points so SD-resolution rendering also respects
+  // the cylinder, not just HD. Populated alongside iso_subvisibility by the
+  // Data Isolation tool's Apply step.
+  std::unordered_map<int, std::vector<uint8_t>> iso_subvisibility_sd;
+
+  // Full LOD reset: remove every per-submap drawable (submap / bbox / coord /
+  // sphere), zero the GPU byte counters, set all render_states to UNLOADED.
+  // Used by Data Isolation + Scalar-filter Apply/Clear to force a complete,
+  // zombie-free re-render. Same body Memory Manager's "Unload all" uses.
+  void unload_all_lod();
   double gps_time_base;  // first gps_time seen; subtract before float cast to preserve float32 precision
 
   float coord_scale;

@@ -45,11 +45,19 @@ ExportStats write_colmap_export(
   const std::vector<ExportCameraFrame>& cameras,
   const std::vector<PinholeIntrinsics>& intrinsics_per_source,
   const std::vector<CameraType>& camera_type_per_source,
+  const std::vector<bool>& is_virtual_per_source,
   const ExportOptions& options,
   std::string* error_msg) {
   auto type_of = [&](int si) {
     return (si >= 0 && si < static_cast<int>(camera_type_per_source.size()))
       ? camera_type_per_source[si] : CameraType::Pinhole;
+  };
+  // True when the source is a virtual (LiDAR-rendered) camera. BlocksExchange
+  // <Accuracy> uses hardcoded tight sigmas for these so BA treats them as
+  // ground-truth anchors independent of the UI slider.
+  auto is_virtual = [&](int si) -> bool {
+    return (si >= 0 && si < static_cast<int>(is_virtual_per_source.size()))
+      ? is_virtual_per_source[si] : false;
   };
 
   ExportStats stats;
@@ -165,11 +173,9 @@ ExportStats write_colmap_export(
   struct UndistortMap { cv::Mat mapx, mapy; int w = 0, h = 0; bool valid = false; };
   std::vector<UndistortMap> undist_maps(intrinsics_per_source.size());
 
-  // Collected per-image camera data for optional Bundler / BlocksExchange export.
+  // Collected per-image camera data for the optional BlocksExchange export.
   // R_cv_world + t_cv_world are POST-transform (re-origin + Y-up world rotation
-  // already applied), so downstream format writers just need a frame conversion
-  // if their camera convention differs (Bundler: OpenGL). The world-space center
-  // is derived on demand as C = -R^T * t.
+  // already applied); the world-space center is derived on demand as C = -R^T * t.
   struct ExportCam {
     int source_idx;
     std::string export_name;
@@ -177,7 +183,7 @@ ExportStats write_colmap_export(
     Eigen::Vector3d t_cv_world;
   };
   std::vector<ExportCam> export_cams;
-  if (options.export_bundler || options.export_blocks_exchange) export_cams.reserve(kept_cams.size());
+  if (options.export_blocks_exchange) export_cams.reserve(kept_cams.size());
 
   int next_image_id = 0;  // 0-based to match Metashape/COLMAP convention
   for (const auto* c : kept_cams) {
@@ -208,7 +214,7 @@ ExportStats write_colmap_export(
     imgs << "\n";  // empty POINTS2D line (no feature track info for 3DGS init)
     next_image_id++;
 
-    if (options.export_bundler || options.export_blocks_exchange) {
+    if (options.export_blocks_exchange) {
       export_cams.push_back({c->source_idx, c->export_name, R_cv_world, t_cv_world});
     }
 
@@ -324,50 +330,6 @@ ExportStats write_colmap_export(
     }
     stats.points_written = kept_points.size();
   }
-  // --- Optional Bundler export (bundle.out at dataset root) ---
-  // Metashape accepts Bundler via File -> Import Cameras... -> Bundler.
-  // Bundler uses OpenGL camera convention (X right, Y up, Z back), distinct
-  // from COLMAP's OpenCV convention (X right, Y down, Z fwd). Conversion:
-  //   R_bundler = diag(1, -1, -1) * R_cv
-  //   t_bundler = diag(1, -1, -1) * t_cv
-  if (options.export_bundler) {
-    const std::string bpath = options.output_dir + "/bundle.out";
-    std::ofstream ofs(bpath);
-    if (!ofs) { seterr("failed to open bundle.out"); }
-    else {
-      const Eigen::Matrix3d R_bundler_from_cv = (Eigen::Matrix3d() <<
-        1,  0,  0,
-        0, -1,  0,
-        0,  0, -1).finished();
-      // Cameras-only export. Bundler requires a point count in the header
-      // but is fine with zero points (Metashape just loads the cameras and
-      // prompts for a separate point cloud import when needed).
-      ofs << "# Bundle file v0.3\n";
-      ofs << export_cams.size() << " " << 0 << "\n";
-      for (const auto& bc : export_cams) {
-        const auto& k = intrinsics_per_source[bc.source_idx];
-        // Bundler intrinsics: focal (single, in pixels) + k1 k2 (radial).
-        // With undistorted images we pass zero distortion, with raw images
-        // we pass the original k1/k2 (Bundler can't represent k3/p1/p2).
-        const double f = 0.5 * (k.fx + k.fy);  // assume nearly equal
-        const double k1 = options.export_undistorted ? 0.0 : k.k1;
-        const double k2 = options.export_undistorted ? 0.0 : k.k2;
-        ofs << std::setprecision(10) << f << " " << k1 << " " << k2 << "\n";
-        Eigen::Matrix3d R_b = R_bundler_from_cv * bc.R_cv_world;
-        Eigen::Vector3d t_b = R_bundler_from_cv * bc.t_cv_world;
-        for (int r = 0; r < 3; r++)
-          ofs << R_b(r, 0) << " " << R_b(r, 1) << " " << R_b(r, 2) << "\n";
-        ofs << t_b.x() << " " << t_b.y() << " " << t_b.z() << "\n";
-      }
-    }
-    // Sidecar image list that Bundler+Metashape workflow expects. export_cams
-    // is 1:1 parallel with kept_cams (pushed inside the same loop, no skips).
-    std::ofstream ilist(options.output_dir + "/bundle.out.list.txt");
-    if (ilist) {
-      for (const auto& ec : export_cams) ilist << "images/" << ec.export_name << "\n";
-    }
-  }
-
   // --- Optional BlocksExchange XML export ---
   // ContextCapture / RealityCapture / Metashape-compatible block file. Same
   // camera convention as COLMAP (world -> OpenCV camera frame), so the R/t we
@@ -459,14 +421,18 @@ ExportStats write_colmap_export(
           ofs << "              <y>" << C.y() << "</y>\n";
           ofs << "              <z>" << C.z() << "</z>\n";
           ofs << "            </Center>\n";
-          if (options.emit_pose_priors) {
-            // Position + rotation accuracy hints -- ContextCapture spec + Metashape
-            // read these as BA constraints. Same sigma for all three axes is the
-            // usual assumption when we don't have per-axis uncertainty.
+          // Position + rotation accuracy hints -- ContextCapture spec + Metashape
+          // read these as BA constraints. Virtual (LiDAR-rendered) cameras
+          // always get tight sigmas so BA locks them; real cameras honour the
+          // UI slider when pose priors are on.
+          const bool virt = is_virtual(ec.source_idx);
+          if (virt || options.emit_pose_priors) {
+            const double pos_sigma = virt ? 0.001 : options.pose_pos_sigma_m;
+            const double rot_sigma = virt ? 0.01  : options.pose_rot_sigma_deg;
             ofs << "            <Accuracy>\n";
-            ofs << "              <Horizontal>" << options.pose_pos_sigma_m << "</Horizontal>\n";
-            ofs << "              <Vertical>"   << options.pose_pos_sigma_m << "</Vertical>\n";
-            ofs << "              <Rotation>"   << options.pose_rot_sigma_deg << "</Rotation>\n";
+            ofs << "              <Horizontal>" << pos_sigma << "</Horizontal>\n";
+            ofs << "              <Vertical>"   << pos_sigma << "</Vertical>\n";
+            ofs << "              <Rotation>"   << rot_sigma << "</Rotation>\n";
             ofs << "            </Accuracy>\n";
           }
           ofs << "          </Pose>\n";

@@ -184,6 +184,11 @@ inline FrameInfo frame_info_from_meta(const std::string& frame_dir, const Eigen:
 
 /// Load a binary attribute file into a pre-allocated vector.
 /// Returns true if the file was read successfully.
+/// NOTE: Doesn't validate actual file size vs sizeof(T) * expected_count -- a
+/// mismatched file will read partial / garbage data silently. For runtime-
+/// chosen attribute names prefer `load_hd_scalar`, which dispatches on file
+/// size and handles the "fake aux" fields (gps_time, intensity, range) that
+/// aren't stored as aux_<name>.bin.
 template <typename T>
 bool load_bin(const std::string& path, std::vector<T>& out, int expected_count) {
   std::ifstream f(path, std::ios::binary);
@@ -191,6 +196,92 @@ bool load_bin(const std::string& path, std::vector<T>& out, int expected_count) 
   out.resize(expected_count);
   f.read(reinterpret_cast<char*>(out.data()), sizeof(T) * expected_count);
   return true;
+}
+
+/// Load a per-point visibility mask (1 = visible, 0 = hidden) from an HD
+/// frame directory. Returns an all-1s vector of size `num_points` when the
+/// file is missing OR the file size doesn't match -- every HD consumer can
+/// call this unconditionally and treat "no file" as "everything visible".
+/// File format: one `uint8_t` per point, stored raw (no header). Overwritten
+/// on every scalar-filter Apply; a Clear visibility wipe removes the files.
+inline std::vector<uint8_t> load_hd_visibility(const std::string& frame_dir, int num_points) {
+  std::vector<uint8_t> out(num_points, 1);
+  if (num_points <= 0) return out;
+  const std::string path = frame_dir + "/aux_visibility.bin";
+  if (!boost::filesystem::exists(path)) return out;
+  if (boost::filesystem::file_size(path) != static_cast<uintmax_t>(num_points)) return out;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return out;
+  f.read(reinterpret_cast<char*>(out.data()), num_points);
+  return out;
+}
+
+/// Write a per-point visibility mask. Overwrites. Returns false on I/O fail.
+inline bool write_hd_visibility(const std::string& frame_dir, const std::vector<uint8_t>& vis) {
+  std::ofstream f(frame_dir + "/aux_visibility.bin", std::ios::binary);
+  if (!f) return false;
+  f.write(reinterpret_cast<const char*>(vis.data()), vis.size());
+  return static_cast<bool>(f);
+}
+
+/// Load a per-point scalar from an HD frame directory by attribute name.
+/// Handles the "fake aux" fields that the UI lists alongside real aux files
+/// but which aren't stored as aux_<name>.bin:
+///   - "intensity" -> intensities.bin (float per point)
+///   - "range"     -> range.bin       (float per point)
+///   - "gps_time"  -> times.bin (float per-point offset) + frame_stamp - base
+/// Real aux fields dispatch by on-disk file size to avoid the float-vs-double
+/// garbage-read trap `load_bin` has.
+///
+/// Returns a vector of size `num_points` on success, empty on failure (file
+/// missing or size doesn't match sizeof(float)*n nor sizeof(double)*n).
+/// Designed for tools whose attribute name isn't known at compile time
+/// (scalar filter, any future "pick a scalar" UI). Tools that load a known
+/// file can keep using `load_bin` directly.
+inline std::vector<float> load_hd_scalar(
+  const std::string& frame_dir,
+  const std::string& attr_name,
+  double frame_stamp,
+  double base,
+  int num_points) {
+  std::vector<float> out;
+  if (num_points <= 0) return out;
+
+  if (attr_name == "intensity") {
+    if (!load_bin(frame_dir + "/intensities.bin", out, num_points)) out.clear();
+    return out;
+  }
+  if (attr_name == "range") {
+    if (!load_bin(frame_dir + "/range.bin", out, num_points)) out.clear();
+    return out;
+  }
+  if (attr_name == "gps_time") {
+    // Per-point offset + frame stamp; no aux_gps_time.bin on HD frames.
+    std::vector<float> offsets(num_points, 0.0f);
+    std::ifstream tf(frame_dir + "/times.bin", std::ios::binary);
+    if (!tf) return out;  // empty -> caller knows
+    tf.read(reinterpret_cast<char*>(offsets.data()), sizeof(float) * num_points);
+    out.resize(num_points);
+    const double base_offset = frame_stamp - base;
+    for (int i = 0; i < num_points; i++) out[i] = static_cast<float>(base_offset) + offsets[i];
+    return out;
+  }
+
+  // Real aux: dispatch on actual file size.
+  const std::string ap = frame_dir + "/aux_" + attr_name + ".bin";
+  if (!boost::filesystem::exists(ap)) return out;
+  const auto fsize = boost::filesystem::file_size(ap);
+  if (fsize == sizeof(float) * static_cast<size_t>(num_points)) {
+    if (!load_bin(ap, out, num_points)) out.clear();
+  } else if (fsize == sizeof(double) * static_cast<size_t>(num_points)) {
+    std::vector<double> dbuf;
+    if (load_bin(ap, dbuf, num_points)) {
+      out.resize(num_points);
+      for (int i = 0; i < num_points; i++) out[i] = static_cast<float>(dbuf[i] - base);
+    }
+  }
+  // else: file exists but size matches neither float nor double -> leave empty.
+  return out;
 }
 
 /// Filter and rewrite a binary attribute file, keeping only specified indices.

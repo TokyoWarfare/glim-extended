@@ -236,6 +236,24 @@ struct ImageSource {
   // Kept out of the JSON serialiser because it's fully derivable from EXIF +
   // datum and would bloat configs with redundant data.
   std::vector<TimedPose> camera_trajectory;
+  // Virtual camera marker. Set when the source was produced by our Virtual
+  // Camera export and reloaded via the manifest short-circuit: intrinsics +
+  // every frame's T_world_cam are known exactly (the camera IS the LiDAR
+  // rig). BlocksExchange overrides <Accuracy> to very tight sigmas for these
+  // so SFM/BA treats them as ground-truth anchors.
+  bool is_virtual = false;
+  // Kind of virtual source (only meaningful when is_virtual == true):
+  //   "pinhole"       -- virtual pinhole rendered at a real pinhole source's pose.
+  //   "pinhole_face"  -- cube face sliced from a real spherical source.
+  //   "spherical"     -- reserved; equirect virtual render (not emitted yet).
+  // Cosmetic for now; feeds the source dropdown's "(Virtual, <kind>)" suffix.
+  std::string virtual_kind;
+  // Minimum spacing between consecutive located cameras, in metres. When >0,
+  // `prune_nearby_located_frames` un-locates any frame whose world position
+  // sits closer than this to the previously kept one (chronological scan).
+  // Purpose: strip the stop-light clumps that otherwise flood SFM with
+  // co-located cameras and wreck tie-point density. 0 = feature off.
+  float min_cam_spacing_m = 0.0f;
   // Time Matcher anchor state -- persisted so dumb-frames sources (no EXIF
   // timestamps) keep their back-filled timestamps across session reloads.
   // A value of tm_anchor1_idx >= 0 means this source has been matched and its
@@ -277,6 +295,14 @@ void build_camera_trajectory(ImageSource& src,
                               double easting_origin,
                               double northing_origin,
                               double alt_origin);
+
+/// Un-locate every located camera frame whose world position sits closer than
+/// `min_dist_m` to the previously kept located frame (chronological scan via
+/// frame index). Returns the number of frames demoted. No-op when
+/// `min_dist_m <= 0`. Applied after Locate in the Colorize window; also safe
+/// to call from the COLMAP / BlocksExchange exporter at trim-time if the
+/// user ever wants a second, export-side filter.
+int prune_nearby_located_frames(ImageSource& src, float min_dist_m);
 
 /// Return the trajectory the given source should place itself on. Routes to
 /// src.camera_trajectory when locate_mode == 2 and the alt trajectory is
