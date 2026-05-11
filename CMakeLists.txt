@@ -31,6 +31,33 @@ find_package(spdlog REQUIRED)
 
 if(BUILD_WITH_VIEWER)
   find_package(Iridescence REQUIRED)
+  # exiv2 lookup -- two-phase:
+  #   1. Try find_package(exiv2 CONFIG) with the standard search path PLUS
+  #      a hint at the Debian/Ubuntu system location. Works on host
+  #      builds where /usr is on CMake's default search path.
+  #   2. Fall back to a hand-built IMPORTED target pointing at the
+  #      system libexiv2.so + /usr/include. Required under the project's
+  #      conda runtime, which scrubs /usr from CMake's path entirely
+  #      (sysroot redirect) so find_package can't see the .cmake config
+  #      even when we pass exiv2_DIR.
+  if(EXISTS "/usr/lib/x86_64-linux-gnu/cmake/exiv2/exiv2Config.cmake")
+    list(APPEND CMAKE_PREFIX_PATH "/usr/lib/x86_64-linux-gnu/cmake/exiv2")
+  endif()
+  find_package(exiv2 QUIET CONFIG)
+  if(NOT TARGET exiv2lib)
+    if(EXISTS "/usr/include/exiv2/exiv2.hpp" AND EXISTS "/usr/lib/x86_64-linux-gnu/libexiv2.so")
+      message(STATUS "exiv2: find_package failed (conda env?), using system fallback at /usr")
+      add_library(exiv2lib SHARED IMPORTED)
+      set_target_properties(exiv2lib PROPERTIES
+        IMPORTED_LOCATION             "/usr/lib/x86_64-linux-gnu/libexiv2.so"
+        INTERFACE_INCLUDE_DIRECTORIES "/usr/include"
+      )
+    else()
+      message(FATAL_ERROR
+        "exiv2 not found via find_package and no /usr/include/exiv2 fallback. "
+        "Install libexiv2-dev (Debian/Ubuntu) or set exiv2_DIR/CMAKE_PREFIX_PATH.")
+    endif()
+  endif()
 endif()
 
 if(BUILD_WITH_OPENCV)
@@ -180,8 +207,16 @@ if(BUILD_WITH_VIEWER)
     src/glim/util/image_viewport.cpp
   )
   target_link_libraries(interactive_viewer
-    glim
-    exif
+    PUBLIC
+      glim
+      exif
+    PRIVATE
+      exiv2lib  # SFM-export EXIF/XMP write (Metashape target uses GPS + datetime).
+                # PRIVATE because consumers (glim_ros2's offline_viewer) only
+                # link interactive_viewer for plugin availability; they don't
+                # need exiv2's symbols. Using the imported CMake target name
+                # (from find_package(exiv2)) carries proper include dirs so
+                # conda-isolated toolchains can find <exiv2/exiv2.hpp>.
   )
 
   # Map editor

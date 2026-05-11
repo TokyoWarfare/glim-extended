@@ -18,6 +18,7 @@
 namespace guik {
 class ProgressModal;
 class ProgressInterface;
+class ModelControl;
 }  // namespace guik
 
 namespace glim {
@@ -136,6 +137,14 @@ private:
   // Colorizer::interpolate_pose / locate_by_time. Previously inlined ~9x across
   // the Colorize menu, Apply paths, alignment checker and Time Matcher.
   std::vector<TimedPose> timed_traj_snapshot() const;
+
+  // Per-submap aux_rgb.bin loader for the build_calibration_context()
+  // `load_hd_aux_rgb_for_submap` callback. Mirrors load_hd_for_submap's
+  // per-frame iteration + 1.5 m range filter so the returned RGB vector is
+  // parallel to the cloud's point order. Used by the virtual-camera path
+  // (both per-RGB-camera and along-trajectory) to enable NativeRGB
+  // rendering from per-point aux_rgb.bin without camera projection.
+  std::function<std::vector<Eigen::Vector3f>(int)> make_aux_rgb_loader();
 
   // Snapshot of all current Colorize-window state into a BlendParams struct.
   // Called from every colorize site to avoid the 20-line duplicated initializer
@@ -566,6 +575,11 @@ private:
   bool  vox_ground_only = false;       // ground-only mode: 1 point per XY cell (requires aux_ground.bin)
   bool  vox_include_intensity = true;  // load + write intensities.bin per voxel
   bool  vox_include_rgb = true;        // load + write aux_rgb.bin per voxel (when source aux_rgb.bin exists)
+  // Per-voxel normals: average the unit normals of contributing points and
+  // re-normalize. Same aggregation pattern as RGB/intensity. When disabled,
+  // no normals.bin is written. When enabled, falls through to zero-vector
+  // for voxels whose source frames lacked normals.bin.
+  bool  vox_include_normals = true;
   bool  lod_use_voxelized = false;     // LOD checkbox: load from hd_frames_voxelized/
 
   // Cached preview data (kept in CPU memory for range highlight re-coloring)
@@ -654,6 +668,20 @@ private:
   bool  vc_ground_only = false;
   bool  vc_render_rgb = false;
   bool  vc_embed_exif_gps = true;
+  // Trajectory-mode camera type: 0 = Pinhole (single image per anchor at
+  // vc_traj_pinhole_w x vc_traj_pinhole_h), 1 = 360° Cubemap (6-face split,
+  // uses vc_face_enabled + vc_face_size). Independent of any source's
+  // camera_type since trajectory mode has no source.
+  int   vc_traj_camera_type = 1;          // default cubemap
+  int   vc_traj_pinhole_w   = 1920;
+  int   vc_traj_pinhole_h   = 1080;
+  double vc_traj_pinhole_hfov_deg = 90.0;  // horizontal FoV for pinhole render
+  // Trajectory-mode preview navigation: current anchor index + dirty flag.
+  // Slider/arrows walk through anchors; the thumbnail re-renders when dirty.
+  int  vc_traj_preview_idx   = 0;
+  bool vc_traj_preview_dirty = true;
+  cv::Mat vc_traj_preview_image;          // last rendered thumbnail
+  unsigned int vc_traj_preview_tex = 0;   // GL texture id for thumbnail
   // State
   bool  vc_running = false;
   std::string vc_status;
@@ -759,16 +787,88 @@ private:
   // region of interest so the output size stays bounded regardless of source.
   // Default: both ON (user picks whichever looks best downstream; dupes are
   // tolerated for the testing phase).
-  bool  ce_export_voxelized = true;
+  bool  ce_export_voxelized = false;  // default OFF: HD meshes better; flip on for 3DGS init
   bool  ce_export_hd        = true;
+  // Per-cloud field toggles. Default ON for everything; user can drop columns
+  // to keep PLY size down or because a downstream tool doesn't read them.
+  // Voxelized normals usually missing on disk (Voxelize panel doesn't yet
+  // emit normals.bin) -- if ON the writer ships zero-vectors, harmless.
+  bool  ce_export_hd_color      = true;
+  bool  ce_export_hd_intensity  = true;
+  bool  ce_export_hd_normal     = true;
+  bool  ce_export_vox_color     = true;
+  bool  ce_export_vox_intensity = true;
+  bool  ce_export_vox_normal    = true;
   float ce_overlap_margin_m = 3.0f;
-  bool  ce_rotate_to_y_up = true;              // export with 3DGS-style Y-up world
+  // Default OFF since Reality Scan (the default target) handles Z-up world
+  // natively. target_changed flips it on for COLMAP / BlocksExchange.
+  bool  ce_rotate_to_y_up = false;             // export with 3DGS-style Y-up world
   float ce_yaw_deg = 0.0f;                      // world-XY yaw of the export region (deg)
+  // 3D gizmo for the export region. TX | TY | RZ -- drag handles in the
+  // viewport for translating the cube in XY and rotating its yaw, both
+  // wired bidirectionally with the DragFloat widgets in the SFM panel.
+  // Lazily constructed on first use so we don't pull in ImGuizmo at
+  // ctor time (matches source_finder_gizmo's pattern in interactive_viewer).
+  std::unique_ptr<guik::ModelControl> ce_region_gizmo;
   bool  ce_undistort_images = true;             // undistort images (PINHOLE) vs raw (OPENCV)
-  bool  ce_write_blocks_exchange = false;       // also emit blocks_exchange.xml (CC/Metashape/RC)
+  // SFM target = single 4-way radio in the SFM Export panel. Each value
+  // is a complete export specification (folder structure + mask naming +
+  // bundle files). emit_colmap and export_blocks_exchange are NOT
+  // separate UI toggles -- they're derived from this enum at worker-
+  // launch time. To get a different format, re-run the export.
+  //   0 = COLMAP / 3DGS         (cameras.txt + images.txt + sparse/0/...)
+  //   1 = Reality Scan          (.geometry/ + .mask/ + point_cloud/)
+  //   2 = Metashape             (images/ + masks/<stem>_mask.png + point_cloud/)
+  //   3 = BlocksExchange        (blocks_exchange.xml + images/ + masks/ + point_cloud/)
+  // Default: Reality Scan -- the most-promising path for our LiDAR-anchored
+  // SFM workflow per current testing.
+  int   ce_target_layout         = 1;
+  // Per-image metadata channels (orthogonal to target_layout). UI Metadata
+  // section toggles these directly; target_changed sets sensible defaults
+  // (XMP on for RS, EXIF on for Metashape; both off for COLMAP / BE) but
+  // user can override for testing (e.g. RS layout + EXIF on to see what RS
+  // does when both XMP and EXIF are present).
+  bool  ce_emit_exif_gps         = false;
+  // Default ON (RS is the default target -- XMP is its primary pose-prior
+  // channel). target_changed handler keeps this in sync when the user
+  // switches targets.
+  bool  ce_emit_xmp_sidecar      = true;
+  // Full UTM mode -- when on (and session has a GNSS datum loaded),
+  // every exported world coord (PLY points, camera positions in
+  // images.txt / BE / XMP) gets the datum's UTM origin added in.
+  // Result: real-world UTM eastings/northings, matching EXIF GPS
+  // lat/lon. Required for Metashape / RealityScan georef workflows
+  // where camera GPS must match the LiDAR cloud's frame. Default:
+  // ON for everything except COLMAP/3DGS (which prefers small
+  // numbers near origin for float precision).
+  // Default ON since RS / Metashape / BE want real-world coords; flipped
+  // off by target_changed for COLMAP/3DGS.
+  bool  ce_full_utm              = true;
+  // Single shared mask per source instead of per-image. Sensible default
+  // for Metashape / BE workflows where masks are static (rig hardware,
+  // no per-frame YOLO segmentation). Off otherwise -- per-image masks are
+  // the right semantic for RS XMP and any future learned-mask flows.
+  bool  ce_single_mask           = false;
+  // Flight log CSV alongside the export. Reality Scan imports this via
+  // Workflow > Trajectory and uses it as a pose-prior source -- a fallback
+  // when XMP sidecars are not auto-detected. Format: `# name lon lat alt`
+  // header + one row per kept camera. Skipped silently when no GNSS datum.
+  // Default ON for RS target (set by target_changed); off otherwise.
+  bool  ce_emit_flight_log       = true;
+  // Header-only points3D.txt for the RS-via-COLMAP SLAM workflow. RS's
+  // tutorial says to wipe the points from points3D.txt before opening the
+  // COLMAP scene; an unwiped file surfaces as "file not found" in RS. We
+  // write it header-only when this is on. Default OFF (normal COLMAP /
+  // 3DGS exports want the points for sparse init).
+  bool  ce_points3d_header_only  = false;
   bool  ce_use_pose_priors = true;              // master toggle for per-photo accuracy hints
-  float ce_pose_pos_sigma_m = 0.05f;            // position sigma (m) for BA prior
-  float ce_pose_rot_sigma_deg = 2.0f;           // rotation sigma (deg) for BA prior
+  // 1-sigma pose uncertainties exported to RS (flight log accuracy columns) and
+  // Metashape BE (<Accuracy> tags). Loose by default (1m / 5deg) -- handheld
+  // SLAM has cm-to-dm drift over a session, but BA needs room to refine
+  // against feature matches; tight priors freeze cameras and prevent re-
+  // alignment when the LiDAR-prior and image-feature solutions disagree.
+  float ce_pose_pos_sigma_m = 1.0f;             // position sigma (m) for BA prior
+  float ce_pose_rot_sigma_deg = 5.0f;           // rotation sigma (deg) for BA prior
   bool  ce_running = false;
   std::string ce_status;
   // Last export summary

@@ -51,7 +51,9 @@
 #include <glk/io/ply_io.hpp>
 #include <guik/recent_files.hpp>
 #include <guik/progress_modal.hpp>
+#include <guik/model_control.hpp>
 #include <guik/viewer/light_viewer.hpp>
+#include <ImGuizmo.h>
 
 namespace glim {
 
@@ -2307,6 +2309,7 @@ std::string OfflineViewer::batch_snapshot_voxelize_hd() {
   p["ground_only"]       = vox_ground_only;
   p["include_intensity"] = vox_include_intensity;
   p["include_rgb"]       = vox_include_rgb;
+  p["include_normals"]   = vox_include_normals;
   return p.dump();
 }
 
@@ -2320,6 +2323,7 @@ void OfflineViewer::batch_prefill_voxelize_hd(const std::string& params_json) {
   vox_ground_only       = p.value("ground_only",       vox_ground_only);
   vox_include_intensity = p.value("include_intensity", vox_include_intensity);
   vox_include_rgb       = p.value("include_rgb",       vox_include_rgb);
+  vox_include_normals   = p.value("include_normals",   vox_include_normals);
 }
 
 void OfflineViewer::batch_prefill_dynamic(const std::string& params_json) {
@@ -3373,6 +3377,8 @@ bool OfflineViewer::run_voxelize_hd(const std::string& params_json, std::string&
     std::vector<float> ranges;
     std::vector<Eigen::Vector3f> rgbs;
     std::vector<uint8_t> rgb_present;
+    std::vector<Eigen::Vector3f> normals;        // averaged unit normal per voxel
+    std::vector<uint8_t> normals_present;        // 1 if any contributing point carried a normal
   };
   std::unordered_map<std::string, FrameOutput> frame_outputs;
   for (const auto& fi : all_frames) frame_outputs[fi.dir] = {};
@@ -3385,7 +3391,9 @@ bool OfflineViewer::run_voxelize_hd(const std::string& params_json, std::string&
     std::vector<float> intensities;
     std::vector<float> ranges;
     std::vector<Eigen::Vector3f> rgbs;
+    std::vector<Eigen::Vector3f> normals;  // world-frame unit normals (1:1 with world_pts)
     bool has_rgb = false;
+    bool has_normals = false;
     std::string dir;
   };
   std::unordered_map<std::string, std::shared_ptr<CachedFrame>> frame_cache;
@@ -3428,9 +3436,24 @@ bool OfflineViewer::run_voxelize_hd(const std::string& params_json, std::string&
         if (rgbf) { rgbf.read(reinterpret_cast<char*>(rgbs.data()), sizeof(Eigen::Vector3f) * fi->num_points); frame_has_rgb = static_cast<bool>(rgbf); }
         if (!frame_has_rgb) rgbs.clear();
       }
+      // Normals: per-point unit vectors from normals.bin. Loaded in the
+      // sensor-local frame and rotated to world when accumulating below.
+      // Same opt-in semantics as RGB -- only loaded when the toggle is on
+      // and the file exists.
+      std::vector<Eigen::Vector3f> nors;
+      bool frame_has_normals = false;
+      if (vox_include_normals && boost::filesystem::exists(fi->dir + "/normals.bin")) {
+        nors.resize(fi->num_points, Eigen::Vector3f::Zero());
+        std::ifstream nf(fi->dir + "/normals.bin", std::ios::binary);
+        if (nf) { nf.read(reinterpret_cast<char*>(nors.data()), sizeof(Eigen::Vector3f) * fi->num_points); frame_has_normals = static_cast<bool>(nf); }
+        if (!frame_has_normals) nors.clear();
+      }
       const Eigen::Matrix3f R = fi->T_world_lidar.rotation().cast<float>();
       const Eigen::Vector3f t = fi->T_world_lidar.translation().cast<float>();
-      auto cf = std::make_shared<CachedFrame>(); cf->dir = fi->dir; cf->has_rgb = frame_has_rgb;
+      auto cf = std::make_shared<CachedFrame>();
+      cf->dir = fi->dir;
+      cf->has_rgb = frame_has_rgb;
+      cf->has_normals = frame_has_normals;
       for (int i = 0; i < fi->num_points; i++) {
         if (!rng.empty() && rng[i] < 1.5f) continue;
         if (ground_only && (ground.empty() || ground[i] < 0.5f)) continue;
@@ -3438,11 +3461,18 @@ bool OfflineViewer::run_voxelize_hd(const std::string& params_json, std::string&
         cf->intensities.push_back(ints[i]);
         cf->ranges.push_back(rng.empty() ? 0.0f : rng[i]);
         if (frame_has_rgb) cf->rgbs.push_back(rgbs[i]);
+        if (frame_has_normals) cf->normals.push_back((R * nors[i]).normalized());
       }
       frame_cache[fi->dir] = cf;
     }
 
-    struct VoxPt { Eigen::Vector3f wp; float intensity; float range; Eigen::Vector3f rgb; bool has_rgb; std::string dir; };
+    struct VoxPt {
+      Eigen::Vector3f wp;
+      float intensity; float range;
+      Eigen::Vector3f rgb; bool has_rgb;
+      Eigen::Vector3f normal; bool has_normal;
+      std::string dir;
+    };
     std::unordered_map<uint64_t, std::vector<VoxPt>> voxels;
     for (const auto* fi : chunk_frame_infos) {
       auto it = frame_cache.find(fi->dir);
@@ -3460,6 +3490,8 @@ bool OfflineViewer::run_voxelize_hd(const std::string& params_json, std::string&
         vp.range = cf->ranges[i];
         vp.has_rgb = cf->has_rgb;
         vp.rgb = cf->has_rgb ? cf->rgbs[i] : Eigen::Vector3f::Zero();
+        vp.has_normal = cf->has_normals;
+        vp.normal = cf->has_normals ? cf->normals[i] : Eigen::Vector3f::Zero();
         vp.dir = cf->dir;
         voxels[key].push_back(std::move(vp));
       }
@@ -3496,20 +3528,33 @@ bool OfflineViewer::run_voxelize_hd(const std::string& params_json, std::string&
       }
       if (!core.contains(pos)) continue;
       float avg_int = 0.0f, avg_rng = 0.0f;
-      Eigen::Vector3f avg_rgb = Eigen::Vector3f::Zero();
+      Eigen::Vector3f avg_rgb    = Eigen::Vector3f::Zero();
+      Eigen::Vector3f normal_sum = Eigen::Vector3f::Zero();
       int rgb_n = 0;
+      int normal_n = 0;
       for (const auto& p : pts_in_voxel) {
         avg_int += p.intensity; avg_rng += p.range;
-        if (p.has_rgb) { avg_rgb += p.rgb; rgb_n++; }
+        if (p.has_rgb)    { avg_rgb    += p.rgb;    rgb_n++; }
+        if (p.has_normal) { normal_sum += p.normal; normal_n++; }
       }
       avg_int /= pts_in_voxel.size(); avg_rng /= pts_in_voxel.size();
       if (rgb_n > 0) avg_rgb /= static_cast<float>(rgb_n);
+      // Per-voxel normal = sum-then-normalize. Mathematically valid for
+      // points on a continuous surface; on sharp edges the average is wrong
+      // but that's the same caveat as RGB / intensity averaging in the
+      // same voxel.
+      Eigen::Vector3f avg_normal = Eigen::Vector3f::Zero();
+      if (normal_n > 0 && normal_sum.squaredNorm() > 1e-12f) {
+        avg_normal = normal_sum.normalized();
+      }
       const std::string& target_dir = contributing_dirs[voxel_idx % contributing_dirs.size()];
       frame_outputs[target_dir].points.push_back(pos);
       frame_outputs[target_dir].intensities.push_back(avg_int);
       frame_outputs[target_dir].ranges.push_back(avg_rng);
       frame_outputs[target_dir].rgbs.push_back(avg_rgb);
       frame_outputs[target_dir].rgb_present.push_back(rgb_n > 0 ? 1 : 0);
+      frame_outputs[target_dir].normals.push_back(avg_normal);
+      frame_outputs[target_dir].normals_present.push_back(normal_n > 0 ? 1 : 0);
       voxel_idx++;
       total_voxels++;
     }
@@ -3537,6 +3582,14 @@ bool OfflineViewer::run_voxelize_hd(const std::string& params_json, std::string&
       if (any_rgb) {
         std::ofstream f(out_dir + "/aux_rgb.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(output.rgbs.data()), sizeof(Eigen::Vector3f) * n);
+      }
+    }
+    if (vox_include_normals) {
+      bool any_normal = false;
+      for (uint8_t v : output.normals_present) if (v) { any_normal = true; break; }
+      if (any_normal) {
+        std::ofstream f(out_dir + "/normals.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(output.normals.data()), sizeof(Eigen::Vector3f) * n);
       }
     }
     { std::ofstream ofs(out_dir + "/frame_meta.json");
@@ -3749,9 +3802,12 @@ bool OfflineViewer::run_virtual_cameras(const std::string& params_json, std::str
       if (!c.located) continue;
       const Eigen::Vector3f apos = c.T_world_cam.translation().cast<float>();
       const Eigen::Vector3f afwd = c.T_world_cam.rotation().col(0).cast<float>().normalized();
+      auto rgb_loader = (vc_pcam_render_opts.source == RenderSource::NativeRGB)
+                          ? make_aux_rgb_loader() : nullptr;
       CalibrationContext ctx = build_calibration_context(
         submaps, batch_timed_traj, c.timestamp, apos, afwd,
-        vc_pcam_ctx_opts, [this](int sm) { return load_hd_for_submap(sm, false); });
+        vc_pcam_ctx_opts, [this](int sm) { return load_hd_for_submap(sm, false); },
+        rgb_loader);
       for (int face : faces_to_render) {
         if (batch_cancel.load() || vc_pcam_cancel) { error_out = "cancelled"; return false; }
         cv::Mat img;
@@ -4401,6 +4457,73 @@ std::vector<TimedPose> OfflineViewer::timed_traj_snapshot() const {
   return snap;
 }
 
+// Build a per-submap aux_rgb.bin loader that returns RGB parallel to
+// load_hd_for_submap's point order (same per-frame iteration, same
+// HD_MIN_RANGE=1.5 m filter). Caller passes the returned function as the
+// optional second loader of build_calibration_context() so ctx.colors_rgb
+// gets populated for NativeRGB renders.
+//
+// IMPORTANT unit conversion: aux_rgb.bin stores RGB in [0..1] (writer:
+// ColorizeResult::colors is doc'd "RGB [0-1]"). The auto_calibrate.cpp
+// rasterizer expects [0..255] because it splats values straight to
+// cv::Vec3b via static_cast<uint8_t>(clamp(c, 0, 255)). The loader scales
+// by 255 here -- without it every splat clamps to ~0 and renders black.
+// (Symptom: NativeRGB selected, render fires but image is all black.)
+//
+// Sentinel (-1, 0, 0) marks points from frames that had no aux_rgb.bin;
+// the rasterizer skips those via `if (use_rgb && c.x() < 0) continue;`.
+std::function<std::vector<Eigen::Vector3f>(int)> OfflineViewer::make_aux_rgb_loader() {
+  return [this](int sm_idx) -> std::vector<Eigen::Vector3f> {
+    std::vector<Eigen::Vector3f> out;
+    if (sm_idx < 0 || sm_idx >= static_cast<int>(submaps.size()) || !submaps[sm_idx]) return out;
+    const auto& submap = submaps[sm_idx];
+    const auto hd_it = session_hd_paths.find(submap->session_id);
+    if (hd_it == session_hd_paths.end()) return out;
+    bool any_rgb = false;
+    for (const auto& frame : submap->frames) {
+      char dn[16]; std::snprintf(dn, sizeof(dn), "%08ld", frame->id);
+      const std::string fd = hd_it->second + "/" + dn;
+      const std::string mp = fd + "/frame_meta.json";
+      if (!boost::filesystem::exists(mp)) continue;
+      std::ifstream mi(mp);
+      const auto m = nlohmann::json::parse(mi, nullptr, false);
+      if (m.is_discarded()) continue;
+      const int np = m.value("num_points", 0);
+      if (np == 0) continue;
+      std::vector<Eigen::Vector3f> pts(np), rgb(np, Eigen::Vector3f::Zero());
+      std::vector<float> range(np);
+      bool hr = false, hc = false;
+      { std::ifstream f(fd + "/points.bin", std::ios::binary);
+        if (!f) continue;
+        f.read(reinterpret_cast<char*>(pts.data()), sizeof(Eigen::Vector3f) * np); }
+      { std::ifstream f(fd + "/range.bin", std::ios::binary);
+        if (f) { f.read(reinterpret_cast<char*>(range.data()), sizeof(float) * np); hr = true; } }
+      { std::ifstream f(fd + "/aux_rgb.bin", std::ios::binary);
+        if (f) { f.read(reinterpret_cast<char*>(rgb.data()), sizeof(Eigen::Vector3f) * np);
+                 hc = true; any_rgb = true; } }
+      // Match load_hd_for_submap's HD_MIN_RANGE = 1.5 filter so the returned
+      // RGB array is parallel to the cloud's point order.
+      // aux_rgb.bin stores RGB in [0..1] (ColorizeResult convention); the
+      // rasterizer (auto_calibrate.cpp) expects ctx.colors_rgb in [0..255]
+      // because it splats colours straight to cv::Vec3b. Scale here so
+      // existing sample_per_point_rgb_from_camera (already 0..255) and our
+      // path agree on units -- otherwise every splat clamps to ~0 = black.
+      for (int pi = 0; pi < np; pi++) {
+        const float r = hr ? range[pi] : pts[pi].norm();
+        if (r < 1.5f) continue;
+        if (hc) {
+          const auto& c = rgb[pi];
+          out.push_back(Eigen::Vector3f(c.x() * 255.0f, c.y() * 255.0f, c.z() * 255.0f));
+        } else {
+          out.push_back(Eigen::Vector3f(-1.0f, 0.0f, 0.0f));
+        }
+      }
+    }
+    if (!any_rgb) out.clear();
+    return out;
+  };
+}
+
 void OfflineViewer::ensure_prefectures_loaded() {
   if (prefectures_loaded) return;
   prefectures_loaded = true;  // mark even on failure to avoid retrying
@@ -4952,6 +5075,17 @@ void OfflineViewer::setup_ui() {
         "each voxel (average) and write aux_rgb.bin in the output frames. Off =\n"
         "no RGB file is emitted. If a source frame is missing aux_rgb.bin the\n"
         "voxel is skipped for that file -- intensity (if on) still lands.");
+      ImGui::SameLine();
+      ImGui::Checkbox("Normals", &vox_include_normals);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Carry per-point normals (from normals.bin, written by SLAM at HD-frame\n"
+        "save time) into each voxel and write normals.bin in the output frames.\n"
+        "Aggregation: sum the unit normals of contributing points and re-normalize\n"
+        "(same averaging pattern as RGB / intensity). Mathematically valid for\n"
+        "voxels on continuous surfaces; on sharp edges the average is a\n"
+        "compromise direction (same caveat as RGB / intensity averaging).\n"
+        "Off = no normals.bin emitted; downstream tools that needed normals\n"
+        "will lose them.");
       ImGui::Separator();
 
       if (vox_processing) {
@@ -5164,6 +5298,8 @@ void OfflineViewer::setup_ui() {
               std::vector<float> ranges;
               std::vector<Eigen::Vector3f> rgbs;      // only populated when rgb_present
               std::vector<uint8_t> rgb_present;        // 1 = voxel had any RGB source
+              std::vector<Eigen::Vector3f> normals;    // averaged unit normal per voxel
+              std::vector<uint8_t> normals_present;    // 1 = voxel had any normal source
             };
             std::unordered_map<std::string, FrameOutput> frame_outputs;  // frame_dir -> output
             // Initialize empty outputs for all frames
@@ -5177,8 +5313,10 @@ void OfflineViewer::setup_ui() {
               std::vector<Eigen::Vector3f> world_pts;
               std::vector<float> intensities;
               std::vector<float> ranges;
-              std::vector<Eigen::Vector3f> rgbs;   // empty unless source aux_rgb.bin existed
+              std::vector<Eigen::Vector3f> rgbs;     // empty unless source aux_rgb.bin existed
+              std::vector<Eigen::Vector3f> normals;  // empty unless source normals.bin existed
               bool has_rgb = false;
+              bool has_normals = false;
               std::string dir;
             };
             std::unordered_map<std::string, std::shared_ptr<CachedFrame>> frame_cache;
@@ -5235,11 +5373,25 @@ void OfflineViewer::setup_ui() {
                   }
                   if (!frame_has_rgb) rgbs.clear();
                 }
+                // Same opt-in for normals.
+                std::vector<Eigen::Vector3f> nors;
+                bool frame_has_normals = false;
+                if (vox_include_normals && boost::filesystem::exists(fi->dir + "/normals.bin")) {
+                  nors.resize(fi->num_points, Eigen::Vector3f::Zero());
+                  std::ifstream nf(fi->dir + "/normals.bin", std::ios::binary);
+                  if (nf) {
+                    nf.read(reinterpret_cast<char*>(nors.data()),
+                            sizeof(Eigen::Vector3f) * fi->num_points);
+                    frame_has_normals = static_cast<bool>(nf);
+                  }
+                  if (!frame_has_normals) nors.clear();
+                }
                 const Eigen::Matrix3f R = fi->T_world_lidar.rotation().cast<float>();
                 const Eigen::Vector3f t = fi->T_world_lidar.translation().cast<float>();
                 auto cf = std::make_shared<CachedFrame>();
                 cf->dir = fi->dir;
                 cf->has_rgb = frame_has_rgb;
+                cf->has_normals = frame_has_normals;
                 for (int i = 0; i < fi->num_points; i++) {
                   if (!rng.empty() && rng[i] < 1.5f) continue;
                   if (ground_only && (ground.empty() || ground[i] < 0.5f)) continue;
@@ -5247,6 +5399,7 @@ void OfflineViewer::setup_ui() {
                   cf->intensities.push_back(ints[i]);
                   cf->ranges.push_back(rng.empty() ? 0.0f : rng[i]);
                   if (frame_has_rgb) cf->rgbs.push_back(rgbs[i]);
+                  if (frame_has_normals) cf->normals.push_back((R * nors[i]).normalized());
                 }
                 frame_cache[fi->dir] = cf;
               }
@@ -5258,6 +5411,8 @@ void OfflineViewer::setup_ui() {
                 float range;
                 Eigen::Vector3f rgb;
                 bool has_rgb;
+                Eigen::Vector3f normal;
+                bool has_normal;
                 std::string dir;
               };
               std::unordered_map<uint64_t, std::vector<VoxPt>> voxels;
@@ -5277,6 +5432,8 @@ void OfflineViewer::setup_ui() {
                   vp.range = cf->ranges[i];
                   vp.has_rgb = cf->has_rgb;
                   vp.rgb = cf->has_rgb ? cf->rgbs[i] : Eigen::Vector3f::Zero();
+                  vp.has_normal = cf->has_normals;
+                  vp.normal = cf->has_normals ? cf->normals[i] : Eigen::Vector3f::Zero();
                   vp.dir = cf->dir;
                   voxels[key].push_back(std::move(vp));
                 }
@@ -5321,18 +5478,26 @@ void OfflineViewer::setup_ui() {
                 // Only include core area voxels
                 if (!core.contains(pos)) continue;
 
-                // Average attributes. RGB averaged only over points that had RGB
-                // (source frames missing aux_rgb.bin don't contribute); the flag
-                // gates whether the voxel carries RGB at all.
+                // Average attributes. RGB and normals averaged only over
+                // points that carried them (source frames missing
+                // aux_rgb.bin / normals.bin don't contribute); the present
+                // flags gate whether the voxel carries the column at all.
                 float avg_int = 0.0f, avg_rng = 0.0f;
-                Eigen::Vector3f avg_rgb = Eigen::Vector3f::Zero();
+                Eigen::Vector3f avg_rgb    = Eigen::Vector3f::Zero();
+                Eigen::Vector3f normal_sum = Eigen::Vector3f::Zero();
                 int rgb_n = 0;
+                int normal_n = 0;
                 for (const auto& p : pts_in_voxel) {
                   avg_int += p.intensity; avg_rng += p.range;
-                  if (p.has_rgb) { avg_rgb += p.rgb; rgb_n++; }
+                  if (p.has_rgb)    { avg_rgb    += p.rgb;    rgb_n++; }
+                  if (p.has_normal) { normal_sum += p.normal; normal_n++; }
                 }
                 avg_int /= pts_in_voxel.size(); avg_rng /= pts_in_voxel.size();
                 if (rgb_n > 0) avg_rgb /= static_cast<float>(rgb_n);
+                Eigen::Vector3f avg_normal = Eigen::Vector3f::Zero();
+                if (normal_n > 0 && normal_sum.squaredNorm() > 1e-12f) {
+                  avg_normal = normal_sum.normalized();
+                }
 
                 // Assign to a frame -- round-robin across contributing frames
                 const std::string& target_dir = contributing_dirs[voxel_idx % contributing_dirs.size()];
@@ -5341,6 +5506,8 @@ void OfflineViewer::setup_ui() {
                 frame_outputs[target_dir].ranges.push_back(avg_rng);
                 frame_outputs[target_dir].rgbs.push_back(avg_rgb);
                 frame_outputs[target_dir].rgb_present.push_back(rgb_n > 0 ? 1 : 0);
+                frame_outputs[target_dir].normals.push_back(avg_normal);
+                frame_outputs[target_dir].normals_present.push_back(normal_n > 0 ? 1 : 0);
                 voxel_idx++;
                 total_voxels++;
               }
@@ -5376,6 +5543,14 @@ void OfflineViewer::setup_ui() {
                 if (any_rgb) {
                   std::ofstream f(out_dir + "/aux_rgb.bin", std::ios::binary);
                   f.write(reinterpret_cast<const char*>(output.rgbs.data()), sizeof(Eigen::Vector3f) * n);
+                }
+              }
+              if (vox_include_normals) {
+                bool any_normal = false;
+                for (uint8_t v : output.normals_present) if (v) { any_normal = true; break; }
+                if (any_normal) {
+                  std::ofstream f(out_dir + "/normals.bin", std::ios::binary);
+                  f.write(reinterpret_cast<const char*>(output.normals.data()), sizeof(Eigen::Vector3f) * n);
                 }
               }
 
@@ -9262,6 +9437,28 @@ void OfflineViewer::setup_ui() {
   // pose + zero-distortion pinhole intrinsics. Output is a set of JPGs that
   // Metashape imports as control-anchor cameras; real cameras BA-refine
   // against them. Automation of the "hand-placed marker" workflow at scale.
+  // === Virtual LiDAR Cameras window ===
+  //
+  // Two ways to place virtual cameras, both feeding the SAME downstream
+  // render/export path:
+  //   1. Pick an existing RGB image source from the Source dropdown ->
+  //      cameras are placed at each real frame's located pose.
+  //   2. Pick the "Along trajectory" sentinel entry at the end of the
+  //      Source dropdown -> a minimal placement panel takes over:
+  //      Interval (m) + Pinhole-or-Cubemap toggle + Place button.
+  //      Clicking Place walks the LiDAR trajectory at vc_interval_m
+  //      spacing, builds a synthetic ImageSource with one located
+  //      CameraFrame per anchor, appends it to image_sources, and
+  //      auto-selects it. From that point on the dropdown is on a
+  //      real (synthetic) source and the per-cam UI handles preview /
+  //      navigate / Export -- NO duplicated render worker.
+  //
+  // Render source dropdown carries an extra "Lidar RGB (aux_rgb.bin /
+  // native)" entry mapped to RenderSource::NativeRGB. When selected,
+  // each build_calibration_context() call site passes a
+  // `make_aux_rgb_loader()` callback that reads aux_rgb.bin per HD
+  // frame and feeds ctx.colors_rgb so the rasterizer splats real
+  // colour instead of intensity. No camera projection involved.
   viewer->register_ui_callback("virtual_cameras_window", [this] {
     if (!show_virtual_cameras_window) return;
     ImGui::SetNextWindowSize(ImVec2(540, 560), ImGuiCond_FirstUseEver);
@@ -9323,138 +9520,6 @@ void OfflineViewer::setup_ui() {
     }
     ImGui::Separator();
 
-    // Placement-mode radio. "Waypoints" walks the trajectory dropping anchors
-    // every N metres (legacy). "Per RGB camera" places a virtual LiDAR camera
-    // at each real RGB frame's estimated world pose -- the 1:1 co-located mode
-    // intended for SFM anchoring; cheap to match because the virtual twin
-    // shares the same viewpoint as the real image (within a few cm).
-    ImGui::TextDisabled("Placement mode");
-    ImGui::RadioButton("Waypoints along trajectory##vcmode", &vc_placement_mode, 0);
-    ImGui::SameLine();
-    ImGui::RadioButton("Per RGB camera (co-located)##vcmode", &vc_placement_mode, 1);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "Emits one virtual LiDAR-intensity image per real RGB frame at the frame's\n"
-      "estimated world pose (from the Colorize extrinsic). Virtual + real sit in\n"
-      "the same bundle with ~10 cm offset -- SFM matching is nearly guaranteed\n"
-      "to fire, giving BA a locked LiDAR-frame anchor for every real photo.\n"
-      "Requires the source to have been 'Located' in the Colorize window.");
-    ImGui::Separator();
-
-    if (vc_placement_mode == 0) {
-
-    // Placement
-    ImGui::TextDisabled("Placement");
-    ImGui::SetNextItemWidth(160);
-    ImGui::DragFloat("Interval (m)##vc", &vc_interval_m, 0.5f, 1.0f, 500.0f, "%.1f");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "Distance between consecutive virtual cameras along the trajectory.\n"
-      "5-10 m = dense BA constraints, 20-50 m = lighter. Denser is usually\n"
-      "safer for feature-sparse LiDARs (Livox Horizon).");
-    ImGui::SetNextItemWidth(160);
-    ImGui::DragFloat("Context radius (m)##vc", &vc_context_radius_m, 1.0f, 5.0f, 500.0f, "%.0f");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "LiDAR points within this radius of an anchor are included in its render.\n"
-      "Smaller = faster render, tighter depth. Larger = more context / background.");
-    ImGui::Separator();
-
-    // Face selection
-    ImGui::TextDisabled("Cube faces to render");
-    const char* face_labels[6] = { "+X (fwd)", "-X (back)", "+Y (left)", "-Y (right)", "+Z (up/sky)", "-Z (down/gnd)" };
-    for (int f = 0; f < 6; f++) {
-      if (f) ImGui::SameLine();
-      ImGui::Checkbox((std::string(face_labels[f]) + "##vcf" + std::to_string(f)).c_str(), &vc_face_enabled[f]);
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "+Z (sky) is off by default -- rarely has useful features.\n"
-      "-Z (down/ground) is critical on Livox Horizon: road markings are the best\n"
-      "matchable content. Keep ON unless you have a reason to drop it.");
-    ImGui::Separator();
-
-    // Resolution
-    ImGui::TextDisabled("Face resolution");
-    ImGui::SetNextItemWidth(120);
-    ImGui::InputInt("pixels/side##vc", &vc_face_size, 64, 256);
-    vc_face_size = std::clamp(vc_face_size, 256, 8192);
-    ImGui::SameLine();
-    if (ImGui::SmallButton(" /2##vcres")) vc_face_size = std::max(256, vc_face_size / 2);
-    ImGui::SameLine();
-    if (ImGui::SmallButton(" x2##vcres")) vc_face_size = std::min(8192, vc_face_size * 2);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "Pixels per cube-face side. 1920 is a good balance; 3840 for Pandar 128\n"
-      "density to extract many features; 1024 for quick test runs.");
-    ImGui::Separator();
-
-    // Filters
-    ImGui::TextDisabled("Filters");
-    ImGui::Checkbox("Ground only (requires aux_ground.bin)##vc", &vc_ground_only);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "Render only points tagged as ground by PatchWork++. On Livox Horizon this\n"
-      "concentrates the feature-rich regions (asphalt, road markings, kerbs) so\n"
-      "the matcher has a better shot. Requires a prior PatchWork++ classify run\n"
-      "that wrote aux_ground.bin per frame.");
-    ImGui::Checkbox("Also render RGB (requires aux_rgb.bin)##vc", &vc_render_rgb);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "In addition to intensity, render an RGB image per face using colors from\n"
-      "a prior Colorize Apply run. Doubles the render time + disk but gives the\n"
-      "matcher both modalities. SIFT works on intensity so this is optional.");
-    ImGui::Checkbox("Embed UTM in EXIF##vc", &vc_embed_exif_gps);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-      "Write virtual cameras' world positions into EXIF GPS tags (using UTM from\n"
-      "gnss_datum.json + our session-local offset). Lets Metashape/RealityScan\n"
-      "seed pose priors from the EXIF even without the BlocksExchange import.");
-    ImGui::Separator();
-
-    // Action buttons
-    ImGui::BeginDisabled(vc_running);
-    if (ImGui::Button("Preview placement (no render)##vc")) {
-      // Fill vc_preview_anchors from the trajectory at current interval.
-      if (!trajectory_built) build_trajectory();
-      std::vector<TrajRecord> tr;
-      tr.reserve(trajectory_data.size());
-      for (const auto& rec : trajectory_data) {
-        tr.push_back({rec.stamp, rec.pose, rec.cumulative_dist});
-      }
-      auto anchors = place_virtual_cameras(tr, vc_interval_m);
-      vc_preview_anchors.clear();
-      vc_preview_orient.clear();
-      vc_preview_anchors.reserve(anchors.size());
-      vc_preview_orient.reserve(anchors.size());
-      for (const auto& a : anchors) {
-        vc_preview_anchors.push_back(a.T_world_cam.translation().cast<float>());
-        vc_preview_orient.push_back(a.T_world_cam.rotation().cast<float>());
-      }
-      vc_anchors_placed_last = anchors.size();
-      vc_status = "Preview: " + std::to_string(anchors.size()) + " anchors placed along "
-                  + std::to_string(static_cast<int>(tr.empty() ? 0 : tr.back().cumulative_dist)) + " m of trajectory";
-      logger->info("[VirtualCams] {}", vc_status);
-    }
-    ImGui::SameLine();
-    const bool can_render = !vc_output_dir.empty() &&
-                            std::any_of(std::begin(vc_face_enabled), std::end(vc_face_enabled), [](bool b){ return b; });
-    ImGui::BeginDisabled(!can_render);
-    if (ImGui::Button("Render all##vc")) {
-      vc_running = true;
-      vc_status = "TODO: render worker not yet implemented; placement + UI + preview are in. "
-                  "Files would land in: " + vc_output_dir;
-      // NOTE: the render worker goes here next session. It will:
-      //  1. Walk trajectory via place_virtual_cameras.
-      //  2. Build a per-anchor CalibrationContext by filtering world_points
-      //     within vc_context_radius_m (optionally ground-only).
-      //  3. For each enabled face, call render_intensity_image with
-      //     cube_face_intrinsics(vc_face_size) and T_world_cam * cube_face_rotation(f).
-      //  4. Save JPG + optional RGB render, populate EXIF if enabled.
-      //  5. Emit a manifest.json with per-anchor poses for BlocksExchange.
-      vc_running = false;
-    }
-    ImGui::EndDisabled();
-    ImGui::EndDisabled();
-
-    if (!vc_status.empty()) {
-      ImGui::Separator();
-      ImGui::TextWrapped("%s", vc_status.c_str());
-    }
-
-    } else {
       // ---------------- Per RGB camera mode ----------------
       // Lazy-seed factory scanner presets on first enter.
       vc_pcam_seed_factory_presets();
@@ -9496,16 +9561,120 @@ void OfflineViewer::setup_ui() {
             std::to_string(loc) + "/" +
             std::to_string(image_sources[i].frames.size()) + " located]");
         }
+        // Sentinel entry: place virtual cameras along the LiDAR trajectory
+        // at a user-set N-metre interval -- no image source required.
+        // Index = image_sources.size(); selecting it switches the panel
+        // into a focused placement panel (Interval + camera type + Place
+        // button). After Place clicks, image_sources gets a NEW synthetic
+        // entry and vc_pcam_active_src auto-points at it, so on the next
+        // frame is_trajectory_src is false and the full per-cam UI runs
+        // against the synthetic source -- the rest of the window has no
+        // idea trajectory mode exists, no duplicated rendering path.
+        const int TRAJ_SRC_IDX = static_cast<int>(image_sources.size());
+        src_labels.push_back("Along trajectory  [virtual N-metre spacing]");
         std::vector<const char*> lptrs;
         for (auto& s : src_labels) lptrs.push_back(s.c_str());
-        vc_pcam_active_src = std::clamp(vc_pcam_active_src, 0,
-                                         static_cast<int>(image_sources.size()) - 1);
+        vc_pcam_active_src = std::clamp(vc_pcam_active_src, 0, TRAJ_SRC_IDX);
         {
           ImGui::SetNextItemWidth(360);
           if (ImGui::Combo("Source##vcp", &vc_pcam_active_src, lptrs.data(), static_cast<int>(lptrs.size()))) {
             vc_pcam_preview_frame = 0;
             vc_pcam_preview_dirty = true;
           }
+          // is_trajectory_src must be evaluated AFTER the Combo above so the
+          // mode switches on the SAME frame the user picks the trajectory
+          // entry -- otherwise the per-cam code below would read
+          // image_sources[N] out of bounds and crash (vector reserve length
+          // error from located_idx.reserve(src.frames.size())).
+          const bool is_trajectory_src = (vc_pcam_active_src == TRAJ_SRC_IDX);
+
+          // ---- "Along trajectory" sentinel: minimal placement panel only.
+          // Walks the LiDAR trajectory at vc_interval_m spacing, creates a
+          // synthetic ImageSource with one located CameraFrame per anchor,
+          // and switches the dropdown to it. From that point on the standard
+          // per-RGB-camera UI handles preview, navigation, render, and
+          // export -- no duplicate path.
+          if (is_trajectory_src) {
+            ImGui::SetNextItemWidth(160);
+            ImGui::DragFloat("Interval (m)##vctrj", &vc_interval_m, 0.5f, 1.0f, 500.0f, "%.1f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+              "Distance between consecutive virtual cameras along the LiDAR trajectory.");
+            ImGui::Separator();
+            ImGui::TextDisabled("Camera type");
+            ImGui::RadioButton("Pinhole##vctrj_ct", &vc_traj_camera_type, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton("360 cubemap##vctrj_ct", &vc_traj_camera_type, 1);
+            if (vc_traj_camera_type == 0) {
+              ImGui::SetNextItemWidth(100);
+              ImGui::DragInt("W##vctrj_pw", &vc_traj_pinhole_w, 8, 256, 16000);
+              ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+              ImGui::DragInt("H##vctrj_ph", &vc_traj_pinhole_h, 8, 144, 12000);
+              ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+              ImGui::DragScalar("HFoV (deg)##vctrj_hf", ImGuiDataType_Double,
+                                 &vc_traj_pinhole_hfov_deg, 0.5f, nullptr, nullptr, "%.1f");
+              vc_traj_pinhole_w = std::clamp(vc_traj_pinhole_w, 256, 16000);
+              vc_traj_pinhole_h = std::clamp(vc_traj_pinhole_h, 144, 12000);
+              vc_traj_pinhole_hfov_deg = std::clamp(vc_traj_pinhole_hfov_deg, 5.0, 170.0);
+            } else {
+              ImGui::SetNextItemWidth(120);
+              ImGui::InputInt("Face size##vctrj", &vc_face_size, 64, 256);
+              vc_face_size = std::clamp(vc_face_size, 256, 8192);
+            }
+            ImGui::Separator();
+
+            if (ImGui::Button("Place virtual cameras##vctrj")) {
+              if (!trajectory_built) build_trajectory();
+              std::vector<TrajRecord> tr;
+              tr.reserve(trajectory_data.size());
+              for (const auto& rec : trajectory_data) tr.push_back({rec.stamp, rec.pose, rec.cumulative_dist});
+              auto anchors = place_virtual_cameras(tr, vc_interval_m);
+
+              ImageSource synth;
+              synth.is_virtual    = true;
+              synth.virtual_kind  = (vc_traj_camera_type == 0) ? "trajectory_pinhole" : "trajectory_cubemap";
+              synth.camera_type   = (vc_traj_camera_type == 0) ? CameraType::Pinhole : CameraType::Spherical;
+              if (vc_traj_camera_type == 0) {
+                synth.intrinsics.width  = vc_traj_pinhole_w;
+                synth.intrinsics.height = vc_traj_pinhole_h;
+                const double hfov_rad = vc_traj_pinhole_hfov_deg * M_PI / 180.0;
+                synth.intrinsics.fx = (vc_traj_pinhole_w * 0.5) / std::tan(hfov_rad * 0.5);
+                synth.intrinsics.fy = synth.intrinsics.fx;
+                synth.intrinsics.cx = vc_traj_pinhole_w * 0.5;
+                synth.intrinsics.cy = vc_traj_pinhole_h * 0.5;
+              } else {
+                synth.intrinsics = cube_face_intrinsics(vc_face_size);
+              }
+              char nm[64];
+              std::snprintf(nm, sizeof(nm), "trajectory_%.1fm_%s",
+                             vc_interval_m,
+                             (vc_traj_camera_type == 0) ? "pinhole" : "cubemap");
+              synth.name = nm;
+              synth.path = "";  // synthetic; no disk folder
+              synth.frames.reserve(anchors.size());
+              for (const auto& a : anchors) {
+                CameraFrame f;
+                f.T_world_cam = a.T_world_cam;
+                f.timestamp   = a.stamp;
+                f.located     = true;
+                synth.frames.push_back(std::move(f));
+              }
+
+              image_sources.push_back(std::move(synth));
+              vc_pcam_active_src = static_cast<int>(image_sources.size()) - 1;
+              vc_pcam_preview_frame = 0;
+              vc_pcam_preview_dirty = true;
+              vc_status = "Placed " + std::to_string(anchors.size()) +
+                          " virtual cameras along trajectory. Use the controls above to preview / export.";
+              logger->info("[VirtualCams/traj] {}", vc_status);
+            }
+            if (!vc_status.empty()) {
+              ImGui::Separator();
+              ImGui::TextWrapped("%s", vc_status.c_str());
+            }
+            ImGui::End();
+            return;
+          }
+
           auto& src = image_sources[vc_pcam_active_src];
 
           // In-panel Create cameras: same code path as Colorize's button but
@@ -9608,20 +9777,46 @@ void OfflineViewer::setup_ui() {
         // The orthogonal "Ground only" checkbox applies on top of any source.
         // Modes beyond Intensity are WIP and currently fall back to Intensity
         // in the rasterizer (safe, just unchanged preview).
+        //
+        // Combo position order != enum order: NativeRGB sits at position 1
+        // (right after Intensity) because that's the typical first-choice
+        // alternative for colour-equipped LiDARs / aux_rgb.bin sessions.
+        // When NativeRGB is selected, the per-cam build_calibration_context
+        // call sites (preview, batch export, test matches) pass
+        // make_aux_rgb_loader() so ctx.colors_rgb is populated from the
+        // SAME aux_rgb.bin the 3D viewer's HD worker reads. The rasterizer
+        // detects this via use_rgb = (source enum + colors_rgb non-empty).
         {
-          int rs = static_cast<int>(vc_pcam_render_opts.source);
+          static const RenderSource k_combo_order[] = {
+            RenderSource::Intensity,
+            RenderSource::NativeRGB,
+            RenderSource::BootstrapColorizedSplat,
+            RenderSource::BootstrapColorizedDepth,
+            RenderSource::ShadedDepth,
+          };
+          int rs = 0;
+          for (int i = 0; i < 5; i++) if (k_combo_order[i] == vc_pcam_render_opts.source) { rs = i; break; }
           ImGui::SetNextItemWidth(260);
           if (ImGui::Combo("Render source##vcp_rs", &rs,
                 "Intensity\0"
+                "Lidar RGB (aux_rgb.bin / native)\0"
                 "Bootstrap RGB -- splat + 2D fill\0"
                 "Bootstrap RGB -- depth reproject\0"
                 "Shaded depth\0")) {
-            vc_pcam_render_opts.source = static_cast<RenderSource>(rs);
+            vc_pcam_render_opts.source = k_combo_order[std::clamp(rs, 0, 4)];
             vc_pcam_preview_dirty = true;
           }
           if (ImGui::IsItemHovered()) ImGui::SetTooltip(
             "Per-point signal driving the rasterizer:\n"
             "  Intensity                  -- LiDAR intensity (current default).\n"
+            "  Lidar RGB                  -- per-point RGB read straight from\n"
+            "                                aux_rgb.bin (native colour LiDAR\n"
+            "                                like Ouster, or a prior Colorize\n"
+            "                                > Apply). No camera projection at\n"
+            "                                render time -- the colours travel\n"
+            "                                with the points. Falls back to\n"
+            "                                intensity silently if the source\n"
+            "                                frames don't carry aux_rgb.bin.\n"
             "  Bootstrap RGB splat+fill   -- per-point RGB sampled from the\n"
             "                                nearest located RGB cam at render\n"
             "                                time, splatted, then 2D-interpolated\n"
@@ -9636,8 +9831,8 @@ void OfflineViewer::setup_ui() {
             "                                normals; works with no RGB.\n\n"
             "Combine with 'Ground only' to mask non-ground points (e.g.\n"
             "Bootstrap RGB + Ground only = ground texture for SfM alignment).\n\n"
-            "Modes other than Intensity are WIP; selecting them is safe\n"
-            "(falls back to Intensity until wired, one mode per session).");
+            "Modes other than Intensity / Lidar RGB are WIP; selecting them is\n"
+            "safe (falls back to Intensity until wired, one mode per session).");
           ImGui::SameLine();
           if (ImGui::Checkbox("Ground only##vcp_ground", &vc_pcam_render_opts.ground_only)) {
             // Forward the request through to the context builder. PatchWork++
@@ -10076,10 +10271,13 @@ void OfflineViewer::setup_ui() {
               const auto timed_traj = timed_traj_snapshot();
               const Eigen::Vector3f anchor_pos = pcam.T_world_cam.translation().cast<float>();
               const Eigen::Vector3f anchor_fwd = pcam.T_world_cam.rotation().col(0).cast<float>().normalized();
+              auto rgb_loader_pv = (vc_pcam_render_opts.source == RenderSource::NativeRGB)
+                                     ? make_aux_rgb_loader() : nullptr;
               CalibrationContext ctx = build_calibration_context(
                 submaps, timed_traj, pcam.timestamp,
                 anchor_pos, anchor_fwd, vc_pcam_ctx_opts,
-                [this](int si) { return load_hd_for_submap(si, false); });
+                [this](int si) { return load_hd_for_submap(si, false); },
+                rgb_loader_pv);
 
               // Per-VC RGB sampling. Only fires when the user picked an RGB
               // render source. Pulls each context point's colour from THIS
@@ -10361,9 +10559,12 @@ void OfflineViewer::setup_ui() {
                   const auto t_traj = timed_traj_snapshot();
                   const Eigen::Vector3f apos = pcam.T_world_cam.translation().cast<float>();
                   const Eigen::Vector3f afwd = pcam.T_world_cam.rotation().col(0).cast<float>().normalized();
+                  auto rgb_loader_tm = (vc_pcam_render_opts.source == RenderSource::NativeRGB)
+                                         ? make_aux_rgb_loader() : nullptr;
                   CalibrationContext tctx = build_calibration_context(
                     submaps, t_traj, pcam.timestamp, apos, afwd, vc_pcam_ctx_opts,
-                    [this](int si) { return load_hd_for_submap(si, false); });
+                    [this](int si) { return load_hd_for_submap(si, false); },
+                    rgb_loader_tm);
 
                   if (psrc.camera_type == CameraType::Spherical) {
                     const int fs = vc_face_size;
@@ -10612,9 +10813,12 @@ void OfflineViewer::setup_ui() {
               // Build context once per frame (same context reused across faces).
               const Eigen::Vector3f apos = c.T_world_cam.translation().cast<float>();
               const Eigen::Vector3f afwd = c.T_world_cam.rotation().col(0).cast<float>().normalized();
+              auto rgb_loader_ex = (vc_pcam_render_opts.source == RenderSource::NativeRGB)
+                                     ? make_aux_rgb_loader() : nullptr;
               CalibrationContext ctx = build_calibration_context(
                 submaps, batch_timed_traj, c.timestamp, apos, afwd,
-                vc_pcam_ctx_opts, [this](int sm) { return load_hd_for_submap(sm, false); });
+                vc_pcam_ctx_opts, [this](int sm) { return load_hd_for_submap(sm, false); },
+                rgb_loader_ex);
 
               for (int face : faces_to_render) {
                 if (vc_pcam_cancel) break;
@@ -10754,7 +10958,6 @@ void OfflineViewer::setup_ui() {
           ImGui::TextWrapped("%s", vc_status.c_str());
         }
       }
-    }
 
     // 3D-viewer preview: show anchors as small spheres so the user can eyeball
     // the spacing before committing to a render.
@@ -12379,7 +12582,8 @@ void OfflineViewer::setup_ui() {
     logger->info("[COLMAP] Region placed at ({:.2f}, {:.2f}, {:.2f})", ce_center.x(), ce_center.y(), ce_center.z());
   });
 
-  // COLMAP exporter: cube rendering (wire frame + transparent fill)
+  // COLMAP exporter: cube rendering (wire frame + transparent fill) +
+  // viewport gizmo (XY translate + Z rotate) for direct manipulation.
   viewer->register_ui_callback("colmap_cube_render", [this] {
     auto vw = guik::LightViewer::instance();
     if (!ce_region_placed) {
@@ -12399,17 +12603,104 @@ void OfflineViewer::setup_ui() {
       guik::FlatColor(0.3f, 0.9f, 0.4f, 1.0f, tf));
     vw->update_drawable("colmap_cube_fill", glk::Primitives::cube(),
       guik::FlatColor(0.2f, 0.8f, 0.3f, 0.15f, tf).make_transparent());
+
+    // Gizmo: show only while the SFM panel is open and the user isn't in
+    // click-to-place mode (otherwise ImGuizmo eats the click). TX | TY | RZ =
+    // 1 | 2 | 32 -- horizontal-only translation + yaw, no Z drag (region Z
+    // is decorative; trim is XY-only) and no other rotations.
+    if (!ce_show || ce_placing) return;
+    if (!ce_region_gizmo) {
+      ce_region_gizmo.reset(new guik::ModelControl("ce_region_gizmo"));
+    }
+    // Build the gizmo transform from current UI state. Cube SCALE doesn't
+    // belong on the gizmo (the gizmo is a movement tool, not a cube preview),
+    // so we strip it -- gizmo is just translate + yaw.
+    Eigen::Matrix4f gizmo_m = Eigen::Matrix4f::Identity();
+    const float yaw_rad = ce_yaw_deg * static_cast<float>(M_PI) / 180.0f;
+    Eigen::Matrix3f Rz = Eigen::AngleAxisf(yaw_rad, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+    gizmo_m.block<3, 3>(0, 0) = Rz;
+    gizmo_m.block<3, 1>(0, 3) = ce_center;
+    // Push UI -> gizmo when the user isn't actively dragging a handle, so
+    // typed-in DragFloat values from the panel flow through. While the user
+    // IS dragging, leave the gizmo authoritative so we don't fight its state.
+    if (!ce_region_gizmo->is_guizmo_using()) {
+      ce_region_gizmo->set_model_matrix(gizmo_m);
+    }
+    // Bitmask: TRANSLATE_X|Y (1|2) + ROTATE_Z (32). No Z translate, no XY
+    // rotate -- a free Z drag would lift the region off the ground and a
+    // free XY rotate would tilt the trim box, both of which break the
+    // top-view-aligned export the writer assumes.
+    ce_region_gizmo->set_gizmo_operation(1 | 2 | 32);
+    // ImGuizmo defaults to perspective projection math; in ortho the gizmo
+    // wouldn't render at all (handles get culled because the perspective
+    // depth-divide blows up). Detect from the projection matrix shape:
+    //   perspective: P[3,2] == -1, P[3,3] == 0
+    //   ortho:       P[3,2] ==  0, P[3,3] == 1
+    // Auto-enables ortho gizmo when the user's in top-down view (the SFM
+    // panel auto-switches the camera to top-down ortho when opened).
+    const Eigen::Matrix4f proj = vw->projection_matrix();
+    const bool is_ortho = std::abs(proj(3, 3) - 1.0f) < 0.01f;
+    ImGuizmo::SetOrthographic(is_ortho);
+    const auto ds = ImGui::GetIO().DisplaySize;
+    ce_region_gizmo->draw_gizmo(
+      0, 0, static_cast<int>(ds.x), static_cast<int>(ds.y),
+      vw->view_matrix(), proj);
+    // Read back -- update ce_center / ce_yaw_deg if the gizmo moved.
+    // Hysteresis (1 mm / 0.1 deg) avoids unnecessary cube-drawable rebuilds
+    // from sub-pixel jitter when the user isn't actually dragging.
+    const Eigen::Matrix4f gm = ce_region_gizmo->model_matrix();
+    const Eigen::Vector3f new_pos = gm.block<3, 1>(0, 3);
+    const float new_yaw = std::atan2(gm(1, 0), gm(0, 0)) * 180.0f / static_cast<float>(M_PI);
+    if ((Eigen::Vector2f(new_pos.x(), new_pos.y()) -
+         Eigen::Vector2f(ce_center.x(), ce_center.y())).squaredNorm() > 1e-6f) {
+      ce_center.x() = new_pos.x();
+      ce_center.y() = new_pos.y();
+      // Z is locked: gizmo has no Z handle so any drift here is just numeric
+      // noise from ImGuizmo's internal accumulation -- discard it.
+    }
+    if (std::abs(new_yaw - ce_yaw_deg) > 0.1f) {
+      // Wrap to (-180, 180] to match the DragFloat range in the panel.
+      float w = std::fmod(new_yaw + 180.0f, 360.0f);
+      if (w < 0) w += 360.0f;
+      ce_yaw_deg = w - 180.0f;
+    }
   });
 
   // COLMAP exporter window
   viewer->register_ui_callback("colmap_export_window", [this] {
     if (!ce_show) return;
     ImGui::SetNextWindowSize(ImVec2(420, 520), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("COLMAP Exporter (dev, single-chunk)", &ce_show)) {
+    // Edge-trigger: when the panel transitions from hidden -> shown, auto-
+    // configure the viewport for region placement: top-down orthographic +
+    // trajectory polyline visible. Pablo's standard pre-export setup --
+    // doing it here saves the manual click-through every time.
+    static bool prev_ce_show = false;
+    if (ce_show && !prev_ce_show) {
+      auto vw = guik::LightViewer::instance();
+      vw->use_topdown_camera_control(200.0, 0.0);
+      auto proj = std::make_shared<guik::BasicProjectionControl>(Eigen::Vector2i(1920, 1080));
+      proj->set_projection_mode(1);  // 1 = orthographic
+      proj->set_ortho_width(200.0);   // ~200m footprint default
+      vw->set_projection_control(proj);
+      camera_mode_sel = 0;            // matches the existing Orthographic menu action
+      draw_traj = true;
+    }
+    prev_ce_show = ce_show;
+
+    if (ImGui::Begin("SFM Export", &ce_show)) {
       ImGui::TextDisabled("Places a 3D cube; 2D top-view footprint is used for trimming.\nZ range is ignored (full column exported).");
-      // Shortcut to the virtual-cameras tool -- commonly run alongside a COLMAP
-      // export so the anchor virtuals land in the same package that goes to
-      // Metashape / LichtFeld.
+      // Shortcuts to the upstream tools -- both are typically run as part of
+      // the same SFM workflow (load image folder + locate cameras in
+      // Colorize, then optionally render virtual cameras, then export here).
+      // Same buttons exposed here so the user doesn't have to hunt through
+      // the main Colorize menu mid-export-tune.
+      if (ImGui::Button("Open Colorize...##ce")) show_colorize_window = true;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Open the Colorize window. That's where image sources are added,\n"
+        "cameras are located along the trajectory, and lever-arm / RPY /\n"
+        "time-shift calibration is tuned. SFM export reads the resulting\n"
+        "located camera poses + intrinsics directly.");
+      ImGui::SameLine();
       if (ImGui::Button("Open Virtual Cameras...##ce")) show_virtual_cameras_window = true;
       if (ImGui::IsItemHovered()) ImGui::SetTooltip(
         "Open the Virtual Cameras window. Render LiDAR-synthesized locked-pose\n"
@@ -12491,32 +12782,311 @@ void OfflineViewer::setup_ui() {
       }
       ImGui::SetNextItemWidth(120); ImGui::DragFloat("Overlap margin (m)", &ce_overlap_margin_m, 0.5f, 0.0f, 50.0f, "%.1f");
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cameras outside the trim bounds but within this distance are still included.\nHelps 3DGS get context at the tile boundary.");
-      // Point sources for the points3D.ply cloud. Independent toggles; both
-      // trimmed to the export region of interest so output size stays bounded.
-      // Availability is checked below (warning + auto-disable).
-      ImGui::TextDisabled("Point cloud sources (trimmed to region)");
-      ImGui::Checkbox("Export Voxelized##ce",   &ce_export_voxelized);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-        "Include points from <hd_path>_voxelized/. Run 'Voxelize HD' first to\n"
-        "produce this. Smooth, BA-friendly density; may look mesh-like when\n"
-        "reconstructed.");
-      ImGui::SameLine();
+      // ----- Point cloud subsection -----
+      // HD and Voxelized are emitted as SEPARATE PLYs (no merge). Each gets
+      // its own per-field toggles for color/intensity/normals. With one
+      // source enabled the file is named "points3D.ply" (COLMAP convention,
+      // 3DGS init compatible); with both enabled, the filenames get the
+      // _hd / _voxelized suffix so downstream tools can pick.
+      ImGui::Separator();
+      ImGui::TextDisabled("Point cloud (trimmed to region; one PLY per enabled source)");
+      // HD source row + per-field options
       ImGui::Checkbox("Export HD##ce", &ce_export_hd);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-        "Include points from the raw HD frames. Full LiDAR density, bigger\n"
-        "output, better for 3DGS reconstruction detail. Region-trim keeps it\n"
-        "manageable.");
+        "Raw HD frames -> points3D[_hd].ply. Full LiDAR density. Best for\n"
+        "meshing (Metashape) and visual control points. Region-trim keeps\n"
+        "the output bounded.");
+      if (ce_export_hd) {
+        ImGui::SameLine(); ImGui::TextDisabled("|");
+        ImGui::SameLine(); ImGui::Checkbox("Color##ce_hd_c",     &ce_export_hd_color);
+        ImGui::SameLine(); ImGui::Checkbox("Intensity##ce_hd_i", &ce_export_hd_intensity);
+        ImGui::SameLine(); ImGui::Checkbox("Normals##ce_hd_n",   &ce_export_hd_normal);
+      }
+      // Voxelized source row + per-field options
+      ImGui::Checkbox("Export Voxelized##ce",   &ce_export_voxelized);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Voxelized HD -> points3D[_voxelized].ply. Smoother density, useful\n"
+        "for 3DGS init. Off by default since HD meshes better. Run 'Voxelize\n"
+        "HD' first to produce this. Note: voxelize panel doesn't yet emit\n"
+        "normals.bin -- normals will be zero-vectors until that lands.");
+      if (ce_export_voxelized) {
+        ImGui::SameLine(); ImGui::TextDisabled("|");
+        ImGui::SameLine(); ImGui::Checkbox("Color##ce_vx_c",     &ce_export_vox_color);
+        ImGui::SameLine(); ImGui::Checkbox("Intensity##ce_vx_i", &ce_export_vox_intensity);
+        ImGui::SameLine(); ImGui::Checkbox("Normals##ce_vx_n",   &ce_export_vox_normal);
+      }
+      // ----- SFM target subsection -----
+      // Each target = a self-contained, complete export spec. Folder
+      // structure, mask naming, AND which bundle files get emitted are
+      // baked into the choice. Pick ONE per export -- mutually exclusive,
+      // no mix-and-match. To get a different format, re-run the export.
+      // The internal emit_colmap / export_blocks_exchange booleans are
+      // DERIVED from this radio at worker-launch time (no separate UI).
+      ImGui::Separator();
+      ImGui::TextDisabled("SFM target (pick one; each is a complete spec)");
+      // Radios on a single line to keep the panel vertically compact.
+      // target_changed feeds the per-target defaults below (Rotate Y-up
+      // toggled on for COLMAP / BE since their downstream consumers
+      // expect it; off for RS / Metashape per testing).
+      bool target_changed = false;
+      target_changed |= ImGui::RadioButton("Colmap (3DGS)##ce_t",      &ce_target_layout, 0);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "images/ + masks/<stem>.png +\n"
+        "sparse/0/{cameras,images,points3D}.{txt,ply}\n\n"
+        "Standard COLMAP bundle. Consumed by COLMAP, 3DGS, nerfstudio,\n"
+        "and tools with COLMAP import. Auto-enables Rotate Y-up.\n\n"
+        "LIMITATION: this exports POSES ONLY (no SfM tracks / 2D-3D\n"
+        "correspondences). Reliably opens in Metashape Standard, may\n"
+        "not in stricter consumers like Reality Scan. For 3DGS, results\n"
+        "depend on tight LiDAR-camera calibration -- still being\n"
+        "iterated via the Reality Scan alignment loop.");
+      // Inline disclaimer when COLMAP target is currently selected, so the
+      // user sees the limitation without needing to hover the radio.
+      if (ce_target_layout == 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
+          "Note: COLMAP export emits POSES ONLY (no SfM tracks). Reliable in Metashape\n"
+          "Standard. Reality Scan may not open it. For 3DGS use, requires the LiDAR-\n"
+          "camera alignment we're still iterating on (see Reality Scan target).");
+      }
+      ImGui::SameLine();
+      target_changed |= ImGui::RadioButton("Reality Scan##ce_t",       &ce_target_layout, 1);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        ".geometry/<images> + .mask/<stem>.png + point_cloud/<stem>.ply\n\n"
+        "RS auto-detects layers by separator-prefixed folder names. Drag\n"
+        "the export folder into RS and both layers populate automatically.\n"
+        "Camera poses come from EXIF metadata (Phase B.6 -- pending).");
+      ImGui::SameLine();
+      target_changed |= ImGui::RadioButton("Metashape##ce_t",          &ce_target_layout, 2);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "images/<images> + masks/<stem>_mask.png + point_cloud/<stem>.ply\n\n"
+        "User points Metashape at masks/ via Tools > Import > Import Masks,\n"
+        "template '{filename}_mask.png'. Camera poses come from EXIF\n"
+        "metadata (Phase B.6 -- pending).");
+      ImGui::SameLine();
+      target_changed |= ImGui::RadioButton("BlocksExchange##ce_t",     &ce_target_layout, 3);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "blocks_exchange.xml + images/ + masks/<stem>.png + point_cloud/<stem>.ply\n\n"
+        "Universal photogrammetry format -- Metashape, RC/RS, ContextCapture.\n"
+        "Full Brown-Conrady distortion + spherical camera model. Auto-enables\n"
+        "Rotate Y-up. Most reliable cross-tool option when COLMAP fails to\n"
+        "open cleanly somewhere.");
+
+      // Per-target default carries:
+      //   * Rotate Y-up: COLMAP + BE on (3DGS / Metashape viewers
+      //     orbit Y-up); RS / Metashape image-folder workflows handle
+      //     Z-up so flip off there.
+      //   * EXIF GPS: Metashape on (its primary georef channel),
+      //     others off. RS users can flip on for testing.
+      //   * XMP sidecar: RS on (its primary pose-prior channel),
+      //     others off. Metashape users can flip on for full 3D
+      //     rotation alongside EXIF heading-only.
+      if (target_changed) {
+        ce_rotate_to_y_up    = (ce_target_layout == 0 || ce_target_layout == 3);
+        ce_emit_xmp_sidecar  = (ce_target_layout == 1);  // RS only by default
+        // EXIF GPS: Metashape always; RS too -- Windows testing showed RS
+        // does NOT auto-detect XMP sidecars on the project we tested, so
+        // EXIF is the proven georef fallback. Cheap to ship both.
+        ce_emit_exif_gps     = (ce_target_layout == 1 || ce_target_layout == 2);
+        // Flight log CSV: RS-specific input (Workflow > Trajectory). On by
+        // default for RS as a third georef channel; off elsewhere.
+        ce_emit_flight_log   = (ce_target_layout == 1);
+        // Full UTM: ON for RS / Metashape / BE (their workflows want real-
+        // world georef + matching EXIF lat/lon), OFF for COLMAP/3DGS
+        // (those prefer small coords near origin for float precision).
+        ce_full_utm          = (ce_target_layout != 0);
+      }
+
+      // Pose-prior accuracies. Two consumers:
+      //   - BE target: emits per-photo <Accuracy> in blocks_exchange.xml,
+      //     gated by the use_pose_priors checkbox (XML treats missing tags
+      //     as "no constraint", so the toggle is binary on/off).
+      //   - RS target with flight log on: writes per-row accuracy columns
+      //     in flight_log.csv. Always emitted when the flight log is on
+      //     (RS treats the values as 1-sigma BA priors; no separate toggle
+      //     since the user already chose to ship the trajectory).
+      const bool sigmas_used =
+        (ce_target_layout == 3) ||
+        (ce_target_layout == 1 && ce_emit_flight_log);
+      if (ce_target_layout == 3) {
+        ImGui::Indent();
+        ImGui::Checkbox("Pose priors (pos/rot accuracy)##ce", &ce_use_pose_priors);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Emit per-photo accuracy hints in blocks_exchange.xml so Metashape's\n"
+          "Optimize Cameras (BA) treats our poses as CONSTRAINED priors instead\n"
+          "of loose initial guesses. Keeps scale + origin nailed to our session\n"
+          "frame during refinement -- critical for multi-tile coherence.");
+        ImGui::Unindent();
+      }
+      if (sigmas_used && (ce_target_layout != 3 || ce_use_pose_priors)) {
+        ImGui::Indent();
+        ImGui::SetNextItemWidth(110);
+        ImGui::DragFloat("pos sigma (m)##ce",   &ce_pose_pos_sigma_m,   0.01f,  0.001f, 50.0f, "%.3f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "1-sigma position uncertainty (metres) attached to every camera in the\n"
+          "trajectory CSV / blocks_exchange.xml. Loose default (1 m) gives BA\n"
+          "room to refine against image features when the LiDAR prior and the\n"
+          "feature solution disagree. Tighten only if you trust the prior more\n"
+          "than feature matching.");
+        ImGui::SameLine(); ImGui::SetNextItemWidth(110);
+        ImGui::DragFloat("rot sigma (deg)##ce", &ce_pose_rot_sigma_deg, 0.1f,   0.01f,  90.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "1-sigma rotation uncertainty (degrees) per axis. Default 5 deg leaves\n"
+          "room for re-alignment; tighten if you trust the SLAM orientation\n"
+          "more than feature-based BA refinement.");
+        ImGui::Unindent();
+      }
+
+      // ----- Metadata (per-image pose-prior carriers) -----
+      // EXIF GPS and XMP sidecar are independently togglable. Defaults
+      // track the target (set in the target_changed handler above) but
+      // the user can flip either on/off for testing -- e.g. enable EXIF
+      // even on the RS target to see if RS reads EXIF GPS when XMP is
+      // also present. Both writes silently skip when their preconditions
+      // miss (datum unavailable for EXIF; libexiv2-unsupported format).
+      ImGui::Separator();
+      ImGui::TextDisabled("Metadata (per-image pose-prior carriers)");
+      ImGui::Checkbox("EXIF GPS in image (Metashape)##ce_exif", &ce_emit_exif_gps);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Embed GPS lat/lon/alt + heading + DateTime into each exported image.\n"
+        "Metashape's primary georef channel -- imports cameras at WGS84.\n"
+        "Reality Scan reads EXIF GPS too; useful for testing what RS picks up.\n"
+        "Requires the session GNSS datum (silent skip if unavailable).");
+      ImGui::SameLine();
+      ImGui::Checkbox("XMP sidecar (Reality Scan)##ce_xmp", &ce_emit_xmp_sidecar);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Write a `<basename>.xmp` next to each exported image with full\n"
+        "camera pose (RS xcr: schema). RS auto-detects same-name XMP files\n"
+        "and uses them as 'initial' (= 'draft') pose priors -- cameras can\n"
+        "refine during BA, anchored against the fixed LiDAR.\n"
+        "Plain XML write -- no library dependency.");
+      ImGui::SameLine();
+      // Flight log CSV -- third georef channel, RS-specific. Imported via
+      // Workflow > Trajectory; user-facing fallback when XMP is not auto-
+      // detected. Format: `# name lon lat alt`, RS lets the user remap
+      // columns at import time. Datum required (silent skip otherwise).
+      ImGui::Checkbox("Trajectory (Reality Scan)##ce_flightlog", &ce_emit_flight_log);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Write `flight_log.csv` at the export root: one row per kept camera with\n"
+        "image, lon, lat, alt, omega, phi, kappa, plus per-axis 1-sigma accuracies\n"
+        "(driven by the pos/rot sigma sliders below).\n"
+        "\n"
+        "Reality Scan imports it via Workflow > Trajectory. In the Import\n"
+        "Trajectory dialog set:\n"
+        "  - File format:                Custom\n"
+        "  - Custom format description (paste from CSV header comment):\n"
+        "      image x/lon y/lat z/alt omega phi kappa\n"
+        "      x/lonaccuracy y/lataccuracy z/altaccuracy\n"
+        "      omegaaccuracy phiaccuracy kappaaccuracy\n"
+        "  - Euler angles order:         zyx\n"
+        "  - Camera axes convention:     Computer vision\n"
+        "  - Coordinate system:          (matches your project; WGS84 for absolute)\n"
+        "\n"
+        "Why OPK + Computer Vision axes (not YPR): YPR mode in RS bakes in a\n"
+        "NADIR-default camera mount (drone), which makes forward-facing\n"
+        "cameras face down. OPK + CV is what the official RS SLAM tutorial\n"
+        "uses for forward-facing scanner data (e.g. OmniSlam R8).\n"
+        "\n"
+        "Skipped silently when no GNSS datum.");
+      // Header-only points3D.txt -- visible for COLMAP target only. The
+      // RS SLAM tutorial says to wipe the points from points3D.txt
+      // before opening the COLMAP scene in RS; an unwiped file surfaces
+      // as "file not found" in the RS import dialog (parse error mis-
+      // reported). When ON, we write the standard COLMAP header lines
+      // but zero point rows -- the per-source PLY still ships, and the
+      // user feeds the cloud separately via RS's Import LiDAR Scan.
+      if (ce_target_layout == 0) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Header-only points3D.txt (RS SLAM)##ce_p3d_hdr", &ce_points3d_header_only);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Write `points3D.txt` with the standard COLMAP header lines\n"
+          "but zero point rows. Per-source PLY still ships alongside.\n"
+          "\n"
+          "Use when feeding the COLMAP scene into Reality Scan: RS's\n"
+          "SLAM tutorial says an oversize / format-quirky points3D.txt\n"
+          "trips the COLMAP importer (surfaces as 'file not found').\n"
+          "Wiping the points to header-only sidesteps the parse path,\n"
+          "and the cloud goes in separately via Import LiDAR Scan.\n"
+          "\n"
+          "Leave OFF for normal COLMAP / 3DGS exports -- those need\n"
+          "the points for sparse init.");
+      }
+      // Single shared mask -- visible for Metashape / BE targets where
+      // it's the typical workflow (Metashape's Import Masks 'Apply to all
+      // cameras of the same camera group' covers per-source). For RS
+      // (XMP sidecar workflow) per-image masks are the right semantic so
+      // we hide it there. Saves ~N mask-copy operations per export when
+      // active.
+      if (ce_target_layout == 2 || ce_target_layout == 3) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Single mask per source##ce_single_mask", &ce_single_mask);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+          "Write one mask file per source (e.g. src0_mask.png) under the\n"
+          "mask folder, instead of one per exported image.\n"
+          "\n"
+          "Metashape applies a single mask to all cameras of the same calib\n"
+          "group via Import Masks > From File > Apply to all cameras.\n"
+          "BlocksExchange references the same file path-wise.\n"
+          "\n"
+          "Sensible default when masks are static (rig hardware mask, no\n"
+          "per-frame segmentation). Saves ~N mask copies per export.\n"
+          "Don't enable if you plan to ship per-image YOLO/learned masks.");
+      }
+
+      // ----- Misc (axis + distortion + georef knobs that affect every target) -----
+      ImGui::Separator();
+      ImGui::TextDisabled("Misc");
+      // Full UTM toggle. Disabled visually when no GNSS datum is loaded
+      // (gnss_datum.json missing) since there's no UTM origin to add --
+      // user gets a tooltip explaining it.
+      const bool can_full_utm = gnss_datum_available;
+      if (!can_full_utm) ImGui::BeginDisabled();
+      ImGui::Checkbox("Full UTM (real-world coords)##ce_utm", &ce_full_utm);
+      if (!can_full_utm) ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (!can_full_utm) {
+          ImGui::SetTooltip(
+            "No GNSS datum loaded for this session (gnss_datum.json missing).\n"
+            "Without a datum, there's no UTM origin to add -- exports stay\n"
+            "in session-local frame regardless.");
+        } else {
+          ImGui::SetTooltip(
+            "When ON, every exported world coordinate (PLY points, camera\n"
+            "positions in cameras.txt / BlocksExchange XML / XMP sidecars)\n"
+            "gets the session datum's UTM origin added. Output lands in real-\n"
+            "world UTM eastings/northings, matching EXIF GPS lat/lon.\n"
+            "\n"
+            "Required for Metashape / RealityScan workflows where camera\n"
+            "GPS must align with the LiDAR cloud's coordinate frame.\n"
+            "\n"
+            "Reality Scan note: in the COLMAP import dialog, leave the\n"
+            "rotation at 0 deg AND the translation at 0. The exporter has\n"
+            "already baked any axis rotation around the scene centroid\n"
+            "(via Y-up if enabled), so applying further rotation in RS\n"
+            "would flip cameras around (0,0,0) to the equator / Africa.\n"
+            "\n"
+            "When OFF, output stays in session-local frame (smaller numbers,\n"
+            "better float precision for 3DGS rendering, but cameras and PLY\n"
+            "won't match unless the downstream tool is told the local origin.)");
+        }
+      }
+      ImGui::SameLine();
       ImGui::Checkbox("Rotate to Y-up (3DGS)##ce", &ce_rotate_to_y_up);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip(
         "Rotate the exported world from our Z-up frame to a 3DGS-style Y-up frame.\n"
         "LichtFeld/gsplat/nerfstudio viewers orbit around Y-up by default -- without\n"
-        "this the scene loads rotated 90 deg. Training math is identical either way,\n"
-        "this is purely viewer ergonomics.");
+        "this the scene loads rotated 90 deg.\n"
+        "\n"
+        "Compatible with Full UTM: the writer also rotates the datum offset by\n"
+        "R_yup so cloud + cameras + offset stay in one consistent frame.\n"
+        "Outputs end up at (rotated UTM, not real-world UTM eastings/northings),\n"
+        "but they're internally self-consistent -- georef ties cleanly via\n"
+        "control points or the importer's coordinate-system declaration.");
       {
         const bool block_undistort = !ce_copy_images;
         if (block_undistort) ce_undistort_images = false;
+        ImGui::SameLine();
         ImGui::BeginDisabled(block_undistort);
-        ImGui::Checkbox("Undistort images (PINHOLE)##ce", &ce_undistort_images);
+        ImGui::Checkbox("Undistort images (pinhole only)##ce", &ce_undistort_images);
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered()) {
           if (block_undistort)
@@ -12525,9 +13095,11 @@ void OfflineViewer::setup_ui() {
               "JPEGs on disk -- we can't symlink to them. Enable Copy to unlock.");
           else
             ImGui::SetTooltip(
-              "Who applies the k1/k2/k3/p1/p2 distortion -- we do it at export, or\n"
-              "the downstream tool does it at projection. Same physics either way,\n"
-              "just split labour differently.\n"
+              "PINHOLE-LENS SOURCES ONLY -- has no effect on Spherical / equirect\n"
+              "(360) sources, which are emitted as-is. The toggle decides who\n"
+              "applies the k1/k2/k3/p1/p2 lens distortion: we do it now at\n"
+              "export, or the downstream tool does it at projection. Same\n"
+              "physics either way, just split labour differently.\n"
               "\n"
               "ON  (default): we apply distortion NOW via cv::remap using the full\n"
               "                k1/k2/k3/p1/p2 source lens model. Output images are\n"
@@ -12543,48 +13115,6 @@ void OfflineViewer::setup_ui() {
               "     model has no slot for k3 -- if your lens needs k3, pair ON with\n"
               "     BlocksExchange (which carries the full k1/k2/k3/p1/p2 set).");
         }
-      }
-      ImGui::Checkbox("Emit BlocksExchange (xml)##ce", &ce_write_blocks_exchange);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-        "Additionally write blocks_exchange.xml at the dataset root.\n"
-        "ContextCapture / RealityCapture / Metashape all import this format.\n"
-        "Supports Brown-Conrady distortion (k1/k2/k3/p1/p2) for pinhole and\n"
-        "the Spherical camera model for equirect sources -- one format covers\n"
-        "every source type the pipeline produces.");
-
-      // Pose priors only apply to BlocksExchange.
-      if (ce_write_blocks_exchange) {
-        ImGui::Indent();
-        ImGui::Checkbox("Pose priors (pos/rot accuracy)##ce", &ce_use_pose_priors);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-          "Emit per-photo accuracy hints in blocks_exchange.xml so Metashape's\n"
-          "Optimize Cameras (BA) treats our poses as CONSTRAINED priors instead\n"
-          "of loose initial guesses. Keeps scale + origin nailed to our session\n"
-          "frame during refinement -- critical for multi-tile coherence and\n"
-          "aerial-LiDAR fusion.\n"
-          "\n"
-          "OFF: no accuracy tags emitted. Metashape BA can freely apply a\n"
-          "     similarity transform to the whole block (scale / drift / rotate).\n"
-          "ON:  emit <Accuracy> tags with the sigmas below. BA refines poses\n"
-          "     locally within those bounds.");
-        if (ce_use_pose_priors) {
-          ImGui::BeginDisabled(!ce_use_pose_priors);
-          ImGui::SetNextItemWidth(140);
-          ImGui::DragFloat("Position sigma (m)##cepp", &ce_pose_pos_sigma_m, 0.005f, 0.001f, 10.0f, "%.3f");
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-            "Position accuracy per photo (metres). Sensible range 0.02-0.10 m\n"
-            "for LiDAR-derived poses. Tighter = less freedom for BA drift,\n"
-            "looser = BA allowed to relocate cameras more.");
-          ImGui::SameLine();
-          ImGui::SetNextItemWidth(140);
-          ImGui::DragFloat("Rotation sigma (deg)##cepp", &ce_pose_rot_sigma_deg, 0.1f, 0.01f, 30.0f, "%.2f");
-          if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-            "Rotation accuracy per photo (degrees). Sensible range 0.5-3 deg\n"
-            "for LiDAR-derived poses. Tighter = BA trusts the orientation,\n"
-            "looser = BA free to rotate cameras to fit features.");
-          ImGui::EndDisabled();
-        }
-        ImGui::Unindent();
       }
 
       // Availability checks for each source toggle. Missing data just prints
@@ -12618,11 +13148,13 @@ void OfflineViewer::setup_ui() {
         }
       }
 
-      // Export button
-      const bool source_ok =
-        (ce_export_voxelized && have_voxelized) ||
-        (ce_export_hd        && have_hd);
-      const bool can_export = ce_region_placed && !ce_output_dir.empty() && source_ok && !ce_running;
+      // Export button. Point-cloud sources are NOT required: the export is
+      // useful even with images-only (e.g. just to ship EXIF GPS + XMP into
+      // RS / Metashape from a session that hasn't been HD-densified yet).
+      // The colored warnings above already tell the user which sources are
+      // missing; the final export stats reiterate "0 points written" so the
+      // outcome is unambiguous regardless.
+      const bool can_export = ce_region_placed && !ce_output_dir.empty() && !ce_running;
       if (!can_export) ImGui::BeginDisabled();
       if (ImGui::Button("Export")) {
         ce_running = true;
@@ -12632,16 +13164,37 @@ void OfflineViewer::setup_ui() {
         const std::string out_dir = ce_output_dir;
         const bool copy_img = ce_copy_images;
         const float overlap = ce_overlap_margin_m;
+        // Y-up + full UTM is now a valid combo: the writer rotates the
+        // datum offset by R_yup so cloud + cameras + offset all live in
+        // one consistent rotated frame (effective_offset = R_yup * datum
+        // in colmap_export.cpp). Pre-baking the rotation around the
+        // scene centroid (= datum location in UTM) avoids the catapult
+        // RS would inflict if the user enters +90 deg X in its import
+        // dialog: RS rotates around (0,0,0), so UTM-scale coords get
+        // flung across the globe. With us baking the rotation in advance,
+        // the user leaves the RS dialog at 0 deg.
         const bool rot_yup = ce_rotate_to_y_up;
         const float yaw_deg = ce_yaw_deg;
         const bool undistort = ce_undistort_images;
-        const bool write_blocks_exchange = ce_write_blocks_exchange;
-        const bool use_priors = ce_use_pose_priors && ce_write_blocks_exchange;
+        // emit_colmap + write_blocks_exchange are now DERIVED from the
+        // single 4-way radio. UI never exposes them as separate toggles --
+        // the target IS the choice, the bundle bits follow.
+        const int  target_layout = ce_target_layout;
+        const bool emit_colmap = (target_layout == 0);                 // COLMAP target
+        const bool write_blocks_exchange = (target_layout == 3);       // BE target
+        const bool use_priors = ce_use_pose_priors && write_blocks_exchange;
+        // Metadata channels -- user-overridable per the Metadata section.
+        const bool emit_exif_gps     = ce_emit_exif_gps;
+        const bool emit_xmp_sidecar  = ce_emit_xmp_sidecar;
+        const bool full_utm          = ce_full_utm;
+        const bool single_mask       = ce_single_mask;
+        const bool emit_flight_log   = ce_emit_flight_log;
+        const bool points3d_header_only = ce_points3d_header_only;
         const float pos_sigma = ce_pose_pos_sigma_m;
         const float rot_sigma = ce_pose_rot_sigma_deg;
         const bool export_vox = ce_export_voxelized;
         const bool export_hd  = ce_export_hd;
-        std::thread([this, center, size, out_dir, copy_img, overlap, rot_yup, yaw_deg, undistort, write_blocks_exchange, use_priors, pos_sigma, rot_sigma, export_vox, export_hd]() {
+        std::thread([this, center, size, out_dir, copy_img, overlap, rot_yup, yaw_deg, undistort, emit_colmap, target_layout, write_blocks_exchange, use_priors, pos_sigma, rot_sigma, export_vox, export_hd, emit_exif_gps, emit_xmp_sidecar, full_utm, single_mask, emit_flight_log, points3d_header_only]() {
           try {
             // 1. Gather points from hd_frames_voxelized/ (or from loaded voxelized state -- simplest to load here)
             ExportBounds2D bounds;
@@ -12653,7 +13206,9 @@ void OfflineViewer::setup_ui() {
             bounds.z_max = center.z() + 0.5f * size.z();
             bounds.yaw_deg = yaw_deg;
 
-            std::vector<ColoredPoint> pts;
+            // Per-source accumulators -- one PLY per source, no merge.
+            std::vector<ColoredPoint> pts_hd;
+            std::vector<ColoredPoint> pts_voxelized;
             if (!trajectory_built) build_trajectory();
             size_t total_scanned = 0;
 
@@ -12675,6 +13230,16 @@ void OfflineViewer::setup_ui() {
             };
 
             // --- Voxelized source: points already in world frame. ---
+            // Per-field availability counters: count frames that DID and
+            // DIDN'T have each per-point file. After the loop we surface
+            // any "checked-but-missing" combinations as warnings -- the
+            // export still completes (fallbacks fill in zeros / intensity-
+            // derived RGB), the user just gets a heads-up so they know
+            // their PLY ships fallback values, not source data.
+            int vox_frames_total = 0;
+            int vox_frames_with_rgb = 0;
+            int vox_frames_with_intensity = 0;
+            int vox_frames_with_normals = 0;
             const std::string vox_dir = hd_frames_path + "_voxelized";
             if (export_vox && boost::filesystem::is_directory(vox_dir)) {
               size_t vox_added = 0;
@@ -12692,32 +13257,81 @@ void OfflineViewer::setup_ui() {
                 std::vector<Eigen::Vector3f> frame_pts(np);
                 std::vector<float> frame_int(np, 0.0f);
                 std::vector<Eigen::Vector3f> frame_rgb(np, Eigen::Vector3f(0.5f, 0.5f, 0.5f));
+                std::vector<Eigen::Vector3f> frame_nor(np, Eigen::Vector3f::Zero());
                 bool frame_has_rgb = false;
+                bool frame_has_nor = false;
+                bool frame_has_int = false;
                 { std::ifstream f(fdir + "/points.bin", std::ios::binary);
                   if (!f) continue;
                   f.read(reinterpret_cast<char*>(frame_pts.data()), sizeof(Eigen::Vector3f) * np); }
                 { std::ifstream f(fdir + "/intensities.bin", std::ios::binary);
-                  if (f) f.read(reinterpret_cast<char*>(frame_int.data()), sizeof(float) * np); }
+                  if (f) {
+                    f.read(reinterpret_cast<char*>(frame_int.data()), sizeof(float) * np);
+                    frame_has_int = static_cast<bool>(f);
+                  }
+                }
                 { std::ifstream f(fdir + "/aux_rgb.bin", std::ios::binary);
                   if (f) {
                     f.read(reinterpret_cast<char*>(frame_rgb.data()), sizeof(Eigen::Vector3f) * np);
                     frame_has_rgb = static_cast<bool>(f);
                   }
                 }
+                // Voxelize doesn't currently emit normals.bin (todo: add a
+                // "Compute normals" toggle to the Voxelize panel). When the
+                // file's missing, we ship zero-vectors and the PLY writer
+                // either omits normals (per-source emit_normal flag) or
+                // writes zeros that downstream tools treat as no-data.
+                { std::ifstream f(fdir + "/normals.bin", std::ios::binary);
+                  if (f) {
+                    f.read(reinterpret_cast<char*>(frame_nor.data()), sizeof(Eigen::Vector3f) * np);
+                    frame_has_nor = static_cast<bool>(f);
+                  }
+                }
+                vox_frames_total++;
+                if (frame_has_rgb) vox_frames_with_rgb++;
+                if (frame_has_int) vox_frames_with_intensity++;
+                if (frame_has_nor) vox_frames_with_normals++;
                 if (!frame_has_rgb) intensity_to_rgb(frame_int, frame_rgb);
                 for (int i = 0; i < np; i++) {
                   if (!bounds.contains_xy(frame_pts[i])) { total_scanned++; continue; }
-                  ColoredPoint cp; cp.xyz = frame_pts[i]; cp.rgb = frame_rgb[i];
-                  pts.push_back(cp);
+                  ColoredPoint cp;
+                  cp.xyz = frame_pts[i];
+                  cp.rgb = frame_rgb[i];
+                  cp.normal = frame_nor[i];
+                  cp.intensity = frame_int[i];
+                  pts_voxelized.push_back(cp);
                   total_scanned++; vox_added++;
                 }
               }
               logger->info("[COLMAP] Voxelized: {} points kept", vox_added);
+              // Surface fallback warnings: per-field, did the source actually
+              // have the data the user asked for? Doesn't change export
+              // behaviour (we already filled defaults) -- just informs the
+              // user their PLY may carry intensity-derived RGB / zero
+              // normals / zero intensity rather than real captured values.
+              if (vox_frames_total > 0) {
+                if (ce_export_vox_color && vox_frames_with_rgb < vox_frames_total) {
+                  logger->warn("[SFM] Voxelized color requested but aux_rgb.bin missing on {}/{} frames; using intensity-derived grayscale fallback for those.",
+                               vox_frames_total - vox_frames_with_rgb, vox_frames_total);
+                }
+                if (ce_export_vox_intensity && vox_frames_with_intensity < vox_frames_total) {
+                  logger->warn("[SFM] Voxelized intensity requested but intensities.bin missing on {}/{} frames; PLY ships 0.0 for those.",
+                               vox_frames_total - vox_frames_with_intensity, vox_frames_total);
+                }
+                if (ce_export_vox_normal && vox_frames_with_normals < vox_frames_total) {
+                  logger->warn("[SFM] Voxelized normals requested but normals.bin missing on {}/{} frames; PLY ships zero-vectors. (Voxelize panel doesn't yet emit normals; A.6 todo.)",
+                               vox_frames_total - vox_frames_with_normals, vox_frames_total);
+                }
+              }
             }
 
             // --- Raw HD source: iterate submaps + frames, transform sensor-
             //     local points to world via T_world_lidar, filter by bounds.
             //     Big output (full density); region trim keeps it bounded.
+            int hd_frames_total = 0;
+            int hd_frames_with_rgb = 0;
+            int hd_frames_with_intensity = 0;
+            int hd_frames_with_normals = 0;
             if (export_hd) {
               ce_status = "Gathering raw HD points...";
               size_t hd_added = 0;
@@ -12749,34 +13363,83 @@ void OfflineViewer::setup_ui() {
                   std::vector<float> frame_int(np, 0.0f);
                   std::vector<float> frame_rng;
                   std::vector<Eigen::Vector3f> frame_rgb(np, Eigen::Vector3f(0.5f, 0.5f, 0.5f));
+                  std::vector<Eigen::Vector3f> frame_nor(np, Eigen::Vector3f::Zero());
                   bool frame_has_rgb = false;
+                  bool frame_has_nor = false;
+                  bool frame_has_int = false;
                   if (!glim::load_bin(fdir + "/points.bin", pts_local, np)) continue;
-                  glim::load_bin(fdir + "/intensities.bin", frame_int, np);
+                  frame_has_int = glim::load_bin(fdir + "/intensities.bin", frame_int, np);
                   { std::ifstream f(fdir + "/aux_rgb.bin", std::ios::binary);
                     if (f) {
                       f.read(reinterpret_cast<char*>(frame_rgb.data()), sizeof(Eigen::Vector3f) * np);
                       frame_has_rgb = static_cast<bool>(f);
                     }
                   }
+                  // HD frames carry normals.bin when normals were enabled at
+                  // capture / re-imported. Local frame here -- transform to
+                  // world below alongside the points.
+                  { std::ifstream f(fdir + "/normals.bin", std::ios::binary);
+                    if (f) {
+                      f.read(reinterpret_cast<char*>(frame_nor.data()), sizeof(Eigen::Vector3f) * np);
+                      frame_has_nor = static_cast<bool>(f);
+                    }
+                  }
+                  hd_frames_total++;
+                  if (frame_has_rgb) hd_frames_with_rgb++;
+                  if (frame_has_int) hd_frames_with_intensity++;
+                  if (frame_has_nor) hd_frames_with_normals++;
                   if (!frame_has_rgb) intensity_to_rgb(frame_int, frame_rgb);
                   const Eigen::Matrix3f R = fi.T_world_lidar.rotation().cast<float>();
                   const Eigen::Vector3f t = fi.T_world_lidar.translation().cast<float>();
                   for (int i = 0; i < np; i++) {
                     const Eigen::Vector3f wp = R * pts_local[i] + t;
                     if (!bounds.contains_xy(wp)) { total_scanned++; continue; }
-                    ColoredPoint cp; cp.xyz = wp; cp.rgb = frame_rgb[i];
-                    pts.push_back(cp);
+                    ColoredPoint cp;
+                    cp.xyz = wp;
+                    cp.rgb = frame_rgb[i];
+                    cp.normal = frame_has_nor ? (R * frame_nor[i]).normalized() : Eigen::Vector3f::Zero();
+                    cp.intensity = frame_int[i];
+                    pts_hd.push_back(cp);
                     total_scanned++; hd_added++;
                   }
                 }
               }
               logger->info("[COLMAP] Raw HD: {} points kept", hd_added);
+              if (hd_frames_total > 0) {
+                if (ce_export_hd_color && hd_frames_with_rgb < hd_frames_total) {
+                  logger->warn("[SFM] HD color requested but aux_rgb.bin missing on {}/{} frames; using intensity-derived grayscale fallback for those.",
+                               hd_frames_total - hd_frames_with_rgb, hd_frames_total);
+                }
+                if (ce_export_hd_intensity && hd_frames_with_intensity < hd_frames_total) {
+                  logger->warn("[SFM] HD intensity requested but intensities.bin missing on {}/{} frames; PLY ships 0.0 for those.",
+                               hd_frames_total - hd_frames_with_intensity, hd_frames_total);
+                }
+                if (ce_export_hd_normal && hd_frames_with_normals < hd_frames_total) {
+                  logger->warn("[SFM] HD normals requested but normals.bin missing on {}/{} frames; PLY ships zero-vectors.",
+                               hd_frames_total - hd_frames_with_normals, hd_frames_total);
+                }
+              }
             }
 
-            logger->info("[COLMAP] Total {} points within bounds (scanned {})", pts.size(), total_scanned);
-            if (pts.empty()) { ce_status = "Failed: 0 points in region (check source toggles + availability)"; ce_running = false; return; }
+            const size_t pts_total = pts_hd.size() + pts_voxelized.size();
+            logger->info("[COLMAP] Total {} points within bounds ({} HD + {} voxelized; scanned {})",
+                         pts_total, pts_hd.size(), pts_voxelized.size(), total_scanned);
+            // 0 points is no longer a hard fail -- images-only exports (just
+            // EXIF GPS / XMP into RS or Metashape from a session that hasn't
+            // been HD-densified yet) are a valid use case. The cameras /
+            // sidecar pipeline below runs unconditionally; the per-source
+            // PLY writer no-ops on empty input, and the final stats report
+            // 0 points so the result is unambiguous.
+            if (pts_total == 0) {
+              logger->info("[COLMAP] No points in region -- proceeding with images-only export.");
+            }
 
-            // 2. Gather cameras from all image_sources
+            // 2. Gather cameras from all image_sources.
+            // For Reality Scan target, virtual cameras (LiDAR-rendered)
+            // are SKIPPED entirely -- RS imports the LiDAR scan through
+            // its own menu, so adding virtual cams just doubles-up data.
+            // (Pablo's call: don't export virtual cams in RS mode.)
+            const bool skip_virtuals = (target_layout == 1);  // RS target only
             const auto timed_traj = timed_traj_snapshot();
             std::vector<ExportCameraFrame> cams;
             std::vector<PinholeIntrinsics> intrs;
@@ -12786,6 +13449,7 @@ void OfflineViewer::setup_ui() {
               intrs.push_back(image_sources[si].intrinsics);
               cam_types.push_back(image_sources[si].camera_type);
               virt_flags.push_back(image_sources[si].is_virtual);
+              if (skip_virtuals && image_sources[si].is_virtual) continue;
               for (size_t fi = 0; fi < image_sources[si].frames.size(); fi++) {
                 const auto& cf = image_sources[si].frames[fi];
                 // Virtual frames have no real EXIF timestamp (cam_time may be
@@ -12813,6 +13477,12 @@ void OfflineViewer::setup_ui() {
                 const std::string ext  = boost::filesystem::path(cf.filepath).extension().string();
                 e.export_name = "src" + std::to_string(si) + "_" + stem + ext;
                 e.T_world_cam = cf.T_world_cam;
+                // Propagate the per-camera timestamp (UTC seconds-since-
+                // epoch, parsed from EXIF DateTimeOriginal at load time +
+                // any source-level time_shift). Used by the EXIF writer to
+                // bake DateTimeOriginal into the exported image. 0.0 means
+                // "no time" -- writer skips the field.
+                e.timestamp = cf.timestamp + image_sources[si].time_shift;
                 cams.push_back(std::move(e));
               }
             }
@@ -12831,12 +13501,66 @@ void OfflineViewer::setup_ui() {
             opt.overlap_margin_m = overlap;
             opt.rotate_to_y_up = rot_yup;
             opt.export_undistorted = undistort;
+            opt.emit_colmap = emit_colmap;
+            opt.target_layout = (target_layout == 1)
+              ? ExportOptions::TargetLayout::RealityScan
+              : (target_layout == 2)
+                ? ExportOptions::TargetLayout::Metashape
+                : (target_layout == 3)
+                  ? ExportOptions::TargetLayout::BlocksExchange
+                  : ExportOptions::TargetLayout::Colmap;
             opt.export_blocks_exchange = write_blocks_exchange;
+            // Datum -> needed by EXIF GPS write (Metashape target). RS XMP
+            // sidecar uses world position directly so it doesn't need it,
+            // but we populate anyway for consistency. datum_available=false
+            // when the session has no GNSS datum (rare but possible) ->
+            // EXIF write becomes a no-op for Metashape target, others
+            // unaffected.
+            opt.datum_available           = gnss_datum_available;
+            opt.datum_utm_zone            = gnss_utm_zone;
+            opt.datum_utm_easting_origin  = gnss_utm_easting_origin;
+            opt.datum_utm_northing_origin = gnss_utm_northing_origin;
+            opt.datum_alt                 = gnss_datum_alt;
+            opt.datum_southern_hemisphere = (gnss_datum_lat < 0.0);
+            opt.emit_exif_gps             = emit_exif_gps;
+            opt.emit_xmp_sidecar          = emit_xmp_sidecar;
+            opt.full_utm                  = full_utm;
+            opt.single_mask               = single_mask;
+            opt.emit_flight_log           = emit_flight_log;
+            opt.points3d_text_header_only = points3d_header_only;
             opt.emit_pose_priors = use_priors;
             opt.pose_pos_sigma_m = pos_sigma;
             opt.pose_rot_sigma_deg = rot_sigma;
+            // Build the per-source PLY list. HD and Voxelized stay separate
+            // (the merge bug fix). When only one is populated, keep the
+            // standard "points3D" stem so 3DGS init / RS lookup still
+            // matches the COLMAP filename convention. When both are
+            // populated, suffix them and emit both -- caller picks which to
+            // feed downstream.
+            std::vector<PointSource> point_sources;
+            const bool both = !pts_hd.empty() && !pts_voxelized.empty();
+            if (!pts_hd.empty()) {
+              PointSource s;
+              s.filename_stem = both ? "points3D_hd" : "points3D";
+              s.points = std::move(pts_hd);
+              s.emit_color = ce_export_hd_color;
+              s.emit_intensity = ce_export_hd_intensity;
+              s.emit_normal = ce_export_hd_normal;
+              s.emit_text_sidecar = true;  // RS / COLMAP text-format compliance
+              point_sources.push_back(std::move(s));
+            }
+            if (!pts_voxelized.empty()) {
+              PointSource s;
+              s.filename_stem = both ? "points3D_voxelized" : "points3D";
+              s.points = std::move(pts_voxelized);
+              s.emit_color = ce_export_vox_color;
+              s.emit_intensity = ce_export_vox_intensity;
+              s.emit_normal = ce_export_vox_normal;
+              s.emit_text_sidecar = !both;  // only one .txt sidecar to avoid clobber
+              point_sources.push_back(std::move(s));
+            }
             std::string err;
-            auto stats = write_colmap_export(bounds, pts, cams, intrs, cam_types, virt_flags, opt, &err);
+            auto stats = write_colmap_export(bounds, point_sources, cams, intrs, cam_types, virt_flags, opt, &err);
             ce_last_points = stats.points_written;
             ce_last_cameras = stats.cameras_written;
             ce_last_images = stats.images_copied;
@@ -12875,7 +13599,26 @@ void OfflineViewer::setup_ui() {
                   sf << "To recover real UTM coordinates from session-local coords:\n";
                   sf << "  UTM_easting  = session_x + easting_origin\n";
                   sf << "  UTM_northing = session_y + northing_origin\n";
-                  sf << "  UTM_alt      = session_z + alt_origin\n";
+                  sf << "  UTM_alt      = session_z + alt_origin\n\n";
+                  // Prominent XGrids-style instructions when target=Colmap+full_utm:
+                  // scene files are local-only and the user has to enter the offset
+                  // as the dialog "translation" in RS / Reality Capture.
+                  if (target_layout == 0 && full_utm) {
+                    sf << "================================================================\n";
+                    sf << "RealityScan COLMAP import (XGrids-style):\n";
+                    sf << "  In the Open Project > COLMAP Text Format dialog, paste:\n";
+                    sf << "    Translation X = " << std::setprecision(12) << gnss_utm_easting_origin << "\n";
+                    sf << "    Translation Y = " << std::setprecision(12) << gnss_utm_northing_origin << "\n";
+                    sf << "    Translation Z = " << std::setprecision(6)  << gnss_datum_alt << "\n";
+                    sf << "    Rotation X    = 0  (or per Y-up setting)\n";
+                    sf << "    Coord system  = UTM zone " << gnss_utm_zone
+                       << (gnss_datum_lat < 0 ? "S" : "N") << " (WGS84)\n";
+                    sf << "  Scene files (cameras.txt / images.txt / points3D.*) are\n";
+                    sf << "  written in session-local frame so RS's import-time rotation\n";
+                    sf << "  doesn't catapult UTM-scale coords. Translation applied AFTER\n";
+                    sf << "  rotation by RS lands the cameras at correct real UTM.\n";
+                    sf << "================================================================\n";
+                  }
                 } else {
                   sf << "No GNSS datum loaded for this session -- the session-local\n";
                   sf << "frame has no recorded UTM anchor. Coordinates are whatever\n";
@@ -12914,7 +13657,6 @@ void OfflineViewer::setup_ui() {
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         if (!ce_region_placed) ImGui::SetTooltip("Place a region first.");
         else if (ce_output_dir.empty()) ImGui::SetTooltip("Choose an output directory.");
-        else if (!source_ok) ImGui::SetTooltip("No point-cloud source selected or available. Enable Voxelized or HD and make sure the matching dir exists.");
       }
 
       if (!ce_status.empty()) {
@@ -12922,13 +13664,41 @@ void OfflineViewer::setup_ui() {
         ImGui::TextDisabled("Status");
         ImGui::TextWrapped("%s", ce_status.c_str());
       }
-      if (ce_last_points > 0) {
+      if (ce_last_points > 0 || ce_last_cameras > 0) {
         ImGui::Separator();
         ImGui::TextDisabled("Last export");
         ImGui::Text("points: %zu", ce_last_points);
         ImGui::Text("cameras: %zu", ce_last_cameras);
         ImGui::Text("images copied: %zu", ce_last_images);
         ImGui::Text("masks copied: %zu", ce_last_masks);
+        // XGrids-style local export: surface the offset numbers the user
+        // needs to paste into RS's COLMAP-import dialog. See SHIFT.txt for
+        // full instructions; this is the quick-copy view next to the
+        // export stats.
+        if (ce_target_layout == 0 && ce_full_utm && gnss_datum_available) {
+          ImGui::Separator();
+          ImGui::TextDisabled("RS COLMAP import: paste as Translation");
+          ImGui::Text("X = %.4f", gnss_utm_easting_origin);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("copy##ox")) {
+            char buf[64]; std::snprintf(buf, sizeof(buf), "%.4f", gnss_utm_easting_origin);
+            ImGui::SetClipboardText(buf);
+          }
+          ImGui::Text("Y = %.4f", gnss_utm_northing_origin);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("copy##oy")) {
+            char buf[64]; std::snprintf(buf, sizeof(buf), "%.4f", gnss_utm_northing_origin);
+            ImGui::SetClipboardText(buf);
+          }
+          ImGui::Text("Z = %.4f", gnss_datum_alt);
+          ImGui::SameLine();
+          if (ImGui::SmallButton("copy##oz")) {
+            char buf[64]; std::snprintf(buf, sizeof(buf), "%.4f", gnss_datum_alt);
+            ImGui::SetClipboardText(buf);
+          }
+          ImGui::TextDisabled("Coord system: UTM %d%c (WGS84)",
+            gnss_utm_zone, gnss_datum_lat < 0 ? 'S' : 'N');
+        }
       }
     }
     ImGui::End();
@@ -16801,10 +17571,16 @@ void OfflineViewer::main_menu() {
       }
 
       ImGui::Separator();
-      if (ImGui::MenuItem("Export COLMAP...", nullptr, ce_show)) { ce_show = !ce_show; }
+      if (ImGui::MenuItem("SFM Export...", nullptr, ce_show)) { ce_show = !ce_show; }
       if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-        "Open the COLMAP exporter (single-chunk, dev mode).\n"
-        "Place a region cube and export points + cameras for 3DGS training.");
+        "Open the SFM Export panel. Bundles point cloud + camera images +\n"
+        "masks + camera poses for downstream consumers:\n"
+        "  - COLMAP / 3DGS / nerfstudio\n"
+        "  - Reality Scan (.geometry/.mask layout + XMP sidecars)\n"
+        "  - Metashape (EXIF GPS + masks/<stem>_mask.png)\n"
+        "  - BlocksExchange XML (universal photogrammetry format)\n"
+        "Place a 3D region cube on the trajectory; the 2D footprint is used\n"
+        "for trimming. One target per export.");
 
       if (ImGui::MenuItem("Quit")) {
         if (pfd::message("Warning", "Quit?").result() == pfd::button::ok) {
@@ -17222,14 +17998,6 @@ void OfflineViewer::main_menu() {
           }).detach();
           pfd::message("Backup Started", "Compressing HD frames in background.\nThis may take several minutes for large datasets.\nCheck the log for completion.");
         }
-        if (ImGui::MenuItem("  + Add to batch (Backup HD)")) {
-          batch_add(BatchKind::BackupHD, batch_snapshot_backup_hd(),
-                    "Backup HD -> $HD_backup_$TIMESTAMP.tar.gz");
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip(
-          "Append a Backup HD step to the batch queue (Tools -> Batch).\n"
-          "Default destination uses portable tokens so the recipe runs\n"
-          "on a different map without edits.");
         if (!has_hd) {
           if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip("No HD frames available to backup.");
@@ -17674,6 +18442,18 @@ void OfflineViewer::main_menu() {
         ImGui::EndMenu();
       }
 
+      if (ImGui::BeginMenu("Dynamic-Erasor filter -> ERASOR (inspiration)")) {
+        entry("Hyungtae Lim, Sungwon Hwang, Hyun Myung -- clean-room reimpl by Mobile Mapper",
+              "ERASOR: Egocentric Ratio of Pseudo Occupancy-based Dynamic Object Removal for "
+              "Static 3D Point Cloud Map Building. IEEE RA-L 2021.\n"
+              "Conceptual inspiration only; this implementation is independent with adaptations\n"
+              "for narrow-V-FOV LiDARs (sensor V-FOV gating, empty-query-skip, sensor preset\n"
+              "tuning bundle for Livox Horizon, Pandar 128, etc.).",
+              "Algorithm: not 1:1. Our code: MIT.",
+              "https://github.com/LimHyungTae/ERASOR (reference, not forked)");
+        ImGui::EndMenu();
+      }
+
       ImGui::Separator();
 
       // --- Third-party libs ---
@@ -17713,8 +18493,19 @@ void OfflineViewer::main_menu() {
           ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("libexif")) {
-          entry("libexif contributors", "EXIF metadata parsing.",
+          entry("libexif contributors", "EXIF metadata parsing (read).",
                 "LGPL-2.1", "https://libexif.github.io/");
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("libexiv2")) {
+          entry("Andreas Huggel et al.",
+                "EXIF / IPTC / XMP metadata read/write. Used by the SFM Export pipeline\n"
+                "to bake camera GPS coordinates + timestamps into images for the Metashape\n"
+                "target (so cameras land in WGS84 lat/lon at import time, no manual\n"
+                "georef step needed). RealityScan target uses a separate XMP sidecar\n"
+                "writer (no library dependency) for full 3D pose priors.",
+                "GPL-2.0-or-later (with linking exception in 0.27+)",
+                "https://github.com/Exiv2/exiv2");
           ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("nlohmann/json")) {

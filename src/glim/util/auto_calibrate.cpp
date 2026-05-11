@@ -20,7 +20,8 @@ CalibrationContext build_calibration_context(
   const Eigen::Vector3f& anchor_pos,
   const Eigen::Vector3f& anchor_forward,
   const CalibContextOptions& opts,
-  std::function<gtsam_points::PointCloudCPU::Ptr(int)> load_hd_for_submap) {
+  std::function<gtsam_points::PointCloudCPU::Ptr(int)> load_hd_for_submap,
+  std::function<std::vector<Eigen::Vector3f>(int)> load_hd_aux_rgb_for_submap) {
 
   CalibrationContext ctx;
   ctx.anchor_stamp = anchor_stamp;
@@ -102,6 +103,21 @@ CalibrationContext build_calibration_context(
         gnd_attr = static_cast<const float*>(it->second.second);
       }
     }
+    // Native lidar RGB (Ouster colour sensor) or Colorize > Apply output.
+    // Loaded from disk by an optional caller-supplied loader -- one entry
+    // per HD point in the SAME order load_hd_for_submap returned the cloud.
+    // Empty => no RGB for this submap; ctx.colors_rgb stays empty for these
+    // points and the rasterizer falls back to intensity.
+    std::vector<Eigen::Vector3f> sm_rgb;
+    if (load_hd_aux_rgb_for_submap) {
+      sm_rgb = load_hd_aux_rgb_for_submap(si);
+      if (!sm_rgb.empty() && sm_rgb.size() != hd->size()) {
+        std::cerr << "[VC] aux_rgb size mismatch for submap " << si
+                  << " (rgb=" << sm_rgb.size() << " pts=" << hd->size()
+                  << ") -- skipping RGB for this submap" << std::endl;
+        sm_rgb.clear();
+      }
+    }
 
     for (size_t i = 0; i < hd->size(); i++) {
       const Eigen::Vector3f wp = (T_wo * Eigen::Vector3d(hd->points[i].head<3>().cast<double>())).cast<float>();
@@ -122,6 +138,15 @@ CalibrationContext build_calibration_context(
         // length mismatch incoming. Mark with 0 (safest fallback: include
         // the point if the consumer was hoping for ground filtering).
         ctx.is_ground.push_back(0);
+      }
+      // Same parallel-accumulation pattern for native RGB. Pushed only when
+      // a submap has provided RGB via the caller's loader. Sentinel
+      // (-1,0,0) marks points from a submap whose loader returned empty so
+      // the rasterizer (use_rgb sentinel check) skips those splats cleanly.
+      if (!sm_rgb.empty()) {
+        ctx.colors_rgb.push_back(sm_rgb[i]);
+      } else if (!ctx.colors_rgb.empty()) {
+        ctx.colors_rgb.push_back(Eigen::Vector3f(-1.0f, 0.0f, 0.0f));
       }
     }
   }
@@ -329,7 +354,8 @@ RenderedIntensity render_intensity_image(
   // to intensity when missing -- safe even if the user toggles a mode that
   // requires data the context doesn't carry.
   const bool use_rgb = (opts.source == RenderSource::BootstrapColorizedSplat ||
-                        opts.source == RenderSource::BootstrapColorizedDepth) &&
+                        opts.source == RenderSource::BootstrapColorizedDepth ||
+                        opts.source == RenderSource::NativeRGB) &&
                        !ctx.colors_rgb.empty() &&
                        ctx.colors_rgb.size() == ctx.world_points.size();
   if (use_rgb) {

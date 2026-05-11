@@ -86,6 +86,14 @@ struct CalibCorrespondence {
 /// the Auto-calibrate and Virtual Camera tools share this definition. `timed_traj`
 /// is used only when the directional filter is on (to resolve each submap's
 /// middle-frame forward direction).
+/// Optional second loader: returns per-point RGB for the given submap_idx,
+/// in the SAME order load_hd_for_submap returns the cloud's points (i.e.,
+/// after the same per-frame range filter, no further filtering). Empty
+/// vector means "no RGB for this submap" and the builder will keep
+/// ctx.colors_rgb empty for those points. When provided AND the returned
+/// vector size matches the cloud's point count, the builder copies the
+/// matching colours into ctx.colors_rgb so RGB-aware consumers (the
+/// virtual-camera rasterizer in NativeRGB mode) can render directly.
 CalibrationContext build_calibration_context(
   const std::vector<SubMap::ConstPtr>& submaps,
   const std::vector<TimedPose>& timed_traj,
@@ -93,7 +101,8 @@ CalibrationContext build_calibration_context(
   const Eigen::Vector3f& anchor_pos,
   const Eigen::Vector3f& anchor_forward,
   const CalibContextOptions& opts,
-  std::function<gtsam_points::PointCloudCPU::Ptr(int)> load_hd_for_submap);
+  std::function<gtsam_points::PointCloudCPU::Ptr(int)> load_hd_for_submap,
+  std::function<std::vector<Eigen::Vector3f>(int)> load_hd_aux_rgb_for_submap = nullptr);
 
 /// Per-point data source the rasterizer uses to colour each splat. Lives on
 /// IntensityRenderOptions so the existing single-call render path can dispatch
@@ -120,6 +129,14 @@ enum class RenderSource {
                                   //   surfaces because depth interpolation
                                   //   averages out per-point Z noise).
   ShadedDepth              = 3,  // Lambertian shading from per-vertex normals.
+  NativeRGB                = 4,  // Per-point RGB carried by the LiDAR itself
+                                  //   (e.g. Ouster colour-equipped sensors,
+                                  //   or aux_rgb.bin written by Colorize >
+                                  //   Apply). No camera projection at render
+                                  //   time -- ctx.colors_rgb is populated by
+                                  //   the context builder from the cloud's
+                                  //   "aux_rgb" attribute, and the rasterizer
+                                  //   splats those colours directly.
 };
 
 /// Tuning knobs for the intensity rasterizer. Defaults match the values the
